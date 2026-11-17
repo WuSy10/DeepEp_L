@@ -15,9 +15,11 @@
 
 namespace py = pybind11;
 namespace deepep { void bind_clock_calibration(py::module_&); }
+namespace deepep { void bind_clock_probe(py::module_&); }
 PYBIND11_MODULE(_C, module)
 {
     deepep::bind_clock_calibration(module);
+    deepep::bind_clock_probe(module);
     module.attr("runtime_protocol") = 1;
     module.def("next_instance_id", &deepep_next_instance);
     module.def("instance_unique_id", []() {

@@ -1,9 +1,10 @@
-# Ascend 950 独立时钟校准：方案 A 回传
+# Ascend 950 时钟校准与单 AIV 连续采集：方案 A 回传
 
-本实验仅建立当前 NPU `GetSystemCycle()` 计数与本机 CPU `CLOCK_MONOTONIC`
-纳秒之间的映射，不启动业务算子，也不采集批量算子日志。单 AIV kernel
-把原始设备计数**直接写到注册映射的 Host 内存**；时间戳不经过 HBM→Host
-拷贝。这就是本文所说的方案 A 回传。
+独立校准命令建立当前 NPU `GetSystemCycle()` 计数与本机 CPU
+`CLOCK_MONOTONIC` 纳秒之间的映射。单 AIV 校准 kernel 把原始设备计数
+**直接写到注册映射的 Host 内存**；时间戳不经过 HBM→Host 拷贝。这就是
+本文所说的方案 A 回传。校准验收后，可运行本文末尾的单 AIV 连续采集实验，
+获取每次算子的 NPU 起止计数及 CPU launch 时间。它尚未接入业务算子。
 
 ## 与 NCCL 的对应关系
 
@@ -26,13 +27,14 @@ NCCL Profiler 则预分配映射 Host 缓冲，GPU 写时间戳和工作序号�
 unset DEEPEP_BUILD_EP_GMM_FUSED DEEPEP_BUILD_MEGAMOE
 export DEEPEP_NPU_ARCH=Ascend950
 python -m pip install -r requirements-build.txt
-python -m py_compile deep_ep/clock_calibration.py
+python -m py_compile deep_ep/clock_calibration.py deep_ep/clock_probe.py
 python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
 ```
 
 `SHMEM_ROOT` 未设置时默认使用 `third-party/shmem/install/shmem`。
 若环境已安装 `pytest`，还可运行
-`python -m pytest -q tests/test_clock_calibration.py` 检查纯 CPU 换算逻辑。
+`python -m pytest -q tests/test_clock_calibration.py tests/test_clock_probe.py`
+检查纯 CPU 换算与日志格式逻辑。
 语法和 CPU 单元测试不验证映射内存；实机运行才验证 AIV 写入。
 
 先用最短参数检查映射和 kernel：
@@ -101,3 +103,69 @@ host_ns(d) = Ha + round((d - Da) * rate)
 实现入口：[设备 kernel](../../csrc/kernels/clock_calibration.cpp)、
 [Host 绑定](../../csrc/ops/clock_calibration.cpp)、
 [Python 拟合](../../deep_ep/clock_calibration.py)。
+
+## 单 AIV 连续算子实验
+
+校准命令运行正常后，先用小批量检查构建和日志：
+
+```bash
+python -m deep_ep.clock_probe --device 0 --samples 4 --warmup 1 \
+  --interval 1 --probe-warmup 2 --iterations 8 --work-iters 32 \
+  --output clock-probe-smoke.jsonl
+```
+
+再运行完整批次：
+
+```bash
+python -m deep_ep.clock_probe --device 0 --samples 32 --warmup 5 \
+  --interval 10 --probe-warmup 20 --iterations 1000 --work-iters 32 \
+  --output clock-probe.jsonl
+```
+
+`--device` 必须是当前进程可见的设备编号。命令先按本页方法执行两批校准
+和第三批留出验收；留出样本不通过就停止，不启动探针。随后 `--probe-warmup`
+次和 `--iterations` 次单 AIV kernel 连续提交到一条新建的专用流。
+`--work-iters` 控制每个 kernel 对 32 个 `int32` 元素执行向量加法的次数，
+范围 1..4096。第 0 个元素的预期结果为 `sequence + 1 + work_iters`；
+该工作负载用于生成可在 CPU 上独立复算的结果，
+不代表业务算子的向量性能。
+`iterations + probe-warmup` 最大为 16384。
+
+Host 为本批每次 launch 预留一个**独立的 64 字节记录位置**，这些位置位于
+同一块 4 KB 对齐并注册映射的锁页 Host 内存中。kernel 参数带上位置和
+序号；单 AIV 在工作前读取 `GetSystemCycle()`，初始化片上向量，并反复
+执行加法；等待向量流水完成、读取结果后，再读取结束计数。随后通过 MTE3 写入
+`sequence / start_tick / end_tick / result / sequence+1 / magic / work_iters /
+~sequence`。记录直接落在映射 Host 内存，没有中间 HBM 时间戳缓冲或
+D2H 拷贝。每个位置只使用一次，本实验**不复用槽位**。
+
+C++ 在每次底层 launch 调用前后用 `CLOCK_MONOTONIC` 记录
+`cpu_launch_begin_ns`、`cpu_launch_end_ns`。它们表示 Host **提交调用**
+的时间，不是 NPU 执行起止时间，也不是整个 Python API 耗时。所有探针
+提交完毕后，Host **只同步一次探针流**，再核对包括预热在内的每条记录：
+序号、起止顺序、CPU 复算结果、完成值、magic 和迭代次数。任一条失败
+便报错，不输出成功日志。`sequence+1` 在本实验中仍是同步后的完整性
+检查字段，不是 CPU 并发轮询时可依赖的发布标志。
+
+输出为 JSONL：首行 `type=calibration` 保存三批原始校准样本、映射参数、
+留出验收结果、负载参数及 `calibration_id`；之后每行 `type=operator`
+对应一个保留的算子，不包含预热算子。每条算子行保存：
+
+- `sequence`、`calibration_id`、`device`、`work_iters`、`result`；
+- 原始 `cpu_launch_begin_ns`、`cpu_launch_end_ns` 和二者之差；
+- 原始 `npu_start_tick`、`npu_end_tick` 和二者之差；
+- 用本次校准映射得到的 `npu_start_host_ns`、`npu_end_host_ns`、
+  `npu_duration_ns`，以及两个时刻的锚点包围区间传播误差。
+  这些也是 `CLOCK_MONOTONIC` 时间轴，不是日期时间；误差值不覆盖
+  后续漂移或设备复位。
+
+成功时终端打印 `clock probe passed: device=... operators=...`；
+`wc -l clock-probe.jsonl` 应为 `iterations + 1`，因为首行是校准记录。
+`npu_duration_ticks` 包含探针的向量加法及完成等待，不包含随后通过
+MTE3 写 64 字节日志的时间。校准本身逐样本同步；探针批次只在全部提交后
+同步一次。目前没有后台采集、批量异步落盘、槽位轮转或溢出丢弃逻辑；JSONL 在批次验证完成
+后由当前进程写出。设备或进程重置后须重新运行校准。
+
+实现入口：[探针 kernel](../../csrc/kernels/clock_probe.cpp)、
+[Host 批量提交与校验](../../csrc/ops/clock_probe.cpp)、
+[日志输出](../../deep_ep/clock_probe.py)。

@@ -28,7 +28,7 @@ set_target_properties(deepep_instances PROPERTIES INSTALL_RPATH "$ORIGIN" INSTAL
 install(TARGETS deepep_instances LIBRARY DESTINATION .)
 pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp)
 target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
-target_sources(_C PRIVATE csrc/ops/clock_calibration.cpp)
+target_sources(_C PRIVATE csrc/ops/clock_calibration.cpp csrc/ops/clock_probe.cpp)
 target_link_libraries(_C PRIVATE ascendcl shmem deepep_device deepep_instances ${CMAKE_DL_LIBS})
 target_compile_options(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -Wall -Wextra -Werror -fstack-protector-strong)
 target_compile_options(_C PRIVATE "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
