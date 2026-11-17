@@ -26,6 +26,7 @@ find_path(DEVICE_RT_INCLUDE rt.h HINTS
     "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/runtime/include"
     NO_DEFAULT_PATH)
 add_library(deepep_kernels SHARED "${DEEPEP_SOURCE_DIR}/csrc/kernels/instance_sync.cpp" "${DEEPEP_SOURCE_DIR}/csrc/kernels/notify/notify.cpp"
+    "${DEEPEP_SOURCE_DIR}/csrc/kernels/clock_calibration.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/dispatch.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/reuse.cpp"

@@ -63,6 +63,8 @@ DeepEP/
 
 模块职责见[架构文档](docs/architecture.md)。
 
+Ascend 950 的独立方案 A 时钟校准见[时钟校准说明](docs/clock_calibration/README.md)。
+
 ## 快速开始
 
 ---
