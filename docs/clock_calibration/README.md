@@ -27,16 +27,10 @@ NCCL Profiler 则预分配映射 Host 缓冲，GPU 写时间戳和工作序号�
 unset DEEPEP_BUILD_EP_GMM_FUSED DEEPEP_BUILD_MEGAMOE
 export DEEPEP_NPU_ARCH=Ascend950
 python -m pip install -r requirements-build.txt
-python -m py_compile deep_ep/clock_calibration.py deep_ep/clock_probe.py
 python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
 ```
 
 `SHMEM_ROOT` 未设置时默认使用 `third-party/shmem/install/shmem`。
-若环境已安装 `pytest`，还可运行
-`python -m pytest -q tests/test_clock_calibration.py tests/test_clock_probe.py`
-检查纯 CPU 换算与日志格式逻辑。
-语法和 CPU 单元测试不验证映射内存；实机运行才验证 AIV 写入。
-
 先用最短参数检查映射和 kernel：
 
 ```bash
@@ -169,3 +163,122 @@ MTE3 写 64 字节日志的时间。校准本身逐样本同步；探针批次�
 实现入口：[探针 kernel](../../csrc/kernels/clock_probe.cpp)、
 [Host 批量提交与校验](../../csrc/ops/clock_probe.cpp)、
 [日志输出](../../deep_ep/clock_probe.py)。
+
+## 后台收集与批量落盘实验
+
+`clock_probe_async` 是下一阶段的独立命令。它继续使用上面的校准与
+`mapped_host_mte3` 方案 A 回传，但在后续批次继续提交时，由后台线程
+检查前面批次的完成情况。原来的 `clock_probe` 命令及其 `iterations+1`
+行输出不变，可用来对照。本实验的进度 Event 路径要求 Ascend 950PR。
+
+### 运行
+
+构建新版本后，先运行小批次：
+
+```bash
+python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
+python -m deep_ep.clock_probe_async --device 7 --samples 4 --warmup 1 \
+  --interval 1 --probe-warmup 2 --iterations 32 --work-iters 32 \
+  --batch-size 4 --slot-batches 2 --queue-batches 2 \
+  --output clock-probe-async-smoke.jsonl
+```
+
+再运行较长的连续采集：
+
+```bash
+python -m deep_ep.clock_probe_async --device 7 --samples 32 --warmup 5 \
+  --interval 10 --probe-warmup 20 --iterations 10000 --work-iters 32 \
+  --batch-size 16 --slot-batches 8 --queue-batches 8 \
+  --flush-ms 100 --submit-interval-us 1000 \
+  --output clock-probe-async.jsonl
+```
+
+命令结束时打印 `attempted`、`logged`、`dropped`。正常成功文件包含
+1 行 `calibration`、`logged` 行 `operator` 和最后 1 行 `summary`，因此
+`wc -l` 应为 `logged+2`。始终有 `attempted=logged+dropped`。
+当 `dropped=0` 时，1 万次运行应输出 10002 行。小批次也可能因设备
+冷启动或 Host 调度而出现丢弃；丢弃是可见的容量行为，不会伪造记录。
+可以用下面的检查同时核对文件结构和计数：
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+rows = [json.loads(line) for line in Path("clock-probe-async.jsonl").open()]
+header, summary = rows[0], rows[-1]
+operators = rows[1:-1]
+assert header["type"] == "calibration" and summary["type"] == "summary"
+assert all(row["type"] == "operator" for row in operators)
+assert len(operators) == summary["logged"] == summary["accepted"]
+assert summary["attempted"] == summary["accepted"] + summary["dropped"]
+assert all(row["calibration_id"] == header["calibration_id"] for row in operators)
+assert all(row["generation"] == row["sequence"] + 1 for row in operators)
+print(summary)
+PY
+```
+
+### 内存和完成协议
+
+固定容量为 `batch-size × slot-batches` 个 64 字节映射 Host 位置，最大
+16384 个；默认 `16 × 8 = 128` 个位置。每批占用一组位置。kernel 的
+8 个字段仍是 `sequence/start_tick/end_tick/result/sequence+1/magic/
+work_iters/~sequence`。本实验的 `generation=sequence+1`，每次提交
+严格递增；即使一整批因满而跳过，其序号也会前进，日志中的缺口可与
+`dropped` 计数相互核对。
+
+每批 kernel 后面，在**同一条探针流**记录一个进度 Event。提交线程
+先完成 `aclrtRecordEvent`，再把批次放入待查询队列；后台收集线程只
+查询已经入队的 Event。Event 返回 `COMPLETE` 之后才读取映射记录，
+逐条检查预期序号、`sequence+1`、magic、tick 顺序、工作次数和 CPU
+复算结果。`NOT_READY` 不释放位置；查询失败或字段不匹配会停止运行，
+也不会授权位置复用。这里 Event 是并发读取的门槛，`sequence+1` 是
+本轮 generation 完整性字段；**不在设备运行时仅凭这个字段轮询读取**。
+进度 Event 使用可重复记录的 `ACL_EVENT_CAPTURE_STREAM_PROGRESS`，
+只在前一轮已完成且记录被搬走后再为同一位置组记录下一轮。
+这遵循昇腾的[跨线程 Event 查询示例](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/others/acldevg/runtime_doc_dev_0024.html)；
+文档也提醒不同线程中的记录与查询可能发生顺序问题，因此本实现先
+记录 Event，再在互斥保护下将批次加入收集队列，查询线程只处理已入队
+批次。查询线程还会绑定提交线程保存的 ACL Context。
+[CANN 9.2 beta.2 API 状态说明](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/920beta2/API/runtimeapi/aclcppdevg_03_0086.html)。
+
+原生 `poll()` 先把整批有效记录复制成独立的 CPU 数据，继续保留原
+映射位置组。Python 收集线程把这份 CPU 数据成功放进有界队列后，
+才调用 `release()` 将对应位置组标记为空闲。
+队列满时暂停收集，不提前释放映射位置；这会把背压传到固定容量的
+映射槽位。提交路径若找不到空闲位置组，跳过**这一批的新采集**并
+增加 `dropped`，不等待设备、也不覆盖正在被设备使用的位置。
+
+### 换算、写盘与退出
+
+第二个后台线程消费 CPU 自有队列，在这时调用校准映射换算原始 tick，
+保留原始值和映射不确定度，再按 `--flush-records` 条或
+`--flush-ms` 毫秒批量写 JSONL。默认分别为 256 条与 100 ms；
+没有逐条 `fsync`，业务提交线程不写磁盘。首行校准 header 在启动
+提交之前写出。最后一行 `summary` 包含 `attempted/accepted/dropped/logged`；
+写入线程检查 `accepted=logged` 才写 summary。
+
+`--submit-interval-us` 默认 1000 微秒，用于这个独立实验的提交节奏。
+设为 0 可压测固定容量，例如 `--batch-size 16 --slot-batches 2
+--queue-batches 1 --submit-interval-us 0`，预期可能出现 `dropped>0`。
+一条完整的拥塞命令如下：
+
+```bash
+python -m deep_ep.clock_probe_async --device 7 --samples 4 --warmup 1 \
+  --interval 1 --probe-warmup 2 --iterations 10000 --work-iters 32 \
+  --batch-size 16 --slot-batches 2 --queue-batches 1 \
+  --submit-interval-us 0 --output clock-probe-async-pressure.jsonl
+```
+
+正常退出时等待收集线程排空待完成批次，再等待写入线程写完尾部；
+最终关闭探针时有一次保护性流同步。`--drain-timeout` 默认 60 秒，
+只用于判断排空失败；超时不会授权复用。若设备状态不明，代码保留
+映射页与事件资源直至进程结束，以避免仍在运行的设备任务写入已释放内存。
+强制终止进程无法保证尾部完整；缺少最终 `summary` 的文件应视为
+未完整收尾。
+
+这仍是独立的单 AIV 实验，尚未接入业务算子；也没有自动周期重校准。
+时钟重置、进程重启或设备重置后必须重新运行校准。映射不确定度只
+传播锚点包围区间误差，不保证长时间漂移上界。实现入口：
+[原生槽位和 Event 管理](../../csrc/ops/clock_probe_async.cpp)、
+[Python 收集与写入](../../deep_ep/clock_probe_async.py)。

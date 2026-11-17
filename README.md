@@ -63,7 +63,7 @@ DeepEP/
 
 模块职责见[架构文档](docs/architecture.md)。
 
-Ascend 950 的方案 A 时钟校准及单 AIV 连续采集实验见[时钟校准说明](docs/clock_calibration/README.md)。
+Ascend 950 的方案 A 时钟校准、单 AIV 连续采集及后台收集实验见[时钟校准说明](docs/clock_calibration/README.md)。
 
 ## 快速开始
 
