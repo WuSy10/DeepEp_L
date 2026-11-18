@@ -5,8 +5,8 @@ namespace {
 constexpr uint64_t kProbeMagic = 0x434c4f434b50524fULL;
 }
 
-// One AIV computes a runtime-dependent vector result and returns its timing record
-// directly to mapped Host memory. Each launch owns a separate 64-byte record.
+// One AIV performs the probe workload. A null mapped_record disables timing
+// collection while keeping the workload and its vector completion wait.
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void deepep_clock_probe(
     GM_ADDR mapped_record, uint64_t sequence, uint32_t work_iters)
 {
@@ -21,7 +21,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void deepep_clock
     auto ones = ones_buffer.Get<int32_t>();
     auto local = record_buffer.Get<uint64_t>();
 
-    const uint64_t start = static_cast<uint64_t>(AscendC::GetSystemCycle());
+    const bool record_timing = mapped_record != nullptr;
+    const uint64_t start = record_timing ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0;
     AscendC::Duplicate(values, static_cast<int32_t>(sequence + 1), 32);
     AscendC::Duplicate(ones, int32_t(1), 32);
     AscendC::PipeBarrier<PIPE_V>();
@@ -32,6 +33,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void deepep_clock
     AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
     const int32_t result = values.GetValue(0);
+    if (!record_timing) {
+        // Keep the vector result observable even without a Host record.
+        volatile int32_t consumed = result;
+        (void)consumed;
+        return;
+    }
     const uint64_t end = static_cast<uint64_t>(AscendC::GetSystemCycle());
 
     local.SetValue(0, sequence);

@@ -76,12 +76,11 @@ class AsyncClockProbe {
 public:
     using Row = std::array<uint64_t, 6>;
 
-    AsyncClockProbe(unsigned batch_size, unsigned slot_batches, unsigned work_iters)
-        : batch_size_(batch_size), work_iters_(work_iters)
+    AsyncClockProbe(unsigned slot_count, unsigned work_iters)
+        : work_iters_(work_iters)
     {
-        if (batch_size < 1 || batch_size > 1024 || slot_batches < 1 || slot_batches > 64 ||
-            uint64_t(batch_size) * slot_batches > 16384 || work_iters < 1 || work_iters > 4096)
-            throw std::invalid_argument("batch_size 1..1024, slot_batches 1..64, total slots <=16384, work_iters 1..4096 required");
+        if (slot_count < 1 || slot_count > 16384 || work_iters < 1 || work_iters > 4096)
+            throw std::invalid_argument("slot_count 1..16384 and work_iters 1..4096 required");
         int32_t device_id = -1;
         check(aclrtGetDevice(&device_id), "get async probe device");
         const char* soc = aclrtGetSocName();
@@ -97,12 +96,11 @@ public:
         check(aclrtGetCurrentContext(&context_), "get async probe context");
         if (!context_) throw std::runtime_error("async probe has no current ACL context");
         try {
-            records_ = std::make_unique<MappedRecords>(size_t(batch_size) * slot_batches);
+            records_ = std::make_unique<MappedRecords>(slot_count);
             check(aclrtCreateStream(&stream_), "create async probe stream");
-            blocks_.resize(slot_batches);
-            for (auto& block : blocks_) {
-                block.launch_times.resize(batch_size);
-                check(aclrtCreateEventExWithFlag(&block.event, ACL_EVENT_CAPTURE_STREAM_PROGRESS),
+            slots_.resize(slot_count);
+            for (auto& slot : slots_) {
+                check(aclrtCreateEventExWithFlag(&slot.event, ACL_EVENT_CAPTURE_STREAM_PROGRESS),
                       "create async probe progress event");
             }
         } catch (...) {
@@ -118,44 +116,48 @@ public:
     int32_t device() const { return device_id_; }
     const std::string& soc() const { return soc_; }
 
-    bool submit(unsigned count)
+    bool submit()
     {
         std::lock_guard<std::mutex> guard(mutex_);
         ensure_open();
-        if (count < 1 || count > batch_size_ || next_sequence_ + count > kMaxSequence)
-            throw std::invalid_argument("async probe count or sequence is out of range");
-        const uint64_t first = next_sequence_;
-        next_sequence_ += count;
-        attempted_ += count;
-        size_t index = blocks_.size();
-        for (size_t i = 0; i < blocks_.size(); ++i) {
-            if (!blocks_[i].in_flight) { index = i; break; }
+        if (next_sequence_ >= kMaxSequence)
+            throw std::invalid_argument("async probe sequence is out of range");
+        const uint64_t sequence = next_sequence_++;
+        ++attempted_;
+        size_t index = slots_.size();
+        for (size_t offset = 0; offset < slots_.size(); ++offset) {
+            const size_t candidate = (next_slot_ + offset) % slots_.size();
+            if (!slots_[candidate].in_flight) { index = candidate; break; }
         }
-        if (index == blocks_.size()) {
-            dropped_ += count;
+        if (index == slots_.size()) {
+            // A full log buffer must not suppress the operator itself.
+            try {
+                deepep_clock_probe_do(stream_, nullptr, sequence, work_iters_);
+            } catch (...) {
+                poisoned_ = true;
+                throw;
+            }
+            ++dropped_;
             return false;
         }
-        auto& block = blocks_[index];
-        block.in_flight = true;
-        block.count = count;
-        block.first_sequence = first;
-        auto* host = reinterpret_cast<uint8_t*>(records_->host) + index * size_t(batch_size_) * kRecordBytes;
-        std::memset(host, 0, size_t(count) * kRecordBytes);
+        next_slot_ = (index + 1) % slots_.size();
+        auto& slot = slots_[index];
+        slot.in_flight = true;
+        slot.sequence = sequence;
+        auto* host = reinterpret_cast<uint8_t*>(records_->host) + index * kRecordBytes;
+        std::memset(host, 0, kRecordBytes);
         try {
-            for (unsigned i = 0; i < count; ++i) {
-                auto* slot = static_cast<uint8_t*>(records_->device) +
-                             (index * size_t(batch_size_) + i) * kRecordBytes;
-                const uint64_t before = monotonic_ns();
-                deepep_clock_probe_do(stream_, slot, first + i, work_iters_);
-                const uint64_t after = monotonic_ns();
-                block.launch_times[i] = {before, after};
-            }
-            check(aclrtRecordEvent(block.event, stream_), "record async probe batch event");
+            auto* mapped_record = static_cast<uint8_t*>(records_->device) + index * kRecordBytes;
+            const uint64_t before = monotonic_ns();
+            deepep_clock_probe_do(stream_, mapped_record, sequence, work_iters_);
+            const uint64_t after = monotonic_ns();
+            slot.launch_times = {before, after};
+            check(aclrtRecordEvent(slot.event, stream_), "record async probe slot event");
             pending_.push_back(index);
-            accepted_ += count;
+            ++accepted_;
             return true;
         } catch (...) {
-            // A launch may already reference this mapped block. Keep it reserved.
+            // A launch may already reference this mapped slot. Keep it reserved.
             poisoned_ = true;
             throw;
         }
@@ -174,14 +176,14 @@ public:
             check(context_status, "bind async collector context");
         }
         const size_t index = pending_.front();
-        auto& block = blocks_[index];
-        if (block.handed_out)
-            throw std::runtime_error("async probe batch must be released before polling again");
+        auto& slot = slots_[index];
+        if (slot.handed_out)
+            throw std::runtime_error("async probe slot must be released before polling again");
         aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
-        const aclError query_status = aclrtQueryEventStatus(block.event, &status);
+        const aclError query_status = aclrtQueryEventStatus(slot.event, &status);
         if (query_status != ACL_SUCCESS) {
             poisoned_ = true;
-            check(query_status, "query async probe batch event");
+            check(query_status, "query async probe slot event");
         }
         if (status == ACL_EVENT_RECORDED_STATUS_NOT_READY) return {};
         if (status != ACL_EVENT_RECORDED_STATUS_COMPLETE) {
@@ -189,43 +191,39 @@ public:
             throw std::runtime_error("unexpected async probe event status");
         }
         std::vector<Row> rows;
-        rows.reserve(block.count);
-        for (unsigned i = 0; i < block.count; ++i) {
-            const uint64_t sequence = block.first_sequence + i;
-            const uint64_t* record = records_->host + (index * size_t(batch_size_) + i) * 8;
-            const auto& launch = block.launch_times[i];
-            if (record[0] != sequence || record[1] == 0 || record[2] < record[1] ||
-                record[3] != sequence + 1 + work_iters_ || record[4] != sequence + 1 ||
-                record[5] != kProbeMagic || record[6] != work_iters_ || record[7] != ~sequence ||
-                launch[1] < launch[0]) {
-                poisoned_ = true;
-                throw std::runtime_error("invalid async clock probe generation or record at sequence " +
-                                         std::to_string(sequence));
-            }
-            rows.push_back({sequence, launch[0], launch[1], record[1], record[2], record[3]});
+        const uint64_t sequence = slot.sequence;
+        const uint64_t* record = records_->host + index * 8;
+        const auto& launch = slot.launch_times;
+        if (record[0] != sequence || record[1] == 0 || record[2] < record[1] ||
+            record[3] != sequence + 1 + work_iters_ || record[4] != sequence + 1 ||
+            record[5] != kProbeMagic || record[6] != work_iters_ || record[7] != ~sequence ||
+            launch[1] < launch[0]) {
+            poisoned_ = true;
+            throw std::runtime_error("invalid async clock probe generation or record at sequence " +
+                                     std::to_string(sequence));
         }
-        // The caller owns this copy, but the mapped block stays reserved until
-        // it confirms that the copy has entered its CPU queue.
-        block.handed_out = true;
+        rows.push_back({sequence, launch[0], launch[1], record[1], record[2], record[3]});
+        // Keep the mapped slot reserved until the CPU copy enters the queue.
+        slot.handed_out = true;
         return rows;
     }
 
-    void release(uint64_t first_sequence)
+    void release(uint64_t sequence)
     {
         std::lock_guard<std::mutex> guard(mutex_);
         ensure_open();
-        if (pending_.empty()) throw std::runtime_error("no async probe batch to release");
-        auto& block = blocks_[pending_.front()];
-        if (!block.handed_out || block.first_sequence != first_sequence) {
+        if (pending_.empty()) throw std::runtime_error("no async probe slot to release");
+        auto& slot = slots_[pending_.front()];
+        if (!slot.handed_out || slot.sequence != sequence) {
             poisoned_ = true;
             throw std::runtime_error("async probe release generation mismatch");
         }
         pending_.pop_front();
-        block.handed_out = false;
-        block.in_flight = false;
+        slot.handed_out = false;
+        slot.in_flight = false;
     }
 
-    size_t pending_batches() const
+    size_t pending_records() const
     {
         std::lock_guard<std::mutex> guard(mutex_);
         return pending_.size();
@@ -241,7 +239,7 @@ public:
     {
         std::lock_guard<std::mutex> guard(mutex_);
         if (closed_) return;
-        if (!pending_.empty()) throw std::runtime_error("async probe close requires drained batches");
+        if (!pending_.empty()) throw std::runtime_error("async probe close requires drained records");
         // The final synchronization protects mapped pages during normal shutdown.
         if (stream_) check(aclrtSynchronizeStream(stream_), "close async probe stream");
         cleanup_after_sync();
@@ -256,18 +254,17 @@ public:
         // proves that mapped pages and event resources can be reclaimed.
         records_.release();
         stream_ = nullptr;
-        for (auto& block : blocks_) block.event = nullptr;
+        for (auto& slot : slots_) slot.event = nullptr;
         closed_ = true;
     }
 
 private:
-    struct Block {
+    struct Slot {
         aclrtEvent event = nullptr;
         bool in_flight = false;
         bool handed_out = false;
-        unsigned count = 0;
-        uint64_t first_sequence = 0;
-        std::vector<std::array<uint64_t, 2>> launch_times;
+        uint64_t sequence = 0;
+        std::array<uint64_t, 2> launch_times{};
     };
 
     void ensure_open() const
@@ -277,8 +274,8 @@ private:
 
     void cleanup_after_sync() noexcept
     {
-        for (auto& block : blocks_) {
-            if (block.event) { aclrtDestroyEvent(block.event); block.event = nullptr; }
+        for (auto& slot : slots_) {
+            if (slot.event) { aclrtDestroyEvent(slot.event); slot.event = nullptr; }
         }
         if (stream_) { aclrtDestroyStream(stream_); stream_ = nullptr; }
         records_.reset();
@@ -296,16 +293,16 @@ private:
         closed_ = true;
     }
 
-    const unsigned batch_size_;
     const unsigned work_iters_;
     int32_t device_id_ = -1;
     std::string soc_;
     aclrtContext context_ = nullptr;
     std::unique_ptr<MappedRecords> records_;
     aclrtStream stream_ = nullptr;
-    std::vector<Block> blocks_;
+    std::vector<Slot> slots_;
     std::deque<size_t> pending_;
     mutable std::mutex mutex_;
+    size_t next_slot_ = 0;
     uint64_t next_sequence_ = 0;
     uint64_t attempted_ = 0;
     uint64_t accepted_ = 0;
@@ -319,21 +316,20 @@ void bind_clock_probe_async(pybind11::module_& module)
 {
     namespace py = pybind11;
     py::class_<AsyncClockProbe>(module, "AsyncClockProbe")
-        .def(py::init<unsigned, unsigned, unsigned>(), py::arg("batch_size"),
-             py::arg("slot_batches"), py::arg("work_iters"))
+        .def(py::init<unsigned, unsigned>(), py::arg("slot_count"), py::arg("work_iters"))
         .def_property_readonly("device", &AsyncClockProbe::device)
         .def_property_readonly("soc", &AsyncClockProbe::soc)
-        .def("submit", [](AsyncClockProbe& probe, unsigned count) {
+        .def("submit", [](AsyncClockProbe& probe) {
             py::gil_scoped_release release;
-            return probe.submit(count);
+            return probe.submit();
         })
         .def("poll", [](AsyncClockProbe& probe) {
             std::vector<AsyncClockProbe::Row> rows;
             { py::gil_scoped_release release; rows = probe.poll(); }
             return rows;
         })
-        .def("release", &AsyncClockProbe::release, pybind11::arg("first_sequence"))
-        .def("pending_batches", &AsyncClockProbe::pending_batches)
+        .def("release", &AsyncClockProbe::release, pybind11::arg("sequence"))
+        .def("pending_records", &AsyncClockProbe::pending_records)
         .def("counts", &AsyncClockProbe::counts)
         .def("close", [](AsyncClockProbe& probe) {
             py::gil_scoped_release release;
