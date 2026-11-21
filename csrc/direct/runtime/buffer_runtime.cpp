@@ -169,6 +169,8 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
     try {
         AllocateCommMeta();
         AllocateWorkspace();
+        // 只为 UDMA Buffer 按需打开采集器，同一 ACL context 可共享实例。
+        if (transport_ == "udma") dispatch_trace_ = trace::DispatchTrace::Open();
     } catch (...) {
         DestroyNoThrow();
         throw;
@@ -240,6 +242,8 @@ void BufferRuntime::ReleaseResources(bool synchronize)
     if (synchronize && shmem_ != nullptr) {
         shmem_->Barrier();
     }
+    // 在释放通信资源前关闭采集器，确保映射内存中的设备写入已排空。
+    dispatch_trace_.reset();
     FreeResources();
     initialized_ = false;
     shmem_.reset();
@@ -384,6 +388,7 @@ BufferRuntime::IntranodeDispatchWithHandle(
     TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     std::vector<torch::Tensor> public_handle;
+    // fresh dispatch 的启动路径按需预留并提交 trace 槽。
     auto result = ascend_deepep::ops::V1Dispatch(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         cached_num_recv_tokens, cached_rank_prefix_matrix, cached_channel_prefix_matrix, expert_alignment,
@@ -392,7 +397,8 @@ BufferRuntime::IntranodeDispatchWithHandle(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan);
+        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan,
+        dispatch_trace_.get());
     symmetric_workspace_active_ = true;
     return {result, public_handle};
 }

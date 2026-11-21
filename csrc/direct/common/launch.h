@@ -20,6 +20,9 @@
 
 extern "C" {
 
+// 校准核把设备 tick 写入映射的 Host 内存，供 Host 与设备时钟对齐。
+ASCEND_DEEPEP_EXPORT void dispatch_trace_clock_do(void* stream, uint8_t* mapped);
+
 ASCEND_DEEPEP_EXPORT void dispatch_layout_kernel_do(
     uint32_t block_dim,
     void* stream,

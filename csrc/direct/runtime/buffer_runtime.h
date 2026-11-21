@@ -20,6 +20,7 @@
 #include <torch/extension.h>
 
 #include "runtime/shmem_instance.h"
+#include "runtime/dispatch_trace.h"
 #include "ops/combine.h"
 
 namespace ascend_deepep::runtime {
@@ -173,6 +174,8 @@ private:
     bool symmetric_workspace_active_{false};
 
     std::shared_ptr<ShmemInstance> shmem_;
+    // 多个 Buffer 可共享同一 ACL context 的采集器。
+    std::shared_ptr<trace::DispatchTrace> dispatch_trace_;
     void* comm_meta_ptr_{nullptr};
     void* workspace_ptr_{nullptr};
     void* dispatch_output_control_{nullptr};

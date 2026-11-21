@@ -17,10 +17,11 @@ find_library(_tiling NAMES tiling_api PATHS "${ASCEND_HOME_PATH}/lib64" REQUIRED
 find_library(_platform NAMES platform PATHS "${ASCEND_HOME_PATH}/lib64" REQUIRED)
 
 set(_direct_root "${CMAKE_SOURCE_DIR}/csrc/direct")
+# 将采集器编入 Host 扩展，供 Buffer 生命周期与 dispatch 启动路径共用。
 pybind11_add_module(_clos_C NO_EXTRAS
     "${_direct_root}/bindings/pybind.cpp" "${_direct_root}/bindings/torch_classes.cpp"
     "${_direct_root}/ops/launcher.cpp" "${_direct_root}/runtime/shmem_instance.cpp"
-    "${_direct_root}/runtime/buffer_runtime.cpp"
+    "${_direct_root}/runtime/buffer_runtime.cpp" "${_direct_root}/runtime/dispatch_trace.cpp"
     "${_direct_root}/ops/aggregate.cpp" "${_direct_root}/ops/combine.cpp"
     "${_direct_root}/ops/dispatch.cpp" "${_direct_root}/ops/expand.cpp")
 target_include_directories(_clos_C PRIVATE "${_direct_root}" "${CMAKE_SOURCE_DIR}/csrc"
