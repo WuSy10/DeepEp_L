@@ -1,8 +1,7 @@
-"""Calibrate an Ascend950 clock, then log consecutive single-AIV operators.
+"""先校准 Ascend 950 时钟，再批量记录单 AIV 探针算子的起止 tick。
 
-The probe writes one mapped Host record per launch. Native code synchronizes
-the probe stream once after all launches; this is a batch experiment, not the
-background collector used by a production profiler.
+每个算子使用独立的映射 Host 记录位置；全部提交后只同步一次探针流。
+这是同步批次实验，异步后台收集见 clock_probe_async.py。
 """
 
 import argparse
@@ -15,7 +14,11 @@ from .clock_calibration import calibrate, from_samples, validate_holdout
 
 
 def operator_row(mapping, calibration_id, work_iters, native_row):
-    """Keep raw ticks and distinguish Host launch time from NPU work time."""
+    """将一条原始记录换算为日志行，并同时保留原始 tick 与 Host 提交时间。
+
+    launch_begin/end 是 CPU 调用底层 launch 前后的时间；start/end 是
+    NPU 执行探针负载前后的 tick，二者不能当作同一段耗时。
+    """
     sequence, launch_begin, launch_end, start, end, result = native_row
     if launch_end < launch_begin or start <= 0 or end < start:
         raise ValueError(f"invalid probe times at sequence {sequence}")
@@ -33,6 +36,7 @@ def operator_row(mapping, calibration_id, work_iters, native_row):
 
 
 def main():
+    """同步参考实验：两批拟合、第三批验收、批量探针、统一写 JSONL。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--samples", type=int, default=32)
@@ -55,6 +59,7 @@ def main():
     torch.npu.set_device(args.device)
     torch.npu.synchronize()
     mapping = calibrate(args.samples, args.warmup, args.interval)
+    # 留出批次只验收既有映射；失败时不启动正式探针。
     time.sleep(args.interval)
     native = require_native("clock probe")
     device, soc, samples = native.clock_calibration_samples(args.samples, args.warmup)
@@ -63,6 +68,7 @@ def main():
     if verdict["holdout_violations"]:
         raise RuntimeError(f"clock calibration holdout failed: {verdict}")
 
+    # 同步探针为每次 launch 预留独立槽位，全部提交后才同步一次流。
     device, soc, raw_rows = native.clock_probe_batch(args.iterations, args.probe_warmup, args.work_iters)
     if device != mapping.device or soc != mapping.soc or len(raw_rows) != args.iterations:
         raise RuntimeError("probe device, SoC, or record count differs from calibration")

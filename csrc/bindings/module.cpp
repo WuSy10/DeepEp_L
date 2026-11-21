@@ -19,6 +19,7 @@ namespace deepep { void bind_clock_probe(py::module_&); }
 namespace deepep { void bind_clock_probe_async(py::module_&); }
 PYBIND11_MODULE(_C, module)
 {
+    // 把校准采样、同步探针和异步探针三个原生入口注册到 Python 的 deep_ep._C。
     deepep::bind_clock_calibration(module);
     deepep::bind_clock_probe(module);
     deepep::bind_clock_probe_async(module);

@@ -24,6 +24,7 @@ constexpr size_t kRecordBytes = 64;
 constexpr uint64_t kProbeMagic = 0x434c4f434b50524fULL;
 constexpr uint64_t kMaxSequence = 1000000000ULL;
 
+// 统一把 ACL 返回码和最近的运行时错误转成可定位的异常。
 void check(aclError status, const char* operation)
 {
     if (status == ACL_SUCCESS) return;
@@ -33,6 +34,7 @@ void check(aclError status, const char* operation)
     throw std::runtime_error(message);
 }
 
+// Host 提交探针时使用的 CLOCK_MONOTONIC，与校准映射的目标时间轴相同。
 uint64_t monotonic_ns()
 {
     timespec ts{};
@@ -40,6 +42,7 @@ uint64_t monotonic_ns()
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
 }
 
+// 异步探针的固定容量日志区：count 个 64 字节槽位，共享一块页对齐映射区。
 struct MappedRecords {
     void* allocation = nullptr;
     uint64_t* host = nullptr;
@@ -47,6 +50,7 @@ struct MappedRecords {
 
     explicit MappedRecords(size_t count)
     {
+        // 注册长度按 4 KB 向上取整；多申请不足一页的余量以找对齐起点。
         const size_t bytes = (count * kRecordBytes + kPage - 1) & ~(kPage - 1);
         check(aclrtMallocHost(&allocation, bytes + kPage - 1), "allocate async probe records");
         const auto address = reinterpret_cast<uintptr_t>(allocation);
@@ -65,6 +69,7 @@ struct MappedRecords {
             throw std::runtime_error("async mapped probe pointer is null or not 32-byte aligned");
         }
     }
+    // 只有确认设备不再使用这些槽位后才应正常销毁本对象。
     ~MappedRecords()
     {
         if (device) aclrtHostUnregister(host);
@@ -72,6 +77,7 @@ struct MappedRecords {
     }
 };
 
+// 单卡异步探针：提交线程、Event 查询线程通过互斥锁共同管理槽位所有权。
 class AsyncClockProbe {
 public:
     using Row = std::array<uint64_t, 6>;
@@ -79,6 +85,7 @@ public:
     AsyncClockProbe(unsigned slot_count, unsigned work_iters)
         : work_iters_(work_iters)
     {
+        // 异步进度 Event 实验限定 Ascend 950PR；每个槽位配一个可复用 Event。
         if (slot_count < 1 || slot_count > 16384 || work_iters < 1 || work_iters > 4096)
             throw std::invalid_argument("slot_count 1..16384 and work_iters 1..4096 required");
         int32_t device_id = -1;
@@ -111,11 +118,14 @@ public:
 
     AsyncClockProbe(const AsyncClockProbe&) = delete;
     AsyncClockProbe& operator=(const AsyncClockProbe&) = delete;
+    // 析构时尝试完成流；若同步失败，cleanup 会保留设备可能仍访问的内存。
     ~AsyncClockProbe() { cleanup(); }
 
+    // 两个只读属性供 Python 确认探针与校准发生在同一设备和 SoC。
     int32_t device() const { return device_id_; }
     const std::string& soc() const { return soc_; }
 
+    // 提交一个算子。返回 true 表示保留日志槽位，false 只表示该次日志被丢弃。
     bool submit()
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -126,11 +136,12 @@ public:
         ++attempted_;
         size_t index = slots_.size();
         for (size_t offset = 0; offset < slots_.size(); ++offset) {
+            // 从上次分配位置继续轮转，只选已归还、不会被设备覆盖的槽位。
             const size_t candidate = (next_slot_ + offset) % slots_.size();
             if (!slots_[candidate].in_flight) { index = candidate; break; }
         }
         if (index == slots_.size()) {
-            // A full log buffer must not suppress the operator itself.
+            // 槽位满仍提交同样的向量工作；空地址使 kernel 跳过读钟和 MTE3 写日志。
             try {
                 deepep_clock_probe_do(stream_, nullptr, sequence, work_iters_);
             } catch (...) {
@@ -152,24 +163,25 @@ public:
             deepep_clock_probe_do(stream_, mapped_record, sequence, work_iters_);
             const uint64_t after = monotonic_ns();
             slot.launch_times = {before, after};
+            // Event 排在同一条流的 kernel 后；先记录 Event，再公布待查询槽位。
             check(aclrtRecordEvent(slot.event, stream_), "record async probe slot event");
             pending_.push_back(index);
             ++accepted_;
             return true;
         } catch (...) {
-            // A launch may already reference this mapped slot. Keep it reserved.
+            // launch 可能已经引用该槽位，异常时不可贸然释放给下一算子复用。
             poisoned_ = true;
             throw;
         }
     }
 
+    // 查询队首 Event；完成后验证映射记录并复制为 CPU 自有的六元组。
     std::vector<Row> poll()
     {
         std::lock_guard<std::mutex> guard(mutex_);
         ensure_open();
         if (pending_.empty()) return {};
-        // The event is queried on a different Host thread after submit has
-        // recorded it and published its queue entry under this mutex.
+        // 查询发生在另一 Host 线程；锁保证只能看到 submit 已记录并入队的 Event。
         const aclError context_status = aclrtSetCurrentContext(context_);
         if (context_status != ACL_SUCCESS) {
             poisoned_ = true;
@@ -203,11 +215,12 @@ public:
                                      std::to_string(sequence));
         }
         rows.push_back({sequence, launch[0], launch[1], record[1], record[2], record[3]});
-        // Keep the mapped slot reserved until the CPU copy enters the queue.
+        // 虽已复制到 CPU，仍等 Python 将副本成功入队后才允许归还原槽位。
         slot.handed_out = true;
         return rows;
     }
 
+    // Python 已持有 CPU 副本后，按序号归还队首映射槽位。
     void release(uint64_t sequence)
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -223,35 +236,38 @@ public:
         slot.in_flight = false;
     }
 
+    // 返回仍等待完成或归还的槽位数，供收集线程判断是否排空。
     size_t pending_records() const
     {
         std::lock_guard<std::mutex> guard(mutex_);
         return pending_.size();
     }
 
+    // 返回 attempted/accepted/dropped；dropped 统计缺日志的算子，不是未执行算子。
     std::array<uint64_t, 3> counts() const
     {
         std::lock_guard<std::mutex> guard(mutex_);
         return {attempted_, accepted_, dropped_};
     }
 
+    // 正常收尾：必须先排空记录，再同步整条流以覆盖无日志算子，最后释放资源。
     void close()
     {
         std::lock_guard<std::mutex> guard(mutex_);
         if (closed_) return;
         if (!pending_.empty()) throw std::runtime_error("async probe close requires drained records");
-        // The final synchronization protects mapped pages during normal shutdown.
+        // 最终流同步保护映射页，也等待没有 Event 的无日志 kernel 完成。
         if (stream_) check(aclrtSynchronizeStream(stream_), "close async probe stream");
         cleanup_after_sync();
         closed_ = true;
     }
 
+    // 异常且设备状态不明时放弃回收映射资源，避免设备写入已释放内存。
     void abandon() noexcept
     {
         std::lock_guard<std::mutex> guard(mutex_);
         if (closed_) return;
-        // On an unknown device state, neither a timeout nor a failed query
-        // proves that mapped pages and event resources can be reclaimed.
+        // 超时或查询失败不能证明设备已停止访问，故资源留到进程结束。
         records_.release();
         stream_ = nullptr;
         for (auto& slot : slots_) slot.event = nullptr;
@@ -267,11 +283,13 @@ private:
         std::array<uint64_t, 2> launch_times{};
     };
 
+    // 拒绝在关闭或出错后的探针上继续提交、查询或释放槽位。
     void ensure_open() const
     {
         if (closed_ || poisoned_) throw std::runtime_error("async clock probe is closed or failed");
     }
 
+    // 只在确认流已同步后销毁 Event、流和映射 Host 记录。
     void cleanup_after_sync() noexcept
     {
         for (auto& slot : slots_) {
@@ -281,11 +299,12 @@ private:
         records_.reset();
     }
 
+    // 析构兜底：尽量同步后释放；同步失败时保留仍可能被设备引用的映射页。
     void cleanup() noexcept
     {
         if (closed_) return;
         if (stream_ && aclrtSynchronizeStream(stream_) != ACL_SUCCESS) {
-            // The device may still write to mapped pages. Leaking is safer than UAF.
+            // 设备可能还在写映射页，宁可保留内存也不能悬空释放。
             records_.release();
             return;
         }
@@ -312,6 +331,7 @@ private:
 };
 }  // namespace
 
+// 把 C++ 生命周期接口暴露给 Python 的提交、收集和写入流水线。
 void bind_clock_probe_async(pybind11::module_& module)
 {
     namespace py = pybind11;

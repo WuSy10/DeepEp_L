@@ -1,9 +1,7 @@
-"""Collect mapped-Host single-AIV timestamps while later operators are submitted.
+"""后续算子继续提交时，后台收集单 AIV 探针写入映射 Host 的时间戳。
 
-This is a bounded experiment. Completed device records are copied into a Host
-queue before their mapped slots are reused; a separate writer converts and
-flushes JSONL. The existing clock_probe command remains the synchronous
-reference run.
+收集线程先复制完成的设备记录，再归还映射槽位；写入线程批量换算并落盘。
+这是有界队列实验；同步参考命令在 clock_probe.py。
 """
 
 import argparse
@@ -21,7 +19,11 @@ from .clock_probe import operator_row
 def run_pipeline(probe, mapping, calibration_id, header, output_path, *, iterations,
                  queue_records, poll_ms, flush_ms, flush_records,
                  submit_interval_us, drain_timeout):
-    """Submit, collect and write with bounded queues; return final counters."""
+    """运行提交、收集、写入三段流水线，返回最终计数。
+
+    映射槽位属于 NPU/原生层；ready 队列只存已复制的 CPU 数据。
+    队列满时收集暂停，槽位不会提前复用，背压最终会造成日志丢弃。
+    """
     ready = queue.Queue(maxsize=queue_records)
     producer_done = threading.Event()
     stopped = threading.Event()
@@ -30,10 +32,12 @@ def run_pipeline(probe, mapping, calibration_id, header, output_path, *, iterati
     final = {}
 
     def fail(exc):
+        """记录后台异常并通知其余线程停止正常工作。"""
         failures.append(exc)
         stopped.set()
 
     def collect():
+        """等 Event 完成后取 CPU 副本；成功入队才释放原映射槽位。"""
         deadline = None
         try:
             while not stopped.is_set():
@@ -44,9 +48,9 @@ def run_pipeline(probe, mapping, calibration_id, header, output_path, *, iterati
                 if ready.full():
                     time.sleep(poll_ms / 1000)
                     continue
-                rows = probe.poll()  # Empty means the oldest slot event is not ready.
+                rows = probe.poll()  # 空结果表示队首槽位的 Event 尚未完成。
                 if rows:
-                    # Each mapped slot is released only after its CPU copy is queued.
+                    # 先让 CPU 副本进入有界队列，再允许设备复用映射槽位。
                     ready.put_nowait(rows[0])
                     probe.release(rows[0][0])
                     continue
@@ -57,11 +61,13 @@ def run_pipeline(probe, mapping, calibration_id, header, output_path, *, iterati
             fail(exc)
 
     def write(output):
-        pending = []  # Raw CPU-owned records awaiting batch conversion and write.
+        """从 CPU 队列取记录，批量换算 tick 并写出 JSONL。"""
+        pending = []  # 等待批量换算和写盘的原始 CPU 副本。
         logged = 0
         last_flush = time.monotonic()
 
         def flush():
+            """把 pending 中的原始 tick 换算为 Host 纳秒并一次写出。"""
             nonlocal last_flush, logged
             if pending:
                 lines = []
@@ -106,6 +112,7 @@ def run_pipeline(probe, mapping, calibration_id, header, output_path, *, iterati
             fail(exc)
 
     with open(output_path, "w", encoding="utf-8") as output:
+        # 校准 header 先于算子提交落盘；正常收尾时 summary 最后写入。
         output.write(json.dumps(header) + "\n")
         output.flush()
         writer = threading.Thread(target=write, args=(output,), name="clock-probe-writer", daemon=True)
@@ -116,7 +123,7 @@ def run_pipeline(probe, mapping, calibration_id, header, output_path, *, iterati
             for _ in range(iterations):
                 if stopped.is_set():
                     raise RuntimeError("async probe background worker failed")
-                # A false return means only this operator's log was dropped.
+                # submit() 返回 false 只表示该算子的日志丢弃，算子仍会运行。
                 probe.submit()
                 if submit_interval_us:
                     time.sleep(submit_interval_us / 1_000_000)
@@ -157,12 +164,13 @@ def run_pipeline(probe, mapping, calibration_id, header, output_path, *, iterati
         if writer.is_alive():
             fail(TimeoutError("async probe writer did not stop"))
         if failures:
-            probe.abandon()  # Unknown device state: do not reuse/free mapped pages.
+            probe.abandon()  # 设备状态不明时保留映射页，避免设备继续写已释放内存。
             raise failures[0]
     return final
 
 
 def main():
+    """单卡异步实验入口：先校准和留出验收，再启动事件门控采集。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--samples", type=int, default=32)
@@ -195,6 +203,7 @@ def main():
     torch.npu.set_device(args.device)
     torch.npu.synchronize()
     mapping = calibrate(args.samples, args.warmup, args.interval)
+    # 前两批决定映射；第三批只验证，失败时不会创建异步探针。
     time.sleep(args.interval)
     native = require_native("async clock probe")
     device, soc, samples = native.clock_calibration_samples(args.samples, args.warmup)

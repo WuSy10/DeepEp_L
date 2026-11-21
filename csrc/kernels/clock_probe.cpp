@@ -5,8 +5,8 @@ namespace {
 constexpr uint64_t kProbeMagic = 0x434c4f434b50524fULL;
 }
 
-// One AIV performs the probe workload. A null mapped_record disables timing
-// collection while keeping the workload and its vector completion wait.
+// 单 AIV 探针：起止 tick 包围向量计算和完成等待，不包含随后 MTE3 写日志的时间。
+// mapped_record 为空时仍执行计算，只跳过读钟和日志写入。
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void deepep_clock_probe(
     GM_ADDR mapped_record, uint64_t sequence, uint32_t work_iters)
 {
@@ -34,7 +34,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void deepep_clock
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
     const int32_t result = values.GetValue(0);
     if (!record_timing) {
-        // Keep the vector result observable even without a Host record.
+        // 槽位满时也保留可观察的计算结果，不能把“丢日志”变成“跳过算子”。
         volatile int32_t consumed = result;
         (void)consumed;
         return;
@@ -49,6 +49,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void deepep_clock
     local.SetValue(5, kProbeMagic);
     local.SetValue(6, static_cast<uint64_t>(work_iters));
     local.SetValue(7, ~sequence);
+    // 八个 uint64 字段共 64 字节，经 MTE3 直接写到该算子独占的映射 Host 槽位。
     AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
     AscendC::GlobalTensor<uint64_t> record;
@@ -61,5 +62,6 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void deepep_clock
 extern "C" DEEPEP_EXPORT void deepep_clock_probe_do(
     void* stream, void* mapped_record, uint64_t sequence, uint32_t work_iters)
 {
+    // 只负责把探针放入指定流；完成确认由同步批次或异步 Event 路径负责。
     deepep_clock_probe<<<1, 320, stream>>>(static_cast<uint8_t*>(mapped_record), sequence, work_iters);
 }
