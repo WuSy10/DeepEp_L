@@ -104,3 +104,58 @@ C++ 元数据上下文采用线程局部存储和作用域恢复，异常退出�
 本次不补充 GPU NVLink 域 rank、GPU kernel 内部 iter、训练 step/microbatch 编号或物理 PCI bus ID；也不增加 Python API 周期汇总、文件轮转或版本配置日志。它们不能由现有 kernel gid 推导出来。当前元数据接入 V2 Python API；直接调用底层原生接口不保证有完整 Python API/handle 元数据。
 
 新数据建议使用 --require-metadata 校验，检查字段完整性、launch/end 元数据相等、同一 API 的元数据一致性及 handle 路由信息稳定性。旧日志不带此参数仍可校验。远端验证应覆盖 fresh/cached/无 weight 与带 weight 的 combine、expand=0/1、超过 128 槽的复用、不同通信/归约 AIV 数，以及多个 Buffer 的身份隔离。必须重新构建 Host 扩展；性能开销需要相同输入下 trace 开关对照。
+
+## 新元数据与开销验收用例
+
+`tests/runtime/test_kernel_trace.py` 同时提供 CPU 回归和可选择运行的 NPU 验收入口，不需要新建 benchmark 脚本。
+
+CPU 回归检查元数据关联、错误字段、遗漏 API、槽位代际协议，以及开销判定的通过、失败和不确定分支：
+
+```bash
+python -m pytest tests/runtime/test_kernel_trace.py -q
+```
+
+在已安装本分支 wheel、Torch、torch_npu、pytest 的 Linux 单机 UDMA 环境，空闲的四张 NPU 上执行：
+
+```bash
+python -u tests/runtime/test_kernel_trace.py --npu \
+    --ep-size 4 --first-device 0 \
+    --num-tokens 2048 --hidden 6144 --num-topk 8 --experts-per-rank 32 \
+    --aiv 32 --reduce-aiv 32 \
+    --pairs 6 --windows 3 --iterations 100 --warmup 10 \
+    --output "$PWD/kernel_trace_acceptance_$(date +%Y%m%d_%H%M%S)"
+```
+
+输出目录必须尚不存在。也可设置 `DEEPEP_RUN_TRACE_NPU=1` 后通过 pytest 运行 `test_npu_metadata_and_overhead`；该入口使用上述默认配置。普通 pytest 默认跳过实机测试。
+
+此用例固定 BF16、随机路由、expand=0、无 bias，不清理 L2。依次覆盖 fresh dispatch、cached dispatch、无 weight 和带 weight 的 combine。weight 是 combine 的 topk_weights 输入，未增加 bias。精度用独立 CPU reference 检查，发生在计时之前。
+
+采集开启时，检查所有 rank 的真实 JSONL：
+
+- 字段完整、launch/end 配对、时钟换算一致，且 summary 中 dropped/incomplete 均为零。
+- shape、dtype、原始 token 数、专家数、容量、实际输入/输出行数、PID、device 和 global_rank 与测试输入/进程相符。
+- comm_id 覆盖完整 EP 组；每次 fresh 调用产生不同 handle_id，cached dispatch 和两种 combine 引用准备阶段的同一个 handle。
+- API 调用数与准备、预热和正式执行数一致，每个日志超过 128 条完成记录。代际旧值拒收由 CPU 原生协议测试另行验证。
+
+每对 A/B 使用独立的 torchrun 进程组，交替执行 off→on、on→off，默认共 6 对、12 次进程组/Buffer 初始化。子进程清除继承的 DEEPEP_TRACE_DIR 和 PYTHONPATH，在输出目录运行以加载已安装 wheel；其他运行环境保持一致。初始化、精度检查、预热和退出排空不计入稳态开销。
+
+计时不启用 profiler、不捕获 Graph，每个窗口连续执行多次 eager API。窗口前设备同步和 Host barrier 在计时之外，窗口末设备同步计入耗时；逐次只插入正常的事件流依赖，不额外逐次做 Host 同步。计时包含 Host 提交、设备执行、业务路径原有同步和同时运行的 Python 日志线程影响。每个窗口取所有 rank 的最大耗时，各窗口取中位数，得到一次进程试验的每 API 耗时。
+
+每种操作独立计算配对开销：
+
+$$
+\Delta_i = 100\left(\frac{T_{\mathrm{on},i}}{T_{\mathrm{off},i}}-1\right)\%.
+$$
+
+对进程级配对样本的中位数做固定随机种子的 10,000 次 bootstrap，输出每种操作的 95% 经验区间。区间上界严格小于 1% 为 PASS；下界大于等于 1% 为 FAIL；其余为 INCONCLUSIVE。四种操作均 PASS 且精度/日志校验通过时退出码为 0，否则非零。窗口不作为独立试验增加样本数，不剔除慢样本。
+
+这是指定 shape 和运行环境的稳态验收，不是所有训练负载的开销保证，也不保证 bootstrap 区间消除系统性频率/负载漂移。波动较大时可增加 `--pairs 12 --windows 5 --iterations 500` 并保持机器空闲。初始化校准与最后日志排空另存耗时，不被宣称满足稳态的 1% 阈值。expand=1、多 Buffer、不同拓扑和 Graph 不在这个实机入口的验收范围内。
+
+产物如下：
+
+- `acceptance.json`：总结果、四种操作的开销、区间及 PASS/FAIL/INCONCLUSIVE；异常时保存失败原因。
+- `config.json`、`runs.json`：配置、各对 A/B 的汇总原始值。
+- `pairXX_on/trace/`：真实 Python 落盘日志；off 目录不应有 trace。
+- `pairXX_on/` 和 `pairXX_off/` 下的 `rankN.json`：每 rank 每窗口耗时、初始化/退出排空耗时、wheel 路径和精度结果；`run.log` 保存 torchrun 输出。
+
+单次 torchrun 默认超时 1800 秒，可用 `--timeout` 调整。超时或中断时终止该次创建的进程组，不影响其他任务。未实际执行 NPU 验收前，CPU 测试通过不能视为开销已满足 1%。

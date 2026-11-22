@@ -2,9 +2,13 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import random
 import shutil
+import statistics
 import subprocess
+import sys
 import threading
 import time
 
@@ -449,3 +453,492 @@ def test_checker_host_metadata(mixed_trace, corruption):
             checker.check(path.parent, 1, require_metadata=True)
     else:
         assert checker.check(path.parent, 1, require_metadata=True) == 130
+
+
+PERF_OPS = ("fresh_dispatch", "cached_dispatch", "combine_unweighted", "combine_weighted")
+
+
+def overhead_result(off, on):
+    """Paired, process-level samples; inner windows are not independent trials."""
+    import math
+
+    if len(off) != len(on) or len(off) < 6:
+        raise ValueError("at least six matched process pairs are required")
+    if any(not math.isfinite(v) or v <= 0 for v in (*off, *on)):
+        raise ValueError("timings must be finite and positive")
+    ratios = [100 * (b / a - 1) for a, b in zip(off, on)]
+    rng = random.Random(20260823)
+    estimates = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(10000))
+    low, high = estimates[249], estimates[9749]
+    return dict(
+        status="PASS" if high < 1 else "FAIL" if low >= 1 else "INCONCLUSIVE",
+        paired_overhead_percent=ratios,
+        median_percent=statistics.median(ratios),
+        bootstrap_95_percent=[low, high],
+    )
+
+
+@pytest.mark.parametrize("on,status", [([99] * 6, "PASS"), ([103] * 6, "FAIL"), ([96, 104] * 3, "INCONCLUSIVE")])
+def test_overhead_acceptance(on, status):
+    assert overhead_result([100] * 6, on)["status"] == status
+
+
+@pytest.mark.parametrize("off,on", [([100] * 5, [100] * 5), ([0] * 6, [100] * 6), ([100] * 6, [float("nan")] * 6)])
+def test_overhead_rejects_invalid_samples(off, on):
+    with pytest.raises(ValueError):
+        overhead_result(off, on)
+
+
+def validate_npu_metadata(directory, manifests, args):
+    spec = importlib.util.spec_from_file_location("trace_checker_npu", ROOT / "scripts/check_kernel_trace.py")
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    checker.check(
+        directory, args.ep_size, ("notify_dispatch", "cached_notify_dispatch", "dispatch", "combine"), True, True
+    )
+    calls = {}
+    stages = {}
+    for path in directory.glob("kernel-*.jsonl"):
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            if row["event"] != "end":
+                continue
+            rank = row["rank"]
+            manifest = manifests[rank]
+            expected = dict(
+                num_tokens=args.num_tokens,
+                hidden_size=args.hidden,
+                topk=args.num_topk,
+                num_experts=args.ep_size * args.experts_per_rank,
+                dtype="torch.bfloat16",
+                element_bytes=2,
+                do_expand=0,
+                token_capacity=args.num_tokens,
+                ep_size=args.ep_size,
+                global_rank=rank,
+                device=args.first_device + rank,
+                pid=manifest["pid"],
+            )
+            is_combine = row["api_name"] == "combine"
+            expected["api_input_rows"] = manifest["recv_rows"] if is_combine else args.num_tokens
+            if row["op_name"] in ("dispatch", "combine"):
+                expected["kernel_input_rows"] = expected["api_input_rows"]
+                expected["kernel_output_rows"] = args.num_tokens if is_combine else manifest["recv_rows"]
+            for key, value in expected.items():
+                if row.get(key) != value:
+                    raise ValueError(f"rank {rank} gid {row['gid']}: {key}={row.get(key)!r}, expected {value!r}")
+            if (is_combine or row["cached"]) and row["handle_id"] != manifest["handle_id"]:
+                raise ValueError("cached dispatch/combine lost the original fresh handle association")
+            calls[rank, row["api_call_id"]] = row
+            stages.setdefault((rank, row["api_call_id"]), set()).add(row["op_name"])
+    for key, row in calls.items():
+        required = (
+            {"combine"}
+            if row["api_name"] == "combine"
+            else {"dispatch", "cached_notify_dispatch" if row["cached"] else "notify_dispatch"}
+        )
+        if not required <= stages[key]:
+            raise ValueError(f"rank/API {key}: missing kernel stages {required - stages[key]}")
+    per_kind = 1 + args.warmup + args.windows * args.iterations
+    for rank in range(args.ep_size):
+        rows = [row for (r, _), row in calls.items() if r == rank]
+        counts = {
+            "fresh": sum(row["api_name"] == "dispatch" and not row["cached"] for row in rows),
+            "cached": sum(row["api_name"] == "dispatch" and bool(row["cached"]) for row in rows),
+            "combine": sum(row["api_name"] == "combine" for row in rows),
+        }
+        if counts != dict(fresh=per_kind, cached=per_kind, combine=2 * per_kind):
+            raise ValueError(f"rank {rank}: missing/extra API records: {counts}")
+        fresh_ids = [row["handle_id"] for row in rows if row["api_name"] == "dispatch" and not row["cached"]]
+        if len(set(fresh_ids)) != per_kind or manifests[rank]["handle_id"] not in fresh_ids:
+            raise ValueError("fresh calls did not produce distinct, associated handles")
+
+
+@pytest.mark.parametrize("corruption", [None, "shape", "handle", "missing_call", "missing_stage"])
+def test_npu_metadata_acceptance(tmp_path, corruption):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        ep_size=1,
+        num_tokens=2048,
+        hidden=6144,
+        num_topk=8,
+        experts_per_rank=32,
+        first_device=0,
+        warmup=1,
+        windows=1,
+        iterations=32,
+    )
+    per_kind = 1 + args.warmup + args.iterations
+    rows = [dict(event="calibration", tick_hz=1_000_000_000, tick=10, offset_ns=1000)]
+    gid = call_id = 0
+    for kind in PERF_OPS:
+        for i in range(per_kind):
+            call_id += 1
+            if corruption == "missing_call" and kind == "combine_weighted" and i == 0:
+                continue
+            combine = kind.startswith("combine")
+            cached = kind == "cached_dispatch"
+            stages = (
+                [("combine", "v1_combine_udma_comm_kernel")]
+                if combine
+                else [
+                    ("cached_notify_dispatch", "cached_notify_dispatch_kernel")
+                    if cached
+                    else ("notify_dispatch", "notify_dispatch_kernel"),
+                    ("dispatch", "v1_dispatch_udma_kernel"),
+                ]
+            )
+            for op, kernel in stages:
+                if corruption == "missing_stage" and kind == "fresh_dispatch" and i == 0 and op == "dispatch":
+                    continue
+                gid += 1
+                row = dict(
+                    metadata_version=1,
+                    comm_id="comm",
+                    buffer_id=1,
+                    process_id="process",
+                    hostname="host",
+                    ep_size=1,
+                    api_name="combine" if combine else "dispatch",
+                    api_call_id=call_id,
+                    handle_id=1 if combine or cached else i + 1,
+                    hidden_size=6144,
+                    element_bytes=2,
+                    dtype="torch.bfloat16",
+                    num_experts=32,
+                    topk=8,
+                    num_tokens=2048,
+                    api_input_rows=2048,
+                    cached=int(cached),
+                    do_expand=0,
+                    token_capacity=2048,
+                    pid=100,
+                    device=0,
+                    global_rank=0,
+                    rank=0,
+                    local_instance=0,
+                    stream="12345",
+                    gid=gid,
+                    launch_ns=1000,
+                    op_name=op,
+                    kernel_name=kernel,
+                    aiv=32,
+                )
+                if op in ("combine", "dispatch"):
+                    row.update(kernel_input_rows=2048, kernel_output_rows=2048)
+                if corruption == "shape":
+                    row["hidden_size"] = 5120  # Internally consistent, but does not match the workload.
+                if corruption == "handle" and cached:
+                    row["handle_id"] = 999
+                rows += [
+                    dict(row, event="launch", status=0),
+                    dict(row, event="end", start_tick=1, end_tick=101, start_ns=1001, end_ns=1101, elapsed_ns=100),
+                ]
+    rows.append(dict(event="summary", completed=gid, incomplete=0, dropped=0))
+    (tmp_path / "kernel-fixture.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    manifests = [dict(pid=100, recv_rows=2048, handle_id=1)]
+    if corruption:
+        with pytest.raises(
+            ValueError,
+            match={
+                "shape": "hidden_size",
+                "handle": "original fresh handle",
+                "missing_call": "API records",
+                "missing_stage": "missing kernel stages",
+            }[corruption],
+        ):
+            validate_npu_metadata(tmp_path, manifests, args)
+    else:
+        validate_npu_metadata(tmp_path, manifests, args)
+
+
+def npu_worker(args):
+    """Use the installed wheel. CPU references and assertions stay outside timing."""
+    import datetime
+    import torch
+    import torch.distributed as dist
+    import torch_npu  # noqa: F401
+    import deep_ep
+    from deep_ep.backends.global_clos import ElasticBuffer
+
+    sys.path.insert(0, str(ROOT / "tests/clos"))
+    import common as golden
+
+    rank = int(os.environ["RANK"])
+    assert int(os.environ["WORLD_SIZE"]) == args.ep_size
+    torch.set_num_threads(1)
+    torch.npu.set_device(args.first_device + rank)
+    dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=300))
+    args.dtype, args.seed = "bf16", 20260823
+    args.num_aiv, args.expert_alignment = args.aiv, 1
+    routes = [golden._make_topk_idx(peer, args) for peer in range(args.ep_size)]
+    source = golden._make_dispatch_x(rank, args)
+    weights_cpu = golden._make_weights(rank, args)
+    x, idx, weights = source.to("npu"), routes[rank].to("npu"), weights_cpu.to("npu")
+    started = time.perf_counter_ns()
+    buffer = ElasticBuffer(
+        dist.group.WORLD,
+        num_max_tokens_per_rank=args.num_tokens,
+        hidden=args.hidden,
+        num_topk=args.num_topk,
+        explicitly_destroy=True,
+        transport="udma",
+    )
+    init_ns = time.perf_counter_ns() - started
+
+    def dispatch(handle=None):
+        return buffer.dispatch(
+            x,
+            topk_idx=idx if handle is None else None,
+            topk_weights=weights if handle is None else None,
+            num_experts=args.ep_size * args.experts_per_rank,
+            handle=handle,
+            num_sms=args.aiv,
+            expert_alignment=1,
+            async_with_compute_stream=True,
+        )
+
+    def consume(result):
+        # Preserve the normal consumer dependency; this is a stream wait, not CPU synchronization.
+        result[-1].current_stream_wait()
+        return result
+
+    fresh = consume(dispatch())
+    torch.npu.synchronize()
+    ref = golden._dispatch_reference(rank, args)
+    for actual, key in zip(fresh[:3], ("recv_x", "recv_topk_idx", "recv_topk_weights")):
+        golden._assert_equal(key, actual, ref[key])
+    handle = fresh[3]
+    owned, recv_weights = fresh[0].clone(), fresh[2].clone()
+    cached = consume(dispatch(handle))
+    torch.npu.synchronize()
+    golden._assert_equal("cached dispatch", cached[0], ref["recv_x"])
+
+    def combine(weighted):
+        return buffer.combine(
+            owned,
+            handle,
+            topk_weights=recv_weights if weighted else None,
+            num_sms=args.aiv,
+            reduce_num_sms=args.reduce_aiv,
+            async_with_compute_stream=True,
+        )
+
+    expected = torch.zeros_like(source, dtype=torch.float32)
+    for peer in range(args.ep_size):
+        mask = (routes[rank] >= peer * args.experts_per_rank) & (routes[rank] < (peer + 1) * args.experts_per_rank)
+        expected[mask.any(1)] += source[mask.any(1)].float()
+    for weighted in (False, True):
+        result = consume(combine(weighted))
+        torch.npu.synchronize()
+        golden._assert_equal("combine payload", result[0], expected.to(torch.bfloat16))
+        if weighted:
+            expected_weights = weights_cpu.clone()
+            expected_weights[routes[rank] == -1] = 0
+            golden._assert_equal("combine weights", result[1], expected_weights)
+        else:
+            assert result[1] is None
+    timings = {}
+    for name, operation in zip(
+        PERF_OPS, (dispatch, lambda: dispatch(handle), lambda: combine(False), lambda: combine(True))
+    ):
+        for _ in range(args.warmup):
+            consume(operation())
+        timings[name] = []
+        for _ in range(args.windows):
+            torch.npu.synchronize()
+            dist.barrier()
+            started = time.perf_counter_ns()
+            for _ in range(args.iterations):
+                consume(operation())
+            torch.npu.synchronize()
+            timings[name].append((time.perf_counter_ns() - started) / args.iterations)
+    manifest = dict(
+        rank=rank,
+        pid=os.getpid(),
+        wheel=deep_ep.__file__,
+        init_ns=init_ns,
+        timings_ns=timings,
+        recv_rows=owned.size(0),
+        handle_id=getattr(handle, "_trace_handle_id", None),
+        precision_passed=True,
+    )
+    started = time.perf_counter_ns()
+    buffer.destroy()  # Flush/close trace before the controller validates logs.
+    manifest["destroy_and_drain_ns"] = time.perf_counter_ns() - started
+    (args.output / f"rank{rank}.json").write_text(json.dumps(manifest, indent=2))
+    dist.destroy_process_group()
+
+
+def npu_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="KernelTrace real-NPU metadata and trace off/on acceptance")
+    parser.add_argument("--npu", action="store_true")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--output", type=Path, required=True)
+    for name, default in dict(
+        ep_size=4,
+        first_device=0,
+        num_tokens=2048,
+        hidden=6144,
+        num_topk=8,
+        experts_per_rank=32,
+        aiv=32,
+        reduce_aiv=32,
+        pairs=6,
+        windows=3,
+        iterations=100,
+        warmup=10,
+        timeout=1800,
+    ).items():
+        parser.add_argument("--" + name.replace("_", "-"), type=int, default=default)
+    return parser
+
+
+def run_npu_process(command, destination, env, log, timeout):
+    import signal
+
+    # torchrun owns the workers. On timeout, terminate this run's process group only.
+    with subprocess.Popen(
+        command, cwd=destination, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+    ) as process:
+        try:
+            code = process.wait(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        if code:
+            raise RuntimeError(f"NPU worker exited {code}; see {destination / 'run.log'}")
+
+
+def run_npu_acceptance(args):
+    args._created_output = False
+    try:
+        return _run_npu_acceptance(args)
+    except Exception as error:
+        # Do not modify an existing output directory rejected by the initial mkdir.
+        if getattr(args, "_created_output", False):
+            (args.output / "acceptance.json").write_text(json.dumps(dict(passed=False, error=str(error)), indent=2))
+        raise
+
+
+def _run_npu_acceptance(args):
+    if args.pairs < 6 or args.windows < 1 or args.iterations < 32 or args.warmup < 1:
+        raise ValueError("require pairs>=6, windows>=1, iterations>=32, warmup>=1")
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=False)
+    args._created_output = True
+    (args.output / "config.json").write_text(json.dumps(vars(args), default=str, indent=2))
+    runs = []
+    for pair in range(args.pairs):
+        # Fresh processes avoid inherited native singleton/env state; counterbalance thermal/order effects.
+        for enabled in (False, True) if pair % 2 == 0 else (True, False):
+            destination = args.output / f"pair{pair:02d}_{'on' if enabled else 'off'}"
+            destination.mkdir()
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env.pop("DEEPEP_TRACE_DIR", None)
+            env.update(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
+            if enabled:
+                env["DEEPEP_TRACE_DIR"] = str(destination / "trace")
+            command = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nnodes=1",
+                f"--nproc-per-node={args.ep_size}",
+                str(Path(__file__).resolve()),
+                "--worker",
+                "--output",
+                str(destination),
+            ]
+            for key, value in vars(args).items():
+                if key not in ("npu", "worker", "output") and not key.startswith("_"):
+                    command += ["--" + key.replace("_", "-"), str(value)]
+            print(f"RUN {destination.name}", flush=True)
+            with (destination / "run.log").open("w") as log:
+                run_npu_process(command, destination, env, log, args.timeout)
+            manifests = [json.loads((destination / f"rank{rank}.json").read_text()) for rank in range(args.ep_size)]
+            if enabled:
+                validate_npu_metadata(destination / "trace", manifests, args)
+            elif list(destination.rglob("kernel-*.jsonl")):
+                raise AssertionError("trace-off run unexpectedly produced logs")
+            # Slowest rank per window determines collective progress; median windows per process trial.
+            values = {
+                op: statistics.median(max(m["timings_ns"][op][w] for m in manifests) for w in range(args.windows))
+                for op in PERF_OPS
+            }
+            runs.append(dict(pair=pair, enabled=enabled, ns_per_api=values))
+            (args.output / "runs.json").write_text(json.dumps(runs, indent=2))
+    results = {
+        op: overhead_result(
+            [r["ns_per_api"][op] for r in runs if not r["enabled"]],
+            [r["ns_per_api"][op] for r in runs if r["enabled"]],
+        )
+        for op in PERF_OPS
+    }
+    passed = all(result["status"] == "PASS" for result in results.values())
+    report = dict(passed=passed, metadata_passed=True, precision_passed=True, operations=results)
+    (args.output / "acceptance.json").write_text(json.dumps(report, indent=2))
+    print(json.dumps(report, indent=2), flush=True)
+    return passed
+
+
+def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
+    args = npu_parser().parse_args(["--npu", "--output", str(tmp_path / "ab")])
+    order = []
+    checked = []
+    monkeypatch.setenv("DEEPEP_TRACE_DIR", "must-not-leak")
+    monkeypatch.setenv("PYTHONPATH", "must-not-leak")
+
+    def launch(command, destination, env, log, timeout):
+        enabled = "DEEPEP_TRACE_DIR" in env
+        order.append(enabled)
+        assert "PYTHONPATH" not in env
+        assert "--worker" in command and "--standalone" in command
+        if enabled:
+            assert env["DEEPEP_TRACE_DIR"] == str(destination / "trace")
+        for rank in range(args.ep_size):
+            manifest = dict(timings_ns={op: [99 if enabled else 100] * args.windows for op in PERF_OPS})
+            (destination / f"rank{rank}.json").write_text(json.dumps(manifest))
+
+    monkeypatch.setattr(sys.modules[__name__], "run_npu_process", launch)
+    monkeypatch.setattr(sys.modules[__name__], "validate_npu_metadata", lambda *items: checked.append(items[0]))
+    assert run_npu_acceptance(args)
+    assert order == [False, True, True, False] * 3
+    assert len(checked) == 6
+    report = json.loads((args.output / "acceptance.json").read_text())
+    assert report["passed"] and set(report["operations"]) == set(PERF_OPS)
+    for result in report["operations"].values():
+        assert result["median_percent"] == pytest.approx(-1)
+
+
+@pytest.mark.skipif(os.environ.get("DEEPEP_RUN_TRACE_NPU") != "1", reason="opt-in real NPU acceptance")
+def test_npu_metadata_and_overhead(tmp_path):
+    args = npu_parser().parse_args(["--npu", "--output", str(tmp_path / "acceptance")])
+    assert run_npu_acceptance(args), "not all operations demonstrate <1% overhead; inspect acceptance.json"
+
+
+if __name__ == "__main__":
+    arguments = npu_parser().parse_args()
+    if arguments.worker:
+        npu_worker(arguments)
+    elif arguments.npu:
+        sys.exit(0 if run_npu_acceptance(arguments) else 1)
+    else:
+        raise SystemExit("use --npu, or run this file with pytest for CPU protocol tests")
