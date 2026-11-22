@@ -34,6 +34,48 @@ void Check(aclError status, const char* op)
 }
 }  // namespace
 
+namespace {
+void JsonString(std::string& out, const std::string& value)
+{
+    constexpr char hex[] = "0123456789abcdef";
+    out += '"';
+    for (unsigned char ch : value) {
+        if (ch == '"' || ch == '\\') { out += '\\'; out += ch; }
+        else if (ch < 0x20) { out += "\\u00"; out += hex[ch >> 4]; out += hex[ch & 15]; }
+        else out += ch; // Preserve UTF-8; the Python file is opened with encoding="utf-8".
+    }
+    out += '"';
+}
+}
+std::string EncodeTraceRecords(const std::vector<TraceRecord>& records)
+{
+    std::string out;
+    out.reserve(records.size() * 1024);
+    for (const auto& record : records) {
+        out += '{';
+        bool first = true;
+        auto key = [&](const std::string& name) {
+            if (!first) out += ',';
+            first = false; JsonString(out, name); out += ':';
+        };
+        auto label = [&](const std::string& name, const std::string& value) {
+            if (record.values.count(name)) return;
+            key(name); JsonString(out, value);
+        };
+        label("event", record.event);
+        if (!record.op_name.empty()) label("op_name", record.op_name);
+        if (!record.kernel_name.empty()) label("kernel_name", record.kernel_name);
+        for (const auto& item : record.labels) {
+            if (item.first == "event" || (item.first == "op_name" && !record.op_name.empty()) ||
+                (item.first == "kernel_name" && !record.kernel_name.empty())) continue;
+            label(item.first, item.second);
+        }
+        for (const auto& item : record.values) { key(item.first); out += std::to_string(item.second); }
+        out += "}\n";
+    }
+    return out;
+}
+
 TraceMetadataSnapshot CurrentTraceMetadata()
 {
     return active_metadata;
@@ -181,9 +223,9 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
         if (slot.ep_size) record.values["ep_size"] = slot.ep_size;
         if (slot.input_rows >= 0) record.values["kernel_input_rows"] = slot.input_rows;
         if (slot.output_rows >= 0) record.values["kernel_output_rows"] = slot.output_rows;
-        if (slot.metadata) {
-            record.values.insert(slot.metadata->values.begin(), slot.metadata->values.end());
-            record.labels = slot.metadata->labels;
+        for (auto metadata = slot.metadata; metadata; metadata = metadata->parent) {
+            record.values.insert(metadata->values.begin(), metadata->values.end());
+            record.labels.insert(metadata->labels.begin(), metadata->labels.end());
         }
         record.labels["stream"] = std::to_string(slot.stream);
         if (!slot.logged_launch) {

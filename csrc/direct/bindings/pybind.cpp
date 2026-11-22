@@ -16,9 +16,30 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.attr("kernel_trace_diagnostic_version") = 1;
+    m.attr("kernel_trace_diagnostic_version") = 2;
     using ascend_deepep::trace::KernelTrace;
     using ascend_deepep::trace::TraceRecord;
+    struct Snapshot { ascend_deepep::trace::TraceMetadataSnapshot value; };
+    pybind11::class_<Snapshot>(m, "TraceMetadataSnapshot");
+    m.def("make_trace_metadata", [](pybind11::dict fields, const Snapshot& parent) {
+        auto value = std::make_shared<ascend_deepep::trace::TraceMetadata>();
+        value->parent = parent.value;
+        for (const auto& item : fields) {
+            auto key = pybind11::cast<std::string>(item.first);
+            if (pybind11::isinstance<pybind11::str>(item.second)) value->labels[key] = pybind11::cast<std::string>(item.second);
+            else value->values[key] = pybind11::cast<int64_t>(item.second);
+        }
+        return Snapshot{value};
+    }, pybind11::arg("fields"), pybind11::arg("parent") = Snapshot{});
+    m.def("push_trace_metadata", [](const Snapshot& base, int64_t api, int64_t handle) {
+        auto value = std::make_shared<ascend_deepep::trace::TraceMetadata>();
+        value->parent = base.value;
+        value->values = {{"api_call_id", api}, {"handle_id", handle}};
+        return Snapshot{ascend_deepep::trace::ExchangeTraceMetadata(value)};
+    });
+    m.def("restore_trace_metadata", [](const Snapshot& previous) {
+        ascend_deepep::trace::ExchangeTraceMetadata(previous.value);
+    });
     auto to_dict = [](const TraceRecord& record) {
         pybind11::dict result;
         for (const auto& item : record.labels) result[pybind11::str(item.first)] = item.second;
@@ -33,6 +54,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             return reinterpret_cast<uintptr_t>(&trace);
         })
         .def("calibration", [to_dict](const KernelTrace& trace) { return to_dict(trace.Calibration()); })
+        .def("drain_trace_json", [](KernelTrace& trace, bool closing) {
+            std::string text;
+            {
+                pybind11::gil_scoped_release release;
+                auto records = trace.Drain(closing);
+                text = ascend_deepep::trace::EncodeTraceRecords(records);
+            } // Native records and maps are destroyed before reacquiring GIL.
+            return text;
+        }, pybind11::arg("closing") = false)
         .def("drain_trace", [to_dict](KernelTrace& trace, bool closing) {
             std::vector<TraceRecord> records;
             {
@@ -44,7 +74,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             return result;
         }, pybind11::arg("closing") = false)
         .def("synchronize", &KernelTrace::Synchronize, pybind11::call_guard<pybind11::gil_scoped_release>())
-        .def("drain_trace_diagnostic", [to_dict](KernelTrace& trace, bool include_records, bool timing, bool closing) {
+        .def("drain_trace_diagnostic", [](KernelTrace& trace, bool include_records, bool timing, bool closing) {
             using Clock = std::chrono::steady_clock;
             const auto now = [timing]() -> int64_t {
                 return timing ? std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -54,7 +84,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             std::map<std::string, int64_t> counters{{"polls", 1}, {"records", 0}, {"launches", 0},
                 {"ends", 0}, {"launch_errors", 0}, {"summaries", 0}, {"completed", 0},
                 {"incomplete", 0}, {"dropped", 0}};
-            int64_t drain_ns{};
+            int64_t drain_ns{}, serialize_ns{};
+            std::string text;
             {
                 pybind11::gil_scoped_release release;
                 const auto begin = now();
@@ -71,38 +102,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
                             counters[key] += record.values.at(key);
                     }
                 }
+                if (include_records) {
+                    const auto encode_begin = now();
+                    text = ascend_deepep::trace::EncodeTraceRecords(records);
+                    serialize_ns = now() - encode_begin;
+                }
+                records.clear();
             }
             const auto begin = now();
-            pybind11::list converted;
-            if (include_records)
-                for (const auto& record : records) converted.append(to_dict(record));
+            pybind11::str converted(text);
             const auto convert_ns = now() - begin;
             pybind11::dict result;
             for (const auto& item : counters) result[pybind11::str(item.first)] = item.second;
             result["drain_ns"] = drain_ns;
             result["convert_ns"] = convert_ns;
-            result["items"] = converted;
+            result["text"] = converted;
+            result["serialize_ns"] = serialize_ns;
             return result;
         }, pybind11::arg("include_records"), pybind11::arg("timing") = false, pybind11::arg("closing") = false);
-    // Thread-local Host context; Reserve snapshots it before device launch.
-    m.def("exchange_kernel_trace_metadata", [](pybind11::dict fields) {
-        ascend_deepep::trace::TraceMetadata metadata;
-        for (const auto& item : fields) {
-            const auto key = pybind11::cast<std::string>(item.first);
-            if (pybind11::isinstance<pybind11::str>(item.second))
-                metadata.labels[key] = pybind11::cast<std::string>(item.second);
-            else
-                metadata.values[key] = pybind11::cast<int64_t>(item.second);
-        }
-        const auto previous = ascend_deepep::trace::ExchangeTraceMetadata(
-            std::make_shared<const ascend_deepep::trace::TraceMetadata>(std::move(metadata)));
-        pybind11::dict result;
-        if (previous) {
-            for (const auto& item : previous->values) result[pybind11::str(item.first)] = item.second;
-            for (const auto& item : previous->labels) result[pybind11::str(item.first)] = item.second;
-        }
-        return result;
-    });
     m.def("get_kernel_trace", &KernelTrace::Open);
     m.def("get_shmem_unique_id" , &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);

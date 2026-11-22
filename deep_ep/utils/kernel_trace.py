@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 from contextlib import contextmanager
+from collections import ChainMap
 import itertools
 import json
 import os
@@ -92,9 +93,9 @@ class KernelTrace:
             if entry["mode"]:
                 KernelTrace._diagnostic_drain(entry, closing)
                 return
-            records = entry["source"].drain_trace(closing)
-            if records:
-                entry["stream"].writelines(json.dumps(record) + "\n" for record in records)
+            text = entry["source"].drain_trace_json(closing)
+            if text:
+                entry["stream"].write(text)
                 entry["stream"].flush()
         except Exception as error:
             if not entry["failed"]:
@@ -108,27 +109,17 @@ class KernelTrace:
         batch = entry["source"].drain_trace_diagnostic(mode != "native", timing, closing)
         if timing:
             batch["drain_call_wall_ns"] = time.perf_counter_ns() - begin
-        records = batch.pop("items")
+        text = batch.pop("text")
         stats = entry["statistics"]
         for key, value in batch.items():
             stats[key] = stats.get(key, 0) + value
-        if mode == "native" or not records:
+        if mode != "full" or not text:
             return
+        begin = time.perf_counter_ns() if timing else 0
+        entry["stream"].write(text)
+        entry["stream"].flush()
         if timing:
-            begin = time.perf_counter_ns()
-            lines = [json.dumps(record) + "\n" for record in records]
-            stats["serialize_ns"] = stats.get("serialize_ns", 0) + time.perf_counter_ns() - begin
-            if mode == "full":
-                begin = time.perf_counter_ns()
-                entry["stream"].writelines(lines)
-                entry["stream"].flush()
-                stats["write_flush_ns"] = stats.get("write_flush_ns", 0) + time.perf_counter_ns() - begin
-        elif mode == "json":
-            for record in records:
-                json.dumps(record) + "\n"  # Execute the same serialization, discard the resulting text.
-        else:
-            entry["stream"].writelines(json.dumps(record) + "\n" for record in records)
-            entry["stream"].flush()
+            stats["write_flush_ns"] = stats.get("write_flush_ns", 0) + time.perf_counter_ns() - begin
 
     @classmethod
     def _poll(cls):
@@ -218,6 +209,8 @@ class KernelTraceSession:
         )
         if global_rank is not None:
             self.fields["global_rank"] = global_rank
+        self._base = native.make_trace_metadata(self.fields)
+        self._templates = {}
 
     @contextmanager
     def call(self, api_name, x, routes, num_experts, handle=None, *, cached=False, expanded=False, capacity=0):
@@ -228,23 +221,47 @@ class KernelTraceSession:
                 handle_id = next(_identities)
                 if handle is not None:
                     handle._trace_handle_id = handle_id
-        fields = dict(
-            self.fields,
-            api_name=api_name,
-            api_call_id=_next_identity(),
-            handle_id=handle_id,
-            hidden_size=int(x.size(1)),
-            element_bytes=x.element_size(),
-            dtype=str(x.dtype),
-            num_experts=int(num_experts),
-            topk=int(routes.size(1)),
-            num_tokens=int(routes.size(0)),
-            api_input_rows=int(x.size(0)),
-            cached=int(cached),
-            do_expand=int(expanded),
-            token_capacity=int(capacity),
+        # Cache by scalar shape/context only; never retain user tensors or handles.
+        key = (
+            api_name,
+            x.size(1),
+            x.element_size(),
+            x.dtype,
+            int(num_experts),
+            routes.size(1),
+            routes.size(0),
+            x.size(0),
+            int(cached),
+            int(expanded),
+            int(capacity),
         )
-        previous = self.native.exchange_kernel_trace_metadata(fields)
+        template = self._templates.get(key)
+        if template is None:
+            fields = dict(
+                zip(
+                    (
+                        "api_name",
+                        "hidden_size",
+                        "element_bytes",
+                        "dtype",
+                        "num_experts",
+                        "topk",
+                        "num_tokens",
+                        "api_input_rows",
+                        "cached",
+                        "do_expand",
+                        "token_capacity",
+                    ),
+                    key,
+                )
+            )
+            fields["dtype"] = str(fields["dtype"])
+            template = (fields, self.native.make_trace_metadata(fields, self._base))
+            if len(self._templates) >= 64:
+                self._templates.clear()  # In-flight native snapshots own their parents independently.
+            self._templates[key] = template
+        dynamic = dict(api_call_id=_next_identity(), handle_id=handle_id)
+        previous = self.native.push_trace_metadata(template[1], dynamic["api_call_id"], handle_id)
         if self.diagnostic_mode:
             kind = ("cached_dispatch" if cached else "fresh_dispatch") if api_name == "dispatch" else api_name
             stats = self.diagnostic_stats.setdefault(kind, dict(calls=0, enter_ns=0, restore_ns=0))
@@ -252,10 +269,10 @@ class KernelTraceSession:
             if self.diagnostic_timing:
                 stats["enter_ns"] += time.perf_counter_ns() - started
         try:
-            yield fields
+            yield ChainMap(dynamic, template[0], self.fields)
         finally:
             started = time.perf_counter_ns() if self.diagnostic_timing else 0
-            self.native.exchange_kernel_trace_metadata(previous)
+            self.native.restore_trace_metadata(previous)
             if self.diagnostic_timing:
                 stats["restore_ns"] += time.perf_counter_ns() - started
 
@@ -270,8 +287,8 @@ def attach_trace_session(native, group, rank, ep_size, all_gather):
         raise ValueError("all EP ranks must agree on DEEPEP_TRACE_DIR enablement and diagnostic settings")
     if not enabled:
         return None, None
-    if mode and getattr(native, "kernel_trace_diagnostic_version", 0) != 1:
-        raise RuntimeError("KernelTrace diagnostics require the matching rebuilt native extension")
+    if getattr(native, "kernel_trace_diagnostic_version", 0) != 2:
+        raise RuntimeError("KernelTrace requires the matching rebuilt native extension")
     identity = None if mode == "metadata" else KernelTrace.attach(native)
     if identity is None and mode != "metadata":
         return None, None

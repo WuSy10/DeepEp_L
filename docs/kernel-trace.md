@@ -51,7 +51,7 @@ $$
 
 ## 上报和资源
 
-Python KernelTrace 在每个进程内共享一个后台线程，管理各活跃 ACL context 的原生采集器。C++ 提供 calibration、drain_trace、synchronize 接口。Python 每轮休眠约 2 ms 后批量读取新记录，负责 JSONL 序列化、写入和刷新。
+Python KernelTrace 在每个进程内共享一个后台线程，管理各活跃 ACL context 的原生采集器。C++ 提供 calibration、drain_trace_json、synchronize 接口。Python 每轮休眠约 2 ms 后调用原生侧回收；原生侧释放 GIL，完成记录合并、JSONL 编码和原生对象清理，返回一块文本。Python 负责批量写入和刷新。
 
 每个采集器分配 128 槽的 Host 映射内存，每槽预留 64 个 AIV，每个 AIV 占用 256 字节，总计约 2 MiB。核内起始 tick 保存在局部变量。结束时 dispatch/notify 复用已释放的 UB，combine/cached notify 在工作结束后使用 32 字节 UB，将 start_tick、end_tick 写入偏移 0，等待 MTE3_S 后，在偏移 128 发布 done_seq。第二次写出也用 MTE3_S 保护 UB 生命周期。combine/cached notify 在读取结束 tick 前用本核 V_S、MTE3_S 将流水完成推进到标量侧；不增加全卡或全核同步。每个 AIV 独占自己的区域。
 
@@ -64,7 +64,7 @@ Host 为成功预留的槽分配从 1 开始的进程内序号，kernel 按此�
 
 ## Host 元数据与调用关联
 
-每条启用 V2 元数据的 launch/end 记录增加 metadata_version=1。元数据在 Python API 的 Host 路径构造，C++ 在 Reserve 时为对应槽保留不可变快照；设备仍只写起止 tick 和 done_seq，Host 映射区布局和 kernel 参数均未因本次元数据扩展而改变。后台 Python 线程合并记录并序列化，不从 NPU tensor 回读参数。
+每条启用 V2 元数据的 launch/end 记录增加 metadata_version=1。元数据在 Python API 的 Host 路径构造，C++ 在 Reserve 时为对应槽保留不可变快照；设备仍只写起止 tick 和 done_seq，Host 映射区布局和 kernel 参数均未因本次元数据扩展而改变。后台线程调用原生侧合并记录并编码，不从 NPU tensor 回读参数。
 
 | 字段 | 含义与来源 |
 | --- | --- |
@@ -95,7 +95,7 @@ Host 为成功预留的槽分配从 1 开始的进程内序号，kernel 按此�
 - cached dispatch：api_call_id=B，handle_id=H；cached notify 与 dispatch 关联到 B。
 - combine：api_call_id=C，handle_id=H；通信及延后执行的 reduce 都关联到 C。
 
-C++ 元数据上下文采用线程局部存储和作用域恢复，异常退出也恢复上一层。每次 API 创建一份原生不可变元数据快照，Reserve 只保存共享引用和本次启动的 stream/行数等标量，不逐 kernel 重复复制整张元数据表，也不保留 Python 可变字典的引用。combine continuation 另保留调用时快照，执行时恢复该快照，避免其他调用覆盖。
+C++ 元数据上下文采用线程局部存储和作用域恢复，异常退出也恢复上一层。Buffer 固定字段只转换一次，按 shape、dtype、API、模式等缓存最多 64 份不可变模板。每次 API 创建只含两个 ID 和模板引用的小快照，使用原生句柄恢复上下文；字段在后台展开，Reserve 只保存共享引用和本次启动的 stream/行数等标量，不逐 kernel 重复复制整张元数据表，也不保留 Python 可变字典的引用。combine continuation 另保留调用时快照，执行时恢复该快照，避免其他调用覆盖。
 
 初始化增加一次 Host 元信息 all-gather，用于检查各 rank 的采集开关一致性并分发 comm_id；UDMA 路径即使关闭采集也参加此一致性检查。业务调用不新增集合通信或设备同步。tensor.size、dtype 和 element_size 只读取 Host 元信息。元数据构造、复制与 JSONL 增量仍有 Host 开销，不能仅据此承诺小于 1%。
 
@@ -164,17 +164,17 @@ $$
 
 当完整采集开销明显超过阈值时，同一个测试入口支持 `--diagnostic`。这是归因工具，不是性能验收，也不修改 kernel 的打点、done_seq 或 Host 映射内存协议。
 
-需要重新构建安装本分支的 Host 原生扩展；只复制 Python 文件不够。诊断启动会检查原生扩展的诊断版本标识，拒绝混用不支持这些开关的旧扩展。
+需要重新构建安装本分支的 Host 原生扩展；只复制 Python 文件不够。采集启动会检查原生扩展的版本标识（当前为 2），拒绝混用不支持这些开关的旧扩展。
 
 | 模式 | 实际工作 | 输出 |
 | --- | --- | --- |
 | off | 完全关闭采集 | rank 耗时/精度 JSON |
 | metadata | 仅执行 API 元数据构造、原生上下文交换与恢复；不分配采集环、不启动校准 kernel 或采集线程 | rank JSON 中的元数据调用统计 |
 | native | 元数据、设备打点、Python 线程轮询原生 Drain；不把每条记录转换成 Python 字典 | 退出时的 diagnostic JSON |
-| json | native 的工作，加逐条 Python 字典转换、JSON 序列化；序列化结果丢弃 | 退出时的 diagnostic JSON |
-| full | 完整转换、序列化和 JSONL 写入/刷新 | kernel JSONL 和退出时的 diagnostic JSON |
+| json | native 的工作，加释放 GIL 的原生 JSONL 编码；返回整批文本后丢弃 | 退出时的 diagnostic JSON |
+| full | 原生批量编码和 Python JSONL 写入/刷新 | kernel JSONL 和退出时的 diagnostic JSON |
 
-native 仍构造原有 C++ TraceRecord，使用原来的 Drain 和 done_seq 回收逻辑；每批只向 Python 返回少量计数。它不是“只有设备打点”的纯设备测试，包含原生记录处理、轮询及批次统计成本。json/full 在此基础上返回逐条 Python 记录。三种模式都检查完成、launch/end 数、丢样和退出 summary，不能用关闭回收或填满槽池来减少被采集的事件。
+native 仍构造原有 C++ TraceRecord，使用原来的 Drain 和 done_seq 回收逻辑；每批只向 Python 返回少量计数。它不是“只有设备打点”的纯设备测试，包含原生记录处理、轮询及批次统计成本。json/full 在此基础上返回整批 JSONL 文本，不返回逐事件 Python 字典。三种模式都检查完成、launch/end 数、丢样和退出 summary，不能用关闭回收或填满槽池来减少被采集的事件。
 
 第一轮不打开细分计时，比较端到端 API 耗时：
 
@@ -188,19 +188,28 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic \
 
 默认每轮运行全部五种模式，轮转并反转运行顺序，3 轮共 15 次独立进程组/Buffer 初始化。每种模式与同轮 off 比较；保留全部窗口和逐轮比值。需要更多证据时增加 rounds。`--modes` 可以选取子集，但必须包含 off 和至少一种开启模式。
 
-第二轮另建目录，沿用相同参数并增加 `--diagnostic-timing`，通常 `--rounds 1` 即可获得初步分项数据。此轮在 Host 增加计时调用，只用于定位，不能混入第一轮或正式 1% 验收。开启细分计时时，full 先序列化一批文本再写入，以分开测量；未开启时保持生成器逐条序列化写入的路径。
+第二轮另建目录，沿用相同参数并增加 `--diagnostic-timing`，通常 `--rounds 1` 即可获得初步分项数据。此轮在 Host 增加计时调用，只用于定位，不能混入第一轮或正式 1% 验收。两种计时设置下，full 都由原生侧编码整批文本，再交给 Python 写入。
 
 统计说明：
 
 - `rankN.json.metadata_statistics`：fresh_dispatch/cached_dispatch/combine 的调用数、构造与进入原生上下文的 `enter_ns`、恢复上下文的 `restore_ns`；包括准备、精度和预热调用。timing 关闭时计时值为零，不代表没有成本。
 - `trace/diagnostic-*.json.counters`：polls、records、launches、ends、summaries、completed、incomplete、dropped、launch_errors。native/json 不生成逐事件 kernel JSONL，这是有意省略；full 仍做完整日志校验。
 - `drain_ns`：原生 Drain 墙钟耗时，执行时释放 GIL。
-- `convert_ns`：原生记录转逐条 Python 字典的墙钟耗时；native 不执行逐条转换。
+- `convert_ns`：整批原生文本转 Python 字符串的墙钟耗时；native 返回空字符串。版本 1 中此字段测量逐条字典转换，含义不同。
 - `drain_call_wall_ns`：Python 发起整个 drain 调用到返回的墙钟耗时，包含转换、批次计数、调度以及可能的 GIL 等待；不能把它减去 drain_ns 后直接称为 GIL 等待时间。
-- `serialize_ns`、`write_flush_ns`：JSON 序列化、写入及 flush 的累计墙钟耗时；只在对应模式且 timing 开启时有值。flush 不是 fsync，不表示持久化到物理磁盘。
+- `serialize_ns`、`write_flush_ns`：释放 GIL 期间原生 JSONL 编码、Python 写入及 flush 的累计墙钟耗时；只在对应模式且 timing 开启时有值。flush 不是 fsync，不表示持久化到物理磁盘。
 
 `diagnosis.json` 汇总五种模式相对 off 的开销，`diagnostic_valid=true` 只表示诊断证据通过完整性检查，`performance_acceptance` 始终为 false。完整性失败返回非零并保留原因；性能变慢本身不使诊断任务失败。native/json/full 的计数校验针对本用例当前 eager 非展开的 notify+dispatch、communication+reduce 路径（每次 API 两个 kernel）；改变执行策略后若 kernel 数不同，应先核对实际路径，不放宽丢样检查。
 
 诊断环境变量只供本功能排查，并在初始化时确定：`DEEPEP_TRACE_DIAGNOSTIC_MODE=metadata|native|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`，开启模式还需设置 DEEPEP_TRACE_DIR。EP 内配置必须一致；不支持运行中修改。测试控制器自动管理并清除继承值，正常 `--npu` 验收也会清除诊断变量。没有诊断变量时保持原有完整采集路径。
 
-相邻模式的差值包含工作重叠、线程调度变化及小额诊断统计成本，不能当作各模块的精确独占时间。优先用未加细分计时的五组结果定位增量，再结合计时轮次解释。尤其 D/json 变慢只说明记录转换/序列化路径有贡献，不能仅凭这一点确认 GIL 是唯一原因。最终优化必须回到原始完整采集开关 A/B 验收。
+相邻模式的差值包含工作重叠、线程调度变化及小额诊断统计成本，不能当作各模块的精确独占时间。优先用未加细分计时的五组结果定位增量，再结合计时轮次解释。json 与 native 的差值现在主要对应原生编码和批量文本传递，不能沿用旧版的逐事件 Python 转换/编码归因。最终优化必须回到原始完整采集开关 A/B 验收。
+
+
+## 元数据缓存与原生批量编码的验证
+
+缓存只保留标量和原生快照，不保留用户 tensor 或 handle 对象。shape、dtype、容量或模式变化会使用新模板；超过 64 种时清空模板缓存。正在执行或延迟执行的 kernel 持有 shared_ptr 父快照引用，不受缓存清空影响。上下文仍是线程局部的，嵌套调用及异常退出使用原生句柄恢复。
+
+每次调用仍读取 Host tensor 属性、更新 ID、预留槽位和记录 launch 时间，并非零开销。kernel 的 tick、done_seq 和满槽跳过机制保持不变。Python 仍拥有后台线程、文件和退出排空流程。JSON 保留所有字段和整数精度，转义控制字符、引号与反斜杠，UTF-8 可直接输出；字段顺序、空格和非 ASCII 转义形式可能变化，按 JSON 解析后的值兼容。
+
+重新构建安装 Host 扩展后，先运行本文 CPU 回归，再运行原始 --npu 完整采集开关 A/B，不加诊断参数。检查精度、元数据、零丢样和实际开销。诊断的 json/full 已采用新编码实现，分项不能直接套用旧版本含义。本次优化尚未完成 NPU 实测，不能承诺开销低于 1%。

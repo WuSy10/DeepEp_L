@@ -10,6 +10,7 @@
 
 namespace ascend_deepep::trace {
 struct TraceMetadata {
+    std::shared_ptr<const TraceMetadata> parent;
     std::map<std::string, int64_t> values;
     std::map<std::string, std::string> labels;
 };
@@ -30,6 +31,7 @@ struct TraceRecord {
     std::map<std::string, int64_t> values;
     std::map<std::string, std::string> labels;
 };
+std::string EncodeTraceRecords(const std::vector<TraceRecord>& records);
 class KernelTrace {
 public:
     static std::shared_ptr<KernelTrace> Open();

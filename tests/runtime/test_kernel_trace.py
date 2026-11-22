@@ -40,14 +40,14 @@ def test_python_monitor_shared_source_and_shutdown(tmp_path, monkeypatch):
         def calibration(self):
             return {"event": "calibration", "device": 0}
 
-        def drain_trace(self, closing=False):
+        def drain_trace_json(self, closing=False):
             self.calls.append(threading.current_thread().name)
             result, self.queue = self.queue, []
             if closing:
                 assert self.synchronized
                 result.append({"event": "summary"})
                 self.closed = True
-            return result
+            return "".join(json.dumps(row) + "\n" for row in result)
 
         def synchronize(self):
             self.synchronized = True
@@ -109,11 +109,12 @@ inline int aclrtSynchronizeStream(void*){return 0;}
 inline int aclrtSynchronizeDevice(){return 0;}
 """)
     source = tmp_path / "test.cpp"
-    source.write_text("""
+    source.write_text(r"""
 #include "runtime/kernel_trace.h"
 #include "common/kernel_trace_layout.h"
 #include <cassert>
 #include <thread>
+#include <iostream>
 using namespace ascend_deepep::trace;
 extern "C" void kernel_trace_clock_do(void*,uint8_t* p){*reinterpret_cast<uint64_t*>(p)=100;}
 int main(){
@@ -123,6 +124,7 @@ int main(){
     auto sink=KernelTrace::Open(); assert(sink);
     TraceMetadata outer;
     outer.values["api_call_id"] = 999;
+    outer.labels["inherited"] = "parent";
     ExchangeTraceMetadata(std::make_shared<const TraceMetadata>(outer));
     std::thread other([] {
         assert(!CurrentTraceMetadata());
@@ -138,6 +140,7 @@ int main(){
     for(int round=0;round<384;++round) {
         const int kind = round % 5;
         TraceMetadata call;
+        call.parent = CurrentTraceMetadata();
         call.values["api_call_id"] = round + 1;
         call.labels["comm_id"] = "test-comm";
         KernelTrace::Ticket ticket;
@@ -166,6 +169,7 @@ int main(){
         assert(done[0].op_name==ops[kind] && done[0].kernel_name==kernels[kind]);
         assert(done[0].values.at("api_call_id")==round+1);
         assert(done[0].labels.at("comm_id")=="test-comm");
+        assert(done[0].labels.at("inherited")=="parent");
         assert(done[0].labels.at("stream")=="12345");
         assert(done[0].values.at("gid")==static_cast<int64_t>(ticket.sequence));
         assert(done[0].values.at("elapsed_ns")==40); // Zero start tick is valid.
@@ -173,6 +177,9 @@ int main(){
     auto summary=sink->Drain(true);
     assert(summary.back().values.at("completed")==384);
     assert(summary.back().values.at("dropped")==0);
+    TraceRecord encoded{"end", "dispatch", "kernel", {{"large", 9223372036854775807LL}},
+        {{"escaped", "quote\"\\\n\t"}}};
+    std::cout << EncodeTraceRecords({encoded});
 }
 """)
     binary = tmp_path / "test"
@@ -194,7 +201,10 @@ int main(){
         check=True,
     )
     monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
-    subprocess.run([str(binary)], check=True, timeout=20)
+    result = subprocess.run([str(binary)], check=True, timeout=20, capture_output=True, text=True)
+    encoded = json.loads(result.stdout)
+    assert encoded["large"] == 9223372036854775807
+    assert encoded["escaped"] == 'quote"\\\n\t'
 
 
 @pytest.fixture
@@ -244,13 +254,13 @@ def test_python_monitor_mixed_kernels_and_checker(mixed_trace, monkeypatch):
         def calibration(self):
             return dict(rows[0], device=0)
 
-        def drain_trace(self, closing=False):
+        def drain_trace_json(self, closing=False):
             result, self.pending = self.pending, []
             if result:
                 written.set()
             if closing:
                 result.append(rows[-1])
-            return result
+            return "".join(json.dumps(row) + "\n" for row in result)
 
         def synchronize(self):
             pass
@@ -313,13 +323,23 @@ class MetadataTensor:
 
 
 class MetadataNative:
+    kernel_trace_diagnostic_version = 2
+
     def __init__(self):
         self.context = threading.local()
+        self.templates = 0
 
-    def exchange_kernel_trace_metadata(self, fields):
+    def make_trace_metadata(self, fields, parent=None):
+        self.templates += 1
+        return dict(parent or {}, **fields)
+
+    def push_trace_metadata(self, template, api, handle):
         previous = getattr(self.context, "fields", {})
-        self.context.fields = dict(fields)
+        self.context.fields = dict(template, api_call_id=api, handle_id=handle)
         return previous
+
+    def restore_trace_metadata(self, previous):
+        self.context.fields = previous
 
 
 def load_trace_module():
@@ -382,6 +402,27 @@ def test_metadata_thread_isolation():
     assert {row["num_tokens"] for row in results} == {32, 64}
 
 
+def test_metadata_cache_shape_changes_and_eviction():
+    module = load_trace_module()
+    native = MetadataNative()
+    session = module.KernelTraceSession(native, "comm", 4)
+    routes = MetadataTensor(32, 8)
+    with session.call("dispatch", MetadataTensor(32, 128), routes, 128):
+        saved = native.context.fields
+        for _ in range(20):
+            with session.call("dispatch", MetadataTensor(32, 128), routes, 128):
+                pass
+        assert native.templates == 2  # One Buffer base and one reusable shape template.
+        for size in range(65):
+            with session.call("combine", MetadataTensor(size + 1, 256), routes, 128) as fields:
+                assert fields["api_input_rows"] == size + 1
+                assert fields["hidden_size"] == 256
+        assert len(session._templates) <= 64
+        assert native.context.fields is saved
+        assert saved["hidden_size"] == 128
+    assert native.context.fields == {}
+
+
 def test_trace_group_initialization(monkeypatch):
     module = load_trace_module()
     native = MetadataNative()
@@ -408,7 +449,7 @@ def test_trace_group_initialization(monkeypatch):
 def test_metadata_only_and_mode_consensus(monkeypatch):
     module = load_trace_module()
     native = MetadataNative()
-    native.kernel_trace_diagnostic_version = 1
+    native.kernel_trace_diagnostic_version = 2
     monkeypatch.setenv("DEEPEP_TRACE_DIR", "unused")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "1")
@@ -422,7 +463,7 @@ def test_metadata_only_and_mode_consensus(monkeypatch):
     assert stats["calls"] == 1 and stats["enter_ns"] > 0 and stats["restore_ns"] > 0
     with pytest.raises(ValueError, match="all EP ranks"):
         module.attach_trace_session(native, None, 0, 1, lambda *items: [(True, "comm", "full", True)])
-    del native.kernel_trace_diagnostic_version
+    native.kernel_trace_diagnostic_version = 0
     with pytest.raises(RuntimeError, match="matching rebuilt native"):
         module.attach_trace_session(native, None, 0, 1, lambda *items: [items[-1]])
 
@@ -459,7 +500,8 @@ def test_diagnostic_monitor_recycling_and_output(tmp_path, monkeypatch, mode, ti
             self.recycled += 1
             records = [dict(event="end", gid=self.recycled)]
             return dict(
-                items=records if include_records else [],
+                text="".join(json.dumps(row) + "\n" for row in records) if include_records else "",
+                serialize_ns=1 if timed and include_records else 0,
                 polls=1,
                 records=1,
                 ends=1,
