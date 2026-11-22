@@ -340,6 +340,12 @@ class ElasticBuffer:
         # Match the V2 initialization visibility contract on the communication
         # stream. The native barrier kernel is reused from the V1 resource layer.
         self.barrier(use_comm_stream=True, with_cpu_sync=True)
+        self._kernel_trace = None
+        if transport == "udma":
+            from ...utils.kernel_trace import KernelTrace
+            from ._native import load_native_module
+
+            self._kernel_trace = KernelTrace.attach(load_native_module())
 
     @property
     def udma_auto_policy(self):
@@ -523,6 +529,12 @@ class ElasticBuffer:
             if self._destroyed:
                 return
             self.barrier(use_comm_stream=True, with_cpu_sync=True)
+            trace = getattr(self, "_kernel_trace", None)
+            if trace is not None:
+                from ...utils.kernel_trace import KernelTrace
+
+                KernelTrace.detach(trace)
+                self._kernel_trace = None
             self._native.destroy()
             self._destroyed = True
             self.runtime = None
@@ -1192,6 +1204,12 @@ class ElasticBuffer:
                     # Finalizers cannot propagate. Fall back to native local
                     # teardown if collective teardown is no longer possible.
                     pass
+            trace = getattr(self, "_kernel_trace", None)
+            if trace is not None:
+                from ...utils.kernel_trace import KernelTrace
+
+                KernelTrace.detach(trace)
+                self._kernel_trace = None
             self.runtime = None
             self._native = None
             self._communication_stream = None
