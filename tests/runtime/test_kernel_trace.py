@@ -117,6 +117,9 @@ inline int aclrtSynchronizeDevice(){return 0;}
 using namespace ascend_deepep::trace;
 extern "C" void kernel_trace_clock_do(void*,uint8_t* p){*reinterpret_cast<uint64_t*>(p)=100;}
 int main(){
+    setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata", 1);
+    assert(!KernelTrace::Open()); // No collector/calibration for Host-only metadata.
+    unsetenv("DEEPEP_TRACE_DIAGNOSTIC_MODE");
     auto sink=KernelTrace::Open(); assert(sink);
     TraceMetadata outer;
     outer.values["api_call_id"] = 999;
@@ -389,7 +392,7 @@ def test_trace_group_initialization(monkeypatch):
 
     def gather(group, comm, size, value):
         proposals.append(value)
-        return [(True, "rank0-uuid"), (True, None)]
+        return [(True, "rank0-uuid", "", False), (True, None, "", False)]
 
     first = module.attach_trace_session(native, None, 0, 2, gather)[1]
     second = module.attach_trace_session(native, None, 1, 2, gather)[1]
@@ -399,7 +402,94 @@ def test_trace_group_initialization(monkeypatch):
     monkeypatch.delenv("DEEPEP_TRACE_DIR")
     with pytest.raises(ValueError, match="all EP ranks"):
         module.attach_trace_session(native, None, 1, 2, gather)
-    assert module.attach_trace_session(native, None, 0, 2, lambda *args: [(False, None)] * 2) == (None, None)
+    assert module.attach_trace_session(native, None, 0, 2, lambda *args: [(False, None, "", False)] * 2) == (None, None)
+
+
+def test_metadata_only_and_mode_consensus(monkeypatch):
+    module = load_trace_module()
+    native = MetadataNative()
+    native.kernel_trace_diagnostic_version = 1
+    monkeypatch.setenv("DEEPEP_TRACE_DIR", "unused")
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata")
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "1")
+    monkeypatch.setattr(module, "_global_rank", lambda: 0)
+    monkeypatch.setattr(module.KernelTrace, "attach", lambda *_: pytest.fail("metadata mode started collector"))
+    identity, session = module.attach_trace_session(native, None, 0, 1, lambda *items: [items[-1]])
+    assert identity is None and session is not None
+    with session.call("dispatch", MetadataTensor(32, 128), MetadataTensor(32, 8), 32):
+        pass
+    stats = session.diagnostic_stats["fresh_dispatch"]
+    assert stats["calls"] == 1 and stats["enter_ns"] > 0 and stats["restore_ns"] > 0
+    with pytest.raises(ValueError, match="all EP ranks"):
+        module.attach_trace_session(native, None, 0, 1, lambda *items: [(True, "comm", "full", True)])
+    del native.kernel_trace_diagnostic_version
+    with pytest.raises(RuntimeError, match="matching rebuilt native"):
+        module.attach_trace_session(native, None, 0, 1, lambda *items: [items[-1]])
+
+
+@pytest.mark.parametrize("mode,timing", [("bogus", "0"), ("", "1"), ("full", "yes")])
+def test_reject_invalid_diagnostic_settings(monkeypatch, mode, timing):
+    module = load_trace_module()
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", mode)
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", timing)
+    with pytest.raises(ValueError):
+        module.diagnostic_config()
+
+
+@pytest.mark.parametrize("mode", ["native", "json", "full"])
+@pytest.mark.parametrize("timing", [False, True])
+def test_diagnostic_monitor_recycling_and_output(tmp_path, monkeypatch, mode, timing):
+    monitor = load_monitor()
+    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", mode)
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", str(int(timing)))
+
+    class Source:
+        identity = 891
+        recycled = 0
+
+        def calibration(self):
+            return dict(event="calibration", device=0)
+
+        def synchronize(self):
+            pass
+
+        def drain_trace_diagnostic(self, include_records, timed, closing):
+            assert include_records == (mode != "native") and timed == timing
+            self.recycled += 1
+            records = [dict(event="end", gid=self.recycled)]
+            return dict(
+                items=records if include_records else [],
+                polls=1,
+                records=1,
+                ends=1,
+                summaries=int(closing),
+                completed=self.recycled if closing else 0,
+                incomplete=0,
+                dropped=0,
+                drain_ns=1 if timing else 0,
+                convert_ns=1 if timing else 0,
+            )
+
+    source = Source()
+    native = type("Native", (), {"get_kernel_trace": staticmethod(lambda: source)})
+    try:
+        key = monitor.attach(native)
+        with monitor._lock:
+            for _ in range(129):
+                monitor._drain(monitor._sources[key])
+        monitor.detach(key)
+        report = json.loads(next(tmp_path.glob("diagnostic-*.json")).read_text())
+        assert not report["failed"] and report["mode"] == mode
+        assert report["counters"]["completed"] == source.recycled > 128
+        assert report["counters"]["summaries"] == 1
+        assert bool(list(tmp_path.glob("kernel-*.jsonl"))) == (mode == "full")
+        if timing and mode != "native":
+            assert report["counters"]["serialize_ns"] > 0
+        if timing and mode == "full":
+            assert report["counters"]["write_flush_ns"] > 0
+    finally:
+        monitor.shutdown()
 
 
 @pytest.mark.parametrize("corruption", [None, "missing", "end", "api", "handle"])
@@ -763,6 +853,11 @@ def npu_worker(args):
         recv_rows=owned.size(0),
         handle_id=getattr(handle, "_trace_handle_id", None),
         precision_passed=True,
+        trace_mode=os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "full")
+        if os.environ.get("DEEPEP_TRACE_DIR")
+        else "off",
+        trace_ring_active=buffer._kernel_trace is not None,
+        metadata_statistics=getattr(buffer._trace_session, "diagnostic_stats", {}),
     )
     started = time.perf_counter_ns()
     buffer.destroy()  # Flush/close trace before the controller validates logs.
@@ -777,6 +872,15 @@ def npu_parser():
     parser = argparse.ArgumentParser(description="KernelTrace real-NPU metadata and trace off/on acceptance")
     parser.add_argument("--npu", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--diagnostic", action="store_true", help="layered attribution, not performance acceptance")
+    parser.add_argument("--diagnostic-timing", action="store_true", help="separate instrumented run only")
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("off", "metadata", "native", "json", "full"),
+        default=["off", "metadata", "native", "json", "full"],
+    )
+    parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
     for name, default in dict(
         ep_size=4,
@@ -828,12 +932,138 @@ def run_npu_process(command, destination, env, log, timeout):
 def run_npu_acceptance(args):
     args._created_output = False
     try:
-        return _run_npu_acceptance(args)
+        if args.diagnostic_timing and not args.diagnostic:
+            raise ValueError("--diagnostic-timing requires --diagnostic")
+        return _run_npu_diagnostic(args) if args.diagnostic else _run_npu_acceptance(args)
     except Exception as error:
         # Do not modify an existing output directory rejected by the initial mkdir.
         if getattr(args, "_created_output", False):
-            (args.output / "acceptance.json").write_text(json.dumps(dict(passed=False, error=str(error)), indent=2))
+            name = "diagnosis.json" if args.diagnostic else "acceptance.json"
+            (args.output / name).write_text(json.dumps(dict(passed=False, error=str(error)), indent=2))
         raise
+
+
+def npu_run_trial(args, destination, mode, diagnostic=False):
+    destination.mkdir()
+    env = os.environ.copy()
+    for key in ("PYTHONPATH", "DEEPEP_TRACE_DIR", "DEEPEP_TRACE_DIAGNOSTIC_MODE", "DEEPEP_TRACE_DIAGNOSTIC_TIMING"):
+        env.pop(key, None)
+    env.update(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    if mode != "off":
+        env["DEEPEP_TRACE_DIR"] = str(destination / "trace")
+        if diagnostic:
+            env["DEEPEP_TRACE_DIAGNOSTIC_MODE"] = mode
+            env["DEEPEP_TRACE_DIAGNOSTIC_TIMING"] = "1" if args.diagnostic_timing else "0"
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nnodes=1",
+        f"--nproc-per-node={args.ep_size}",
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--output",
+        str(destination),
+    ]
+    for key, value in vars(args).items():
+        if type(value) is int and not key.startswith("_"):
+            command += ["--" + key.replace("_", "-"), str(value)]
+    print(f"RUN {destination.name}", flush=True)
+    with (destination / "run.log").open("w") as log:
+        run_npu_process(command, destination, env, log, args.timeout)
+    manifests = [json.loads((destination / f"rank{rank}.json").read_text()) for rank in range(args.ep_size)]
+    values = {
+        op: statistics.median(max(m["timings_ns"][op][w] for m in manifests) for w in range(args.windows))
+        for op in PERF_OPS
+    }
+    return manifests, values
+
+
+def validate_diagnostic_trial(destination, manifests, args, mode):
+    trace = destination / "trace"
+    if mode == "full":
+        validate_npu_metadata(trace, manifests, args)
+    elif list(trace.glob("kernel-*.jsonl")):
+        raise ValueError(f"{mode}: unexpected per-event log")
+    per_kind = 1 + args.warmup + args.windows * args.iterations
+    reports = list(trace.glob("diagnostic-*.json"))
+    if mode in ("native", "json", "full"):
+        if len(reports) != args.ep_size:
+            raise ValueError("missing diagnostic collector reports")
+        by_pid = {json.loads(f.read_text())["pid"]: json.loads(f.read_text()) for f in reports}
+    elif reports:
+        raise ValueError("off/metadata mode unexpectedly started a collector")
+    for rank, manifest in enumerate(manifests):
+        if manifest["trace_mode"] != mode or not manifest["precision_passed"]:
+            raise ValueError("wrong mode or precision failure")
+        if manifest["trace_ring_active"] != (mode in ("native", "json", "full")):
+            raise ValueError("unexpected trace ring state")
+        metadata = manifest["metadata_statistics"]
+        expected_calls = dict(fresh_dispatch=per_kind, cached_dispatch=per_kind, combine=2 * per_kind)
+        if mode != "off" and {k: v["calls"] for k, v in metadata.items()} != expected_calls:
+            raise ValueError("diagnostic metadata call count mismatch")
+        if mode in ("native", "json", "full"):
+            report = by_pid[manifest["pid"]]
+            stats = report["counters"]
+            # Current eager fixture: notify+dispatch and communication+reduce, two kernels per API.
+            expected = 8 * per_kind
+            if (
+                report["failed"]
+                or report["mode"] != mode
+                or report["timing"] != args.diagnostic_timing
+                or report["device"] != args.first_device + rank
+                or stats.get("summaries") != 1
+                or stats.get("completed") != expected
+                or stats.get("launches") != expected
+                or stats.get("ends") != expected
+                or any(stats.get(key) != 0 for key in ("dropped", "incomplete", "launch_errors"))
+            ):
+                raise ValueError(f"invalid diagnostic collection, rank {rank}: {report}")
+
+
+def _run_npu_diagnostic(args):
+    if args.rounds < 1 or args.windows < 1 or args.iterations < 32 or args.warmup < 1:
+        raise ValueError("require rounds/windows/warmup>=1, iterations>=32")
+    if "off" not in args.modes or len(set(args.modes)) != len(args.modes) or len(args.modes) < 2:
+        raise ValueError("diagnostic modes must be unique and include off plus at least one enabled mode")
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=False)
+    args._created_output = True
+    (args.output / "config.json").write_text(json.dumps(vars(args), default=str, indent=2))
+    runs = []
+    for round_id in range(args.rounds):
+        offset = round_id % len(args.modes)
+        order = args.modes[offset:] + args.modes[:offset]
+        if round_id % 2:
+            order = list(reversed(order))
+        for mode in order:
+            destination = args.output / f"round{round_id:02d}_{mode}"
+            manifests, values = npu_run_trial(args, destination, mode, diagnostic=True)
+            validate_diagnostic_trial(destination, manifests, args, mode)
+            runs.append(dict(round=round_id, mode=mode, ns_per_api=values))
+            (args.output / "runs.json").write_text(json.dumps(runs, indent=2))
+    baseline = {r["round"]: r["ns_per_api"] for r in runs if r["mode"] == "off"}
+    comparisons = {}
+    for mode in args.modes:
+        comparisons[mode] = {}
+        for op in PERF_OPS:
+            selected = [r for r in runs if r["mode"] == mode]
+            deltas = [100 * (r["ns_per_api"][op] / baseline[r["round"]][op] - 1) for r in selected]
+            comparisons[mode][op] = dict(
+                median_ns=statistics.median(r["ns_per_api"][op] for r in selected),
+                paired_percent=deltas,
+                median_percent=statistics.median(deltas),
+            )
+    report = dict(
+        diagnostic_valid=True,
+        performance_acceptance=False,
+        instrumented=args.diagnostic_timing,
+        comparisons=comparisons,
+    )
+    (args.output / "diagnosis.json").write_text(json.dumps(report, indent=2))
+    print(json.dumps(report, indent=2), flush=True)
+    return True  # Diagnostic success means valid evidence, never a <1% claim.
 
 
 def _run_npu_acceptance(args):
@@ -848,41 +1078,11 @@ def _run_npu_acceptance(args):
         # Fresh processes avoid inherited native singleton/env state; counterbalance thermal/order effects.
         for enabled in (False, True) if pair % 2 == 0 else (True, False):
             destination = args.output / f"pair{pair:02d}_{'on' if enabled else 'off'}"
-            destination.mkdir()
-            env = os.environ.copy()
-            env.pop("PYTHONPATH", None)
-            env.pop("DEEPEP_TRACE_DIR", None)
-            env.update(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
-            if enabled:
-                env["DEEPEP_TRACE_DIR"] = str(destination / "trace")
-            command = [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                "--standalone",
-                "--nnodes=1",
-                f"--nproc-per-node={args.ep_size}",
-                str(Path(__file__).resolve()),
-                "--worker",
-                "--output",
-                str(destination),
-            ]
-            for key, value in vars(args).items():
-                if key not in ("npu", "worker", "output") and not key.startswith("_"):
-                    command += ["--" + key.replace("_", "-"), str(value)]
-            print(f"RUN {destination.name}", flush=True)
-            with (destination / "run.log").open("w") as log:
-                run_npu_process(command, destination, env, log, args.timeout)
-            manifests = [json.loads((destination / f"rank{rank}.json").read_text()) for rank in range(args.ep_size)]
+            manifests, values = npu_run_trial(args, destination, "full" if enabled else "off")
             if enabled:
                 validate_npu_metadata(destination / "trace", manifests, args)
             elif list(destination.rglob("kernel-*.jsonl")):
                 raise AssertionError("trace-off run unexpectedly produced logs")
-            # Slowest rank per window determines collective progress; median windows per process trial.
-            values = {
-                op: statistics.median(max(m["timings_ns"][op][w] for m in manifests) for w in range(args.windows))
-                for op in PERF_OPS
-            }
             runs.append(dict(pair=pair, enabled=enabled, ns_per_api=values))
             (args.output / "runs.json").write_text(json.dumps(runs, indent=2))
     results = {
@@ -905,11 +1105,14 @@ def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
     checked = []
     monkeypatch.setenv("DEEPEP_TRACE_DIR", "must-not-leak")
     monkeypatch.setenv("PYTHONPATH", "must-not-leak")
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata")
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "1")
 
     def launch(command, destination, env, log, timeout):
         enabled = "DEEPEP_TRACE_DIR" in env
         order.append(enabled)
         assert "PYTHONPATH" not in env
+        assert "DEEPEP_TRACE_DIAGNOSTIC_MODE" not in env and "DEEPEP_TRACE_DIAGNOSTIC_TIMING" not in env
         assert "--worker" in command and "--standalone" in command
         if enabled:
             assert env["DEEPEP_TRACE_DIR"] == str(destination / "trace")
@@ -926,6 +1129,66 @@ def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
     assert report["passed"] and set(report["operations"]) == set(PERF_OPS)
     for result in report["operations"].values():
         assert result["median_percent"] == pytest.approx(-1)
+
+
+@pytest.mark.parametrize("corruption", [None, "dropped", "completed", "summaries"])
+def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, corruption):
+    args = npu_parser().parse_args(
+        ["--npu", "--diagnostic", "--rounds", "2", "--diagnostic-timing", "--output", str(tmp_path / "diagnosis")]
+    )
+    order = []
+    per_kind = 1 + args.warmup + args.windows * args.iterations
+
+    def launch(command, destination, env, log, timeout):
+        mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "off")
+        order.append(mode)
+        assert (env.get("DEEPEP_TRACE_DIAGNOSTIC_TIMING") == "1") == (mode != "off")
+        multiplier = dict(off=1, metadata=1.1, native=1.2, json=1.4, full=1.45)[mode]
+        for rank in range(args.ep_size):
+            manifest = dict(
+                pid=100 + rank,
+                trace_mode=mode,
+                trace_ring_active=mode in ("native", "json", "full"),
+                precision_passed=True,
+                metadata_statistics={}
+                if mode == "off"
+                else {
+                    k: dict(calls=v, enter_ns=1, restore_ns=1)
+                    for k, v in dict(fresh_dispatch=per_kind, cached_dispatch=per_kind, combine=2 * per_kind).items()
+                },
+                timings_ns={op: [100 * multiplier] * args.windows for op in PERF_OPS},
+            )
+            (destination / f"rank{rank}.json").write_text(json.dumps(manifest))
+            if mode in ("native", "json", "full"):
+                trace = destination / "trace"
+                trace.mkdir(exist_ok=True)
+                counters = dict(
+                    summaries=1,
+                    completed=8 * per_kind,
+                    launches=8 * per_kind,
+                    ends=8 * per_kind,
+                    dropped=0,
+                    incomplete=0,
+                    launch_errors=0,
+                )
+                if corruption:
+                    counters[corruption] += 1
+                report = dict(pid=100 + rank, device=rank, mode=mode, timing=True, failed=False, counters=counters)
+                (trace / f"diagnostic-{rank}.json").write_text(json.dumps(report))
+
+    monkeypatch.setattr(sys.modules[__name__], "run_npu_process", launch)
+    monkeypatch.setattr(sys.modules[__name__], "validate_npu_metadata", lambda *items: None)
+    if corruption:
+        with pytest.raises(ValueError, match="invalid diagnostic collection"):
+            run_npu_acceptance(args)
+        assert not json.loads((args.output / "diagnosis.json").read_text())["passed"]
+    else:
+        assert run_npu_acceptance(args)
+        report = json.loads((args.output / "diagnosis.json").read_text())
+        assert report["diagnostic_valid"] and not report["performance_acceptance"]
+        assert report["instrumented"]
+        assert order == args.modes + list(reversed(args.modes[1:] + args.modes[:1]))
+        assert report["comparisons"]["json"]["fresh_dispatch"]["median_percent"] == pytest.approx(40)
 
 
 @pytest.mark.skipif(os.environ.get("DEEPEP_RUN_TRACE_NPU") != "1", reason="opt-in real NPU acceptance")

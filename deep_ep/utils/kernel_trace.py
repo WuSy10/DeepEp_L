@@ -15,6 +15,17 @@ import warnings
 import uuid
 
 
+def diagnostic_config():
+    """Read once at initialization; an empty mode preserves the production path."""
+    mode = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "")
+    timing = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "0")
+    if mode not in ("", "metadata", "native", "json", "full") or timing not in ("0", "1"):
+        raise ValueError("invalid KernelTrace diagnostic mode/timing")
+    if timing == "1" and not mode:
+        raise ValueError("diagnostic timing requires a diagnostic mode")
+    return mode, timing == "1"
+
+
 class KernelTrace:
     """Own log files and a shared polling thread for active native sources."""
 
@@ -28,12 +39,17 @@ class KernelTrace:
         directory = os.environ.get("DEEPEP_TRACE_DIR")
         if not directory:
             return None
+        mode, timing = diagnostic_config()
+        if mode == "metadata":
+            return None
         source = native_module.get_kernel_trace()
         if source is None:
             return None
         identity = source.identity
         with cls._lock:
             if identity in cls._sources:
+                if (cls._sources[identity]["mode"], cls._sources[identity]["timing"]) != (mode, timing):
+                    raise ValueError("cannot change diagnostic mode while a trace source is active")
                 cls._sources[identity]["references"] += 1
                 return identity
             stream = None
@@ -41,10 +57,21 @@ class KernelTrace:
                 calibration = source.calibration()
                 Path(directory).mkdir(parents=True, exist_ok=True)
                 name = f"kernel-{socket.gethostname()}-{os.getpid()}-d{calibration['device']}-{time.time_ns()}.jsonl"
-                stream = (Path(directory) / name).open("x", encoding="utf-8")
-                stream.write(json.dumps(calibration) + "\n")
-                stream.flush()
-                cls._sources[identity] = dict(source=source, stream=stream, references=1, failed=False)
+                if mode in ("", "full"):
+                    stream = (Path(directory) / name).open("x", encoding="utf-8")
+                    stream.write(json.dumps(calibration) + "\n")
+                    stream.flush()
+                cls._sources[identity] = dict(
+                    source=source,
+                    stream=stream,
+                    references=1,
+                    failed=False,
+                    mode=mode,
+                    timing=timing,
+                    statistics={},
+                    diagnostic_path=Path(directory) / name.replace("kernel-", "diagnostic-").replace(".jsonl", ".json"),
+                    device=calibration["device"],
+                )
                 if cls._thread is None:
                     cls._stop.clear()
                     cls._thread = threading.Thread(target=cls._poll, name="deepep-kernel-trace", daemon=True)
@@ -62,6 +89,9 @@ class KernelTrace:
     @staticmethod
     def _drain(entry, closing=False):
         try:
+            if entry["mode"]:
+                KernelTrace._diagnostic_drain(entry, closing)
+                return
             records = entry["source"].drain_trace(closing)
             if records:
                 entry["stream"].writelines(json.dumps(record) + "\n" for record in records)
@@ -70,6 +100,35 @@ class KernelTrace:
             if not entry["failed"]:
                 warnings.warn(f"KernelTrace logging failed: {error}", RuntimeWarning)
                 entry["failed"] = True
+
+    @staticmethod
+    def _diagnostic_drain(entry, closing):
+        mode, timing = entry["mode"], entry["timing"]
+        begin = time.perf_counter_ns() if timing else 0
+        batch = entry["source"].drain_trace_diagnostic(mode != "native", timing, closing)
+        if timing:
+            batch["drain_call_wall_ns"] = time.perf_counter_ns() - begin
+        records = batch.pop("items")
+        stats = entry["statistics"]
+        for key, value in batch.items():
+            stats[key] = stats.get(key, 0) + value
+        if mode == "native" or not records:
+            return
+        if timing:
+            begin = time.perf_counter_ns()
+            lines = [json.dumps(record) + "\n" for record in records]
+            stats["serialize_ns"] = stats.get("serialize_ns", 0) + time.perf_counter_ns() - begin
+            if mode == "full":
+                begin = time.perf_counter_ns()
+                entry["stream"].writelines(lines)
+                entry["stream"].flush()
+                stats["write_flush_ns"] = stats.get("write_flush_ns", 0) + time.perf_counter_ns() - begin
+        elif mode == "json":
+            for record in records:
+                json.dumps(record) + "\n"  # Execute the same serialization, discard the resulting text.
+        else:
+            entry["stream"].writelines(json.dumps(record) + "\n" for record in records)
+            entry["stream"].flush()
 
     @classmethod
     def _poll(cls):
@@ -91,8 +150,21 @@ class KernelTrace:
                 entry["source"].synchronize()
                 cls._drain(entry, closing=True)
             finally:
-                entry["stream"].close()
-                del cls._sources[identity]
+                try:
+                    if entry["stream"] is not None:
+                        entry["stream"].close()
+                    if entry["mode"]:
+                        report = dict(
+                            mode=entry["mode"],
+                            timing=entry["timing"],
+                            pid=os.getpid(),
+                            device=entry["device"],
+                            failed=entry["failed"],
+                            counters=entry["statistics"],
+                        )
+                        entry["diagnostic_path"].write_text(json.dumps(report, indent=2), encoding="utf-8")
+                finally:
+                    del cls._sources[identity]
 
     @classmethod
     def shutdown(cls):
@@ -134,6 +206,8 @@ class KernelTraceSession:
 
     def __init__(self, native, comm_id, ep_size, global_rank=None):
         self.native = native
+        self.diagnostic_mode, self.diagnostic_timing = diagnostic_config()
+        self.diagnostic_stats = {}
         self.fields = dict(
             metadata_version=1,
             comm_id=comm_id,
@@ -147,6 +221,7 @@ class KernelTraceSession:
 
     @contextmanager
     def call(self, api_name, x, routes, num_experts, handle=None, *, cached=False, expanded=False, capacity=0):
+        started = time.perf_counter_ns() if self.diagnostic_timing else 0
         with _identity_lock:
             handle_id = getattr(handle, "_trace_handle_id", None) if handle is not None else None
             if handle_id is None:
@@ -170,23 +245,35 @@ class KernelTraceSession:
             token_capacity=int(capacity),
         )
         previous = self.native.exchange_kernel_trace_metadata(fields)
+        if self.diagnostic_mode:
+            kind = ("cached_dispatch" if cached else "fresh_dispatch") if api_name == "dispatch" else api_name
+            stats = self.diagnostic_stats.setdefault(kind, dict(calls=0, enter_ns=0, restore_ns=0))
+            stats["calls"] += 1
+            if self.diagnostic_timing:
+                stats["enter_ns"] += time.perf_counter_ns() - started
         try:
             yield fields
         finally:
+            started = time.perf_counter_ns() if self.diagnostic_timing else 0
             self.native.exchange_kernel_trace_metadata(previous)
+            if self.diagnostic_timing:
+                stats["restore_ns"] += time.perf_counter_ns() - started
 
 
 def attach_trace_session(native, group, rank, ep_size, all_gather):
     """Agree once at Buffer initialization, including disabled ranks; no per-call collective."""
     enabled = bool(os.environ.get("DEEPEP_TRACE_DIR"))
+    mode, timing = diagnostic_config()
     proposal = uuid.uuid4().hex if enabled and rank == 0 else None
-    peers = all_gather(group, None, ep_size, (enabled, proposal))
-    if any(peer[0] != enabled for peer in peers):
-        raise ValueError("all EP ranks must agree on whether DEEPEP_TRACE_DIR is enabled")
+    peers = all_gather(group, None, ep_size, (enabled, proposal, mode, timing))
+    if any((peer[0], peer[2], peer[3]) != (enabled, mode, timing) for peer in peers):
+        raise ValueError("all EP ranks must agree on DEEPEP_TRACE_DIR enablement and diagnostic settings")
     if not enabled:
         return None, None
-    identity = KernelTrace.attach(native)
-    if identity is None:
+    if mode and getattr(native, "kernel_trace_diagnostic_version", 0) != 1:
+        raise RuntimeError("KernelTrace diagnostics require the matching rebuilt native extension")
+    identity = None if mode == "metadata" else KernelTrace.attach(native)
+    if identity is None and mode != "metadata":
         return None, None
     try:
         global_rank = _global_rank()

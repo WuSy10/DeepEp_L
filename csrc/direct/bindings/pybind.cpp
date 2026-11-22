@@ -8,6 +8,7 @@
  */
 
 #include <torch/extension.h>
+#include <chrono>
 
 #include "common/types.h"
 #include "runtime/kernel_trace.h"
@@ -15,6 +16,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    m.attr("kernel_trace_diagnostic_version") = 1;
     using ascend_deepep::trace::KernelTrace;
     using ascend_deepep::trace::TraceRecord;
     auto to_dict = [](const TraceRecord& record) {
@@ -41,7 +43,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             for (const auto& record : records) result.append(to_dict(record));
             return result;
         }, pybind11::arg("closing") = false)
-        .def("synchronize", &KernelTrace::Synchronize, pybind11::call_guard<pybind11::gil_scoped_release>());
+        .def("synchronize", &KernelTrace::Synchronize, pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def("drain_trace_diagnostic", [to_dict](KernelTrace& trace, bool include_records, bool timing, bool closing) {
+            using Clock = std::chrono::steady_clock;
+            const auto now = [timing]() -> int64_t {
+                return timing ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now().time_since_epoch()).count() : 0;
+            };
+            std::vector<TraceRecord> records;
+            std::map<std::string, int64_t> counters{{"polls", 1}, {"records", 0}, {"launches", 0},
+                {"ends", 0}, {"launch_errors", 0}, {"summaries", 0}, {"completed", 0},
+                {"incomplete", 0}, {"dropped", 0}};
+            int64_t drain_ns{};
+            {
+                pybind11::gil_scoped_release release;
+                const auto begin = now();
+                records = trace.Drain(closing);  // Same done_seq validation and slot recycling as production.
+                drain_ns = now() - begin;
+                counters["records"] = records.size();
+                for (const auto& record : records) {
+                    if (record.event == "launch") ++counters["launches"];
+                    else if (record.event == "end") ++counters["ends"];
+                    else if (record.event == "launch_error") ++counters["launch_errors"];
+                    else if (record.event == "summary") {
+                        ++counters["summaries"];
+                        for (const char* key : {"completed", "incomplete", "dropped"})
+                            counters[key] += record.values.at(key);
+                    }
+                }
+            }
+            const auto begin = now();
+            pybind11::list converted;
+            if (include_records)
+                for (const auto& record : records) converted.append(to_dict(record));
+            const auto convert_ns = now() - begin;
+            pybind11::dict result;
+            for (const auto& item : counters) result[pybind11::str(item.first)] = item.second;
+            result["drain_ns"] = drain_ns;
+            result["convert_ns"] = convert_ns;
+            result["items"] = converted;
+            return result;
+        }, pybind11::arg("include_records"), pybind11::arg("timing") = false, pybind11::arg("closing") = false);
     // Thread-local Host context; Reserve snapshots it before device launch.
     m.def("exchange_kernel_trace_metadata", [](pybind11::dict fields) {
         ascend_deepep::trace::TraceMetadata metadata;

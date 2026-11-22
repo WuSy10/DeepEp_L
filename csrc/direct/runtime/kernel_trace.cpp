@@ -56,6 +56,9 @@ std::shared_ptr<KernelTrace> KernelTrace::Open()
 {
     const char* directory = std::getenv("DEEPEP_TRACE_DIR");
     if (!directory || !*directory) return {};
+    // Diagnostic metadata-only mode must not allocate a ring or launch calibration/device probes.
+    const char* diagnostic = std::getenv("DEEPEP_TRACE_DIAGNOSTIC_MODE");
+    if (diagnostic && std::strcmp(diagnostic, "metadata") == 0) return {};
     try {
         static std::mutex mutex;
         static std::map<aclrtContext, std::weak_ptr<KernelTrace>> sinks;
