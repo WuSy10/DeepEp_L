@@ -16,7 +16,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.attr("kernel_trace_diagnostic_version") = 3;
+    m.attr("kernel_trace_diagnostic_version") = 4;
     using ascend_deepep::trace::KernelTrace;
     using ascend_deepep::trace::TraceRecord;
     struct Snapshot { ascend_deepep::trace::TraceMetadataSnapshot value; };

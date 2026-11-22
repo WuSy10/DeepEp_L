@@ -96,6 +96,7 @@ def check(directory, ranks, require_ops=(), require_reuse=False, require_metadat
         raise ValueError(f"no trace files in {directory}")
     for path in paths:
         offset = None
+        slots = 128  # Older calibration records used the fixed-size ring.
         launches = {}
         ended = set()
         finished = False
@@ -110,6 +111,9 @@ def check(directory, ranks, require_ops=(), require_reuse=False, require_metadat
                     if offset is not None or row["tick_hz"] != 1_000_000_000 or row["tick"] <= 0:
                         raise ValueError(f"{where}: invalid calibration")
                     offset = row["offset_ns"]
+                    slots = row.get("slots", 128)
+                    if type(slots) is not int or not 128 <= slots <= 16384:
+                        raise ValueError(f"{where}: invalid trace capacity")
                 elif kind == "launch":
                     gid = row["gid"]
                     if (
@@ -168,8 +172,8 @@ def check(directory, ranks, require_ops=(), require_reuse=False, require_metadat
                     raise ValueError(f"{where}: {kind}")
         if not finished:
             raise ValueError(f"{path}: missing final summary")
-        if require_reuse and len(ended) <= 128:
-            raise ValueError(f"{path}: need more than 128 completed records to exercise slot reuse")
+        if require_reuse and len(ended) <= slots:
+            raise ValueError(f"{path}: need more than {slots} completed records to exercise slot reuse")
         completed += len(ended)
     if observed != set(range(ranks)):
         raise ValueError(f"expected ranks 0..{ranks - 1}, got {sorted(observed)}")

@@ -20,10 +20,15 @@ def diagnostic_config():
     """Read once at initialization; an empty mode preserves the production path."""
     mode = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "")
     timing = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "0")
-    if mode not in ("", "metadata", "native", "json_discard", "json", "full") or timing not in ("0", "1"):
+    if mode not in ("", "record_only", "metadata", "native", "json_discard", "json", "full") or timing not in (
+        "0",
+        "1",
+    ):
         raise ValueError("invalid KernelTrace diagnostic mode/timing")
     if timing == "1" and not mode:
         raise ValueError("diagnostic timing requires a diagnostic mode")
+    if mode == "record_only" and timing == "1":
+        raise ValueError("record_only must run without diagnostic timing")
     return mode, timing == "1"
 
 
@@ -58,7 +63,7 @@ class KernelTrace:
                 calibration = source.calibration()
                 Path(directory).mkdir(parents=True, exist_ok=True)
                 name = f"kernel-{socket.gethostname()}-{os.getpid()}-d{calibration['device']}-{time.time_ns()}.jsonl"
-                if mode in ("", "full"):
+                if mode in ("", "record_only", "full"):
                     stream = (Path(directory) / name).open("x", encoding="utf-8")
                     stream.write(json.dumps(calibration) + "\n")
                     stream.flush()
@@ -72,8 +77,10 @@ class KernelTrace:
                     statistics={},
                     diagnostic_path=Path(directory) / name.replace("kernel-", "diagnostic-").replace(".jsonl", ".json"),
                     device=calibration["device"],
+                    slots=calibration.get("slots", 128),
+                    deferred_drains=0,
                 )
-                if cls._thread is None:
+                if mode != "record_only" and cls._thread is None:
                     cls._stop.clear()
                     cls._thread = threading.Thread(target=cls._poll, name="deepep-kernel-trace", daemon=True)
                     cls._thread.start()
@@ -89,8 +96,13 @@ class KernelTrace:
 
     @staticmethod
     def _drain(entry, closing=False):
+        # Even if another source owns a polling thread, deferred sources are never collected early.
+        if entry["mode"] == "record_only":
+            if not closing:
+                return
+            entry["deferred_drains"] += 1
         try:
-            if entry["mode"]:
+            if entry["mode"] not in ("", "record_only"):
                 KernelTrace._diagnostic_drain(entry, closing)
                 return
             text = entry["source"].drain_trace_json(closing)
@@ -144,7 +156,7 @@ class KernelTrace:
                 try:
                     if entry["stream"] is not None:
                         entry["stream"].close()
-                    if entry["mode"]:
+                    if entry["mode"] not in ("", "record_only"):
                         report = dict(
                             mode=entry["mode"],
                             timing=entry["timing"],
@@ -198,6 +210,8 @@ class KernelTraceSession:
     def __init__(self, native, comm_id, ep_size, global_rank=None):
         self.native = native
         self.diagnostic_mode, self.diagnostic_timing = diagnostic_config()
+        if self.diagnostic_mode == "record_only":
+            self.diagnostic_mode = ""  # Match production metadata work, without diagnostic per-call counters.
         self.diagnostic_stats = {}
         self.fields = dict(
             metadata_version=1,
@@ -287,7 +301,7 @@ def attach_trace_session(native, group, rank, ep_size, all_gather):
         raise ValueError("all EP ranks must agree on DEEPEP_TRACE_DIR enablement and diagnostic settings")
     if not enabled:
         return None, None
-    if getattr(native, "kernel_trace_diagnostic_version", 0) != 3:
+    if getattr(native, "kernel_trace_diagnostic_version", 0) != 4:
         raise RuntimeError("KernelTrace requires the matching rebuilt native extension")
     identity = None if mode == "metadata" else KernelTrace.attach(native)
     if identity is None and mode != "metadata":

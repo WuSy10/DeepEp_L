@@ -124,9 +124,17 @@ std::shared_ptr<KernelTrace> KernelTrace::Open()
 void KernelTrace::Init(int device)
 {
     device_ = device;
-    Check(aclrtMallocHost(&host_, kSlots * kSlotBytes), "allocate trace ring");
-    std::memset(host_, 0, kSlots * kSlotBytes);
-    Check(aclrtHostRegister(host_, kSlots * kSlotBytes, ACL_HOST_REGISTER_MAPPED, &mapped_), "map trace ring");
+    if (const char* value = std::getenv("DEEPEP_TRACE_SLOTS")) {
+        char* end{};
+        const auto count = std::strtoul(value, &end, 10);
+        if (!*value || *value < '0' || *value > '9' || *end || count < 128 || count > 16384)
+            throw std::runtime_error("DEEPEP_TRACE_SLOTS must be an integer in [128, 16384]");
+        slot_count_ = static_cast<unsigned>(count);
+    }
+    slots_ = std::make_unique<Slot[]>(slot_count_);
+    Check(aclrtMallocHost(&host_, slot_count_ * kSlotBytes), "allocate trace ring");
+    std::memset(host_, 0, slot_count_ * kSlotBytes);
+    Check(aclrtHostRegister(host_, slot_count_ * kSlotBytes, ACL_HOST_REGISTER_MAPPED, &mapped_), "map trace ring");
 
     aclrtStream stream{};
     Check(aclrtCreateStream(&stream), "create calibration stream");
@@ -155,7 +163,7 @@ KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t c
                                        const char* kernel_name, uint64_t stream, uint32_t ep_size,
                                        int64_t input_rows, int64_t output_rows)
 {
-    const auto index = cursor_.fetch_add(1, std::memory_order_relaxed) % kSlots;
+    const auto index = cursor_.fetch_add(1, std::memory_order_relaxed) % slot_count_;
     auto& slot = slots_[index];
     auto expected = State::Free;
     if (cores == 0 || cores > platform::kMaxNumAiv ||
@@ -195,7 +203,8 @@ void KernelTrace::Submit(Ticket ticket, int64_t launch_ns, int status)
 TraceRecord KernelTrace::Calibration() const
 {
     return {"calibration", "", "", {{"device", device_}, {"pid", getpid()}, {"tick_hz", kTickHz},
-        {"tick", static_cast<int64_t>(calibration_tick_)}, {"offset_ns", offset_ns_}, {"window_ns", window_ns_}}};
+        {"tick", static_cast<int64_t>(calibration_tick_)}, {"offset_ns", offset_ns_}, {"window_ns", window_ns_},
+        {"slots", slot_count_}, {"slot_bytes", kSlotBytes}}};
 }
 
 void KernelTrace::Synchronize()
@@ -213,7 +222,7 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
 {
     std::lock_guard<std::mutex> lock(drain_mutex_);
     std::vector<TraceRecord> records;
-    for (unsigned index = 0; index < kSlots; ++index) {
+    for (unsigned index = 0; index < slot_count_; ++index) {
         auto& slot = slots_[index];
         if (slot.state.load(std::memory_order_acquire) != State::Submitted) continue;
         TraceRecord record{"", slot.op_name, slot.kernel_name,

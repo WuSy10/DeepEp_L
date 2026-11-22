@@ -82,6 +82,46 @@ def test_python_monitor_shared_source_and_shutdown(tmp_path, monkeypatch):
     assert not worker.is_alive()
 
 
+def test_record_only_defers_all_collection_until_detach(tmp_path, monkeypatch):
+    monitor = load_monitor()
+    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "record_only")
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "0")
+
+    class Source:
+        identity = 987
+        calls = 0
+        synced = False
+
+        def calibration(self):
+            return dict(event="calibration", device=0, slots=4096)
+
+        def synchronize(self):
+            self.synced = True
+
+        def drain_trace_json(self, closing=False):
+            assert closing and self.synced
+            self.calls += 1
+            return '{"event":"summary","completed":300,"dropped":0,"incomplete":0}\n'
+
+    source = Source()
+    native = type("Native", (), {"get_kernel_trace": staticmethod(lambda: source)})
+    try:
+        key = monitor.attach(native)
+        entry = monitor._sources[key]
+        assert monitor._thread is None
+        for _ in range(256):
+            monitor._drain(entry)  # Also protects deferred sources if another source owns a poller.
+        assert source.calls == entry["deferred_drains"] == 0
+        assert len(next(tmp_path.glob("kernel-*.jsonl")).read_text().splitlines()) == 1
+        monitor.detach(key)
+        assert source.calls == entry["deferred_drains"] == 1
+        assert not list(tmp_path.glob("diagnostic-*.json"))
+        assert json.loads(next(tmp_path.glob("kernel-*.jsonl")).read_text().splitlines()[-1])["completed"] == 300
+    finally:
+        monitor.shutdown()
+
+
 def test_native_generation_reuse(tmp_path, monkeypatch):
     compiler = shutil.which("g++")
     if compiler is None:
@@ -177,6 +217,29 @@ int main(){
     auto summary=sink->Drain(true);
     assert(summary.back().values.at("completed")==384);
     assert(summary.back().values.at("dropped")==0);
+    sink.reset();
+    setenv("DEEPEP_TRACE_SLOTS", "512", 1);
+    sink=KernelTrace::Open(); assert(sink);
+    assert(sink->Calibration().values.at("slots")==512);
+    // More than the default 128 tickets must survive with no intermediate Drain.
+    for (int i=0; i<300; ++i) {
+        auto t=sink->Reserve(0,1,1,"dispatch","kernel"); assert(t.address);
+        sink->Submit(t,1000,0);
+        auto* p=reinterpret_cast<uint64_t*>(t.address);
+        __atomic_store_n(p,uint64_t{10},__ATOMIC_RELEASE);
+        __atomic_store_n(p+1,uint64_t{20},__ATOMIC_RELEASE);
+        __atomic_store_n(reinterpret_cast<uint64_t*>(t.address+kLineBytes),t.sequence,__ATOMIC_RELEASE);
+    }
+    auto deferred=sink->Drain(true);
+    assert(deferred.size()==601);
+    assert(deferred.back().values.at("completed")==300);
+    assert(deferred.back().values.at("dropped")==0);
+    assert(deferred.back().values.at("incomplete")==0);
+    sink.reset();
+    for (const char* invalid : {"", "127", "16385", "-1", "512oops"}) {
+        setenv("DEEPEP_TRACE_SLOTS", invalid, 1);
+        assert(!KernelTrace::Open());
+    }
     TraceRecord encoded{"end", "dispatch", "kernel", {{"large", 9223372036854775807LL}},
         {{"escaped", "quote\"\\\n\t"}}};
     std::cout << EncodeTraceRecords({encoded});
@@ -201,6 +264,7 @@ int main(){
         check=True,
     )
     monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
+    monkeypatch.delenv("DEEPEP_TRACE_SLOTS", raising=False)
     result = subprocess.run([str(binary)], check=True, timeout=20, capture_output=True, text=True)
     encoded = json.loads(result.stdout)
     assert encoded["large"] == 9223372036854775807
@@ -284,6 +348,15 @@ def test_python_monitor_mixed_kernels_and_checker(mixed_trace, monkeypatch):
         monitor.shutdown()
 
 
+def test_checker_uses_actual_capacity_for_reuse(mixed_trace):
+    checker, path, rows = mixed_trace
+    rows[0]["slots"] = 512
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    assert checker.check(path.parent, 1) == 130
+    with pytest.raises(ValueError, match="more than 512"):
+        checker.check(path.parent, 1, require_reuse=True)
+
+
 @pytest.mark.parametrize("corruption", ["kernel", "aiv", "gid", "time", "dropped", "missing_op"])
 def test_checker_rejects_mixed_trace_corruption(mixed_trace, corruption):
     checker, path, rows = mixed_trace
@@ -323,7 +396,7 @@ class MetadataTensor:
 
 
 class MetadataNative:
-    kernel_trace_diagnostic_version = 3
+    kernel_trace_diagnostic_version = 4
 
     def __init__(self):
         self.context = threading.local()
@@ -349,10 +422,14 @@ def load_trace_module():
     return module
 
 
-def test_call_and_handle_metadata_scopes():
+@pytest.mark.parametrize("mode", ["", "record_only"])
+def test_call_and_handle_metadata_scopes(monkeypatch, mode):
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", mode)
+    monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "0")
     module = load_trace_module()
     native = MetadataNative()
     session = module.KernelTraceSession(native, "comm-a", 4, 12)
+    assert session.diagnostic_mode == "" and not session.diagnostic_timing
     routes = MetadataTensor(32, 8)
     x = MetadataTensor(32, 6144)
     handle = type("Handle", (), {})()
@@ -449,7 +526,7 @@ def test_trace_group_initialization(monkeypatch):
 def test_metadata_only_and_mode_consensus(monkeypatch):
     module = load_trace_module()
     native = MetadataNative()
-    native.kernel_trace_diagnostic_version = 3
+    native.kernel_trace_diagnostic_version = 4
     monkeypatch.setenv("DEEPEP_TRACE_DIR", "unused")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "1")
@@ -463,12 +540,12 @@ def test_metadata_only_and_mode_consensus(monkeypatch):
     assert stats["calls"] == 1 and stats["enter_ns"] > 0 and stats["restore_ns"] > 0
     with pytest.raises(ValueError, match="all EP ranks"):
         module.attach_trace_session(native, None, 0, 1, lambda *items: [(True, "comm", "full", True)])
-    native.kernel_trace_diagnostic_version = 2  # Old extension lacks the native-discard argument.
+    native.kernel_trace_diagnostic_version = 3  # Old extension lacks configurable trace capacity.
     with pytest.raises(RuntimeError, match="matching rebuilt native"):
         module.attach_trace_session(native, None, 0, 1, lambda *items: [items[-1]])
 
 
-@pytest.mark.parametrize("mode,timing", [("bogus", "0"), ("", "1"), ("full", "yes")])
+@pytest.mark.parametrize("mode,timing", [("bogus", "0"), ("", "1"), ("full", "yes"), ("record_only", "1")])
 def test_reject_invalid_diagnostic_settings(monkeypatch, mode, timing):
     module = load_trace_module()
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", mode)
@@ -627,7 +704,11 @@ def validate_npu_metadata(directory, manifests, args):
     checker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(checker)
     checker.check(
-        directory, args.ep_size, ("notify_dispatch", "cached_notify_dispatch", "dispatch", "combine"), True, True
+        directory,
+        args.ep_size,
+        ("notify_dispatch", "cached_notify_dispatch", "dispatch", "combine"),
+        8 * (1 + args.warmup + args.windows * args.iterations) > (args.trace_slots or 128),
+        True,
     )
     calls = {}
     stages = {}
@@ -701,6 +782,7 @@ def test_npu_metadata_acceptance(tmp_path, corruption):
         warmup=1,
         windows=1,
         iterations=32,
+        trace_slots=128,
     )
     per_kind = 1 + args.warmup + args.iterations
     rows = [dict(event="calibration", tick_hz=1_000_000_000, tick=10, offset_ns=1000)]
@@ -794,6 +876,7 @@ def npu_worker(args):
     import torch_npu  # noqa: F401
     import deep_ep
     from deep_ep.backends.global_clos import ElasticBuffer
+    from deep_ep.utils.kernel_trace import KernelTrace
 
     sys.path.insert(0, str(ROOT / "tests/clos"))
     import common as golden
@@ -819,6 +902,11 @@ def npu_worker(args):
         transport="udma",
     )
     init_ns = time.perf_counter_ns() - started
+    trace_entry = KernelTrace._sources.get(buffer._kernel_trace)
+    deferred = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE") == "record_only"
+    if deferred:
+        assert trace_entry is not None and KernelTrace._thread is None
+        assert trace_entry["slots"] >= 8 * (1 + args.warmup + args.windows * args.iterations)
 
     def dispatch(handle=None):
         return buffer.dispatch(
@@ -901,10 +989,18 @@ def npu_worker(args):
         else "off",
         trace_ring_active=buffer._kernel_trace is not None,
         metadata_statistics=getattr(buffer._trace_session, "diagnostic_stats", {}),
+        trace_slots=trace_entry["slots"] if trace_entry else 0,
     )
+    if deferred:
+        manifest["deferred_evidence"] = dict(
+            thread_absent=KernelTrace._thread is None,
+            drains_before_destroy=trace_entry["deferred_drains"],
+        )
     started = time.perf_counter_ns()
     buffer.destroy()  # Flush/close trace before the controller validates logs.
     manifest["destroy_and_drain_ns"] = time.perf_counter_ns() - started
+    if deferred:
+        manifest["deferred_evidence"]["drains_after_destroy"] = trace_entry["deferred_drains"]
     (args.output / f"rank{rank}.json").write_text(json.dumps(manifest, indent=2))
     dist.destroy_process_group()
 
@@ -925,7 +1021,7 @@ def npu_parser():
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=("off", "production", "metadata", "native", "json_discard", "json", "full"),
+        choices=("off", "production", "record_only", "metadata", "native", "json_discard", "json", "full"),
         default=["off", "metadata", "native", "json", "full"],
     )
     parser.add_argument("--rounds", type=int, default=3)
@@ -944,6 +1040,7 @@ def npu_parser():
         iterations=100,
         warmup=10,
         timeout=1800,
+        trace_slots=0,
     ).items():
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=default)
     return parser
@@ -984,8 +1081,14 @@ def run_npu_acceptance(args):
             raise ValueError("--diagnostic-timing requires --diagnostic")
         if args.paired_baselines and not args.diagnostic:
             raise ValueError("--paired-baselines requires --diagnostic")
-        if args.diagnostic and args.diagnostic_timing and "production" in args.modes:
-            raise ValueError("production control must run without --diagnostic-timing")
+        if args.diagnostic and args.diagnostic_timing and any(m in args.modes for m in ("production", "record_only")):
+            raise ValueError("production control and record_only must run without --diagnostic-timing")
+        required_slots = 8 * (1 + args.warmup + args.windows * args.iterations)
+        deferred = args.diagnostic and "record_only" in args.modes
+        if args.trace_slots == 0:
+            args.trace_slots = max(128, required_slots) if deferred else 128
+        if not 128 <= args.trace_slots <= 16384 or (deferred and args.trace_slots < required_slots):
+            raise ValueError("trace slots must be in [128, 16384] and cover all record_only kernels")
         return _run_npu_diagnostic(args) if args.diagnostic else _run_npu_acceptance(args)
     except Exception as error:
         # Do not modify an existing output directory rejected by the initial mkdir.
@@ -998,11 +1101,18 @@ def run_npu_acceptance(args):
 def npu_run_trial(args, destination, mode, diagnostic=False):
     destination.mkdir()
     env = os.environ.copy()
-    for key in ("PYTHONPATH", "DEEPEP_TRACE_DIR", "DEEPEP_TRACE_DIAGNOSTIC_MODE", "DEEPEP_TRACE_DIAGNOSTIC_TIMING"):
+    for key in (
+        "PYTHONPATH",
+        "DEEPEP_TRACE_DIR",
+        "DEEPEP_TRACE_DIAGNOSTIC_MODE",
+        "DEEPEP_TRACE_DIAGNOSTIC_TIMING",
+        "DEEPEP_TRACE_SLOTS",
+    ):
         env.pop(key, None)
     env.update(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     if mode != "off":
         env["DEEPEP_TRACE_DIR"] = str(destination / "trace")
+        env["DEEPEP_TRACE_SLOTS"] = str(args.trace_slots)
         if diagnostic and mode != "production":
             env["DEEPEP_TRACE_DIAGNOSTIC_MODE"] = mode
             env["DEEPEP_TRACE_DIAGNOSTIC_TIMING"] = "1" if args.diagnostic_timing else "0"
@@ -1034,7 +1144,7 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
 
 def validate_diagnostic_trial(destination, manifests, args, mode):
     trace = destination / "trace"
-    if mode in ("production", "full"):
+    if mode in ("production", "record_only", "full"):
         validate_npu_metadata(trace, manifests, args)
     elif list(trace.glob("kernel-*.jsonl")):
         raise ValueError(f"{mode}: unexpected per-event log")
@@ -1050,13 +1160,22 @@ def validate_diagnostic_trial(destination, manifests, args, mode):
     for rank, manifest in enumerate(manifests):
         if manifest["trace_mode"] != mode or not manifest["precision_passed"]:
             raise ValueError("wrong mode or precision failure")
-        if manifest["trace_ring_active"] != (mode in (*collector_modes, "production")):
+        if manifest["trace_ring_active"] != (mode in (*collector_modes, "production", "record_only")):
             raise ValueError("unexpected trace ring state")
+        if manifest["trace_ring_active"] and manifest.get("trace_slots") != args.trace_slots:
+            raise ValueError("trace capacity does not match the paired control")
+        if mode == "record_only" and manifest.get("deferred_evidence") != dict(
+            thread_absent=True, drains_before_destroy=0, drains_after_destroy=1
+        ):
+            raise ValueError("record_only collected early or started a polling thread")
         metadata = manifest["metadata_statistics"]
         expected_calls = dict(fresh_dispatch=per_kind, cached_dispatch=per_kind, combine=2 * per_kind)
-        if mode in ("off", "production") and metadata:
+        if mode in ("off", "production", "record_only") and metadata:
             raise ValueError("off/production must not execute diagnostic metadata counters")
-        if mode not in ("off", "production") and {k: v["calls"] for k, v in metadata.items()} != expected_calls:
+        if (
+            mode not in ("off", "production", "record_only")
+            and {k: v["calls"] for k, v in metadata.items()} != expected_calls
+        ):
             raise ValueError("diagnostic metadata call count mismatch")
         if mode in collector_modes:
             report = by_pid[manifest["pid"]]
@@ -1091,7 +1210,9 @@ def diagnostic_schedule(args):
     """Counterbalance mode order and off/on order without changing the worker workload."""
     modes = [mode for mode in args.modes if mode != "off"] if args.paired_baselines else args.modes
     for round_id in range(args.rounds):
-        offset = round_id % len(modes)
+        # Reverse each rotation on the next round; rotating every round would cancel
+        # reversal for two modes and keep the same mode first forever.
+        offset = (round_id // 2) % len(modes)
         order = modes[offset:] + modes[:offset]
         if round_id % 2:
             order = list(reversed(order))
@@ -1111,6 +1232,8 @@ def diagnostic_layer_increments(runs):
     baseline = {(r["round"], r["pair"]): r["ns_per_api"] for r in runs if r["mode"] == "off"}
     selected = {(r["round"], r["mode"]): r for r in runs if r["mode"] != "off"}
     edges = (
+        ("metadata", "record_only"),
+        ("record_only", "production"),
         ("production", "full"),
         ("metadata", "native"),
         ("native", "json_discard"),
@@ -1259,7 +1382,17 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
     args = npu_parser().parse_args(
         ["--npu", "--diagnostic", "--rounds", "2", "--output", str(tmp_path / "diagnosis")]
         + (
-            ["--paired-baselines", "--modes", "off", "production", "native", "json_discard", "json", "full"]
+            [
+                "--paired-baselines",
+                "--modes",
+                "off",
+                "production",
+                "record_only",
+                "native",
+                "json_discard",
+                "json",
+                "full",
+            ]
             if paired
             else ["--diagnostic-timing"]
         )
@@ -1278,15 +1411,19 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
         # Use the planned pair label because mode names themselves may contain underscores.
         planned = next(t for t in diagnostic_schedule(args) if t["directory"] == destination.name)
         drift = 100 * args.modes.index(planned["pair"]) if paired else 0
-        excess = dict(off=0, production=35, metadata=10, native=20, json_discard=30, json=40, full=45)[mode]
+        excess = dict(off=0, production=35, record_only=25, metadata=10, native=20, json_discard=30, json=40, full=45)[
+            mode
+        ]
         for rank in range(args.ep_size):
             manifest = dict(
                 pid=100 + rank,
                 trace_mode=mode,
-                trace_ring_active=mode in ("production", "native", "json_discard", "json", "full"),
+                trace_ring_active=mode in ("production", "record_only", "native", "json_discard", "json", "full"),
+                trace_slots=args.trace_slots,
+                deferred_evidence=dict(thread_absent=True, drains_before_destroy=0, drains_after_destroy=1),
                 precision_passed=True,
                 metadata_statistics={}
-                if mode in ("off", "production")
+                if mode in ("off", "production", "record_only")
                 else {
                     k: dict(calls=v, enter_ns=1, restore_ns=1)
                     for k, v in dict(fresh_dispatch=per_kind, cached_dispatch=per_kind, combine=2 * per_kind).items()
@@ -1339,9 +1476,14 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
         assert report["instrumented"] == args.diagnostic_timing
         assert order == [t["mode"] for t in diagnostic_schedule(args)]
         if paired:
-            assert len(order) == 20
-            assert report["comparisons"]["json"]["fresh_dispatch"]["median_percent"] == pytest.approx(8)
-            for edge in ("production -> full", "native -> json_discard", "json_discard -> json"):
+            assert len(order) == 24
+            assert report["comparisons"]["json"]["fresh_dispatch"]["median_percent"] == pytest.approx(100 * 40 / 600)
+            for edge in (
+                "record_only -> production",
+                "production -> full",
+                "native -> json_discard",
+                "json_discard -> json",
+            ):
                 assert report["layer_increments"][edge]["fresh_dispatch"]["baseline_adjusted_ns"] == [10, 10]
         else:
             assert report["comparisons"]["json"]["fresh_dispatch"]["median_percent"] == pytest.approx(40)
@@ -1365,6 +1507,15 @@ def test_diagnostic_paired_schedule_and_production_guard(tmp_path):
     )
     plan = list(diagnostic_schedule(args))
     assert len(plan) == 24 and len({t["directory"] for t in plan}) == 24
+    enabled_order = [[t["mode"] for t in plan if t["round"] == r and t["mode"] != "off"] for r in range(6)]
+    assert enabled_order == [
+        ["production", "full"],
+        ["full", "production"],
+        ["full", "production"],
+        ["production", "full"],
+        ["production", "full"],
+        ["full", "production"],
+    ]
     for i in range(0, len(plan), 2):
         a, b = plan[i : i + 2]
         assert a["round"] == b["round"] and a["pair"] == b["pair"]
@@ -1373,6 +1524,51 @@ def test_diagnostic_paired_schedule_and_production_guard(tmp_path):
     with pytest.raises(ValueError, match="production control"):
         run_npu_acceptance(args)
     assert not args.output.exists()
+
+
+@pytest.mark.parametrize("slots", [127, 128, 16385])
+def test_record_only_rejects_insufficient_capacity(tmp_path, slots):
+    args = npu_parser().parse_args(
+        [
+            "--npu",
+            "--diagnostic",
+            "--modes",
+            "off",
+            "record_only",
+            "--trace-slots",
+            str(slots),
+            "--output",
+            str(tmp_path / "unused"),
+        ]
+    )
+    with pytest.raises(ValueError, match="trace slots"):
+        run_npu_acceptance(args)
+    assert not args.output.exists()
+
+
+@pytest.mark.parametrize("corruption", ["capacity", "thread", "early", "missing_final"])
+def test_record_only_rejects_invalid_collection_evidence(tmp_path, monkeypatch, corruption):
+    args = npu_parser().parse_args(["--output", str(tmp_path), "--trace-slots", "2488"])
+    evidence = dict(thread_absent=True, drains_before_destroy=0, drains_after_destroy=1)
+    manifest = dict(
+        trace_mode="record_only",
+        precision_passed=True,
+        trace_ring_active=True,
+        trace_slots=2488,
+        metadata_statistics={},
+        deferred_evidence=evidence,
+    )
+    if corruption == "capacity":
+        manifest["trace_slots"] = 128
+    elif corruption == "thread":
+        evidence["thread_absent"] = False
+    elif corruption == "early":
+        evidence["drains_before_destroy"] = 1
+    else:
+        evidence["drains_after_destroy"] = 0
+    monkeypatch.setattr(sys.modules[__name__], "validate_npu_metadata", lambda *items: None)
+    with pytest.raises(ValueError, match="trace capacity|record_only collected"):
+        validate_diagnostic_trial(tmp_path, [manifest], args, "record_only")
 
 
 @pytest.mark.skipif(os.environ.get("DEEPEP_RUN_TRACE_NPU") != "1", reason="opt-in real NPU acceptance")

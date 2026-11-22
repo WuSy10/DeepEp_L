@@ -29,7 +29,7 @@ python -u benchmarks/clos/bench_v2_bandwidth.py \
 python scripts/check_kernel_trace.py "$RUN/trace" --ranks 4 --require-ops notify_dispatch dispatch combine --require-metadata
 ```
 
-每个文件名包含主机、PID、设备和文件创建时间。校验器检查各 rank 是否有指定类型的成功完成记录、launch 与 end 是否配对、时钟换算是否一致，以及是否丢样。一次 API 调用可能启动多个 kernel，基准的预热和准备也会产生记录，因此记录数不等于 iterations。增加 eager 调用数后可用 `--require-reuse` 要求每个文件超过 128 条完成记录；此检查证明跨越槽池容量，逐核 done_seq 的代际校验还需原生协议测试。性能验收需使用相同输入、资源和启动方式做开关交替对照，并同时记录丢样数。
+每个文件名包含主机、PID、设备和文件创建时间。校验器检查各 rank 是否有指定类型的成功完成记录、launch 与 end 是否配对、时钟换算是否一致，以及是否丢样。一次 API 调用可能启动多个 kernel，基准的预热和准备也会产生记录，因此记录数不等于 iterations。增加 eager 调用数后可用 `--require-reuse` 要求每个文件超过 128 条完成记录；新日志按 calibration.slots 的实际容量检查，旧日志回退到 128；仅记录的大容量试验不宣称槽位复用。逐核 done_seq 的代际校验还需原生协议测试。性能验收需使用相同输入、资源和启动方式做开关交替对照，并同时记录丢样数。
 
 ## 时间含义
 
@@ -53,7 +53,7 @@ $$
 
 Python KernelTrace 在每个进程内共享一个后台线程，管理各活跃 ACL context 的原生采集器。C++ 提供 calibration、drain_trace_json、synchronize 接口。Python 每轮休眠约 2 ms 后调用原生侧回收；原生侧释放 GIL，完成记录合并、JSONL 编码和原生对象清理，返回一块文本。Python 负责批量写入和刷新。
 
-每个采集器分配 128 槽的 Host 映射内存，每槽预留 64 个 AIV，每个 AIV 占用 256 字节，总计约 2 MiB。核内起始 tick 保存在局部变量。结束时 dispatch/notify 复用已释放的 UB，combine/cached notify 在工作结束后使用 32 字节 UB，将 start_tick、end_tick 写入偏移 0，等待 MTE3_S 后，在偏移 128 发布 done_seq。第二次写出也用 MTE3_S 保护 UB 生命周期。combine/cached notify 在读取结束 tick 前用本核 V_S、MTE3_S 将流水完成推进到标量侧；不增加全卡或全核同步。每个 AIV 独占自己的区域。
+每个采集器默认分配 128 槽的 Host 映射内存，每槽预留 64 个 AIV，每个 AIV 占用 256 字节，总计约 2 MiB。核内起始 tick 保存在局部变量。结束时 dispatch/notify 复用已释放的 UB，combine/cached notify 在工作结束后使用 32 字节 UB，将 start_tick、end_tick 写入偏移 0，等待 MTE3_S 后，在偏移 128 发布 done_seq。第二次写出也用 MTE3_S 保护 UB 生命周期。combine/cached notify 在读取结束 tick 前用本核 V_S、MTE3_S 将流水完成推进到标量侧；不增加全卡或全核同步。每个 AIV 独占自己的区域。
 
 Host 为成功预留的槽分配从 1 开始的进程内序号，kernel 按此序号发布。只有全部参与核的 done_seq 等于本轮序号才消费数据。回收后保留旧 tick 和序号，下一轮靠新序号识别数据。占用的槽会导致当前采集跳过并记录 dropped。提交异常的槽隔离到销毁。
 
@@ -164,12 +164,13 @@ $$
 
 当完整采集开销明显超过阈值时，同一个测试入口支持 `--diagnostic`。这是归因工具，不是性能验收，也不修改 kernel 的打点、done_seq 或 Host 映射内存协议。
 
-需要重新构建安装本分支的 Host 原生扩展；只复制 Python 文件不够。采集启动会检查原生扩展的版本标识（当前为 3），拒绝混用不支持这些开关的旧扩展。
+需要重新构建安装本分支的 Host 原生扩展；只复制 Python 文件不够。采集启动会检查原生扩展的版本标识（当前为 4），拒绝混用不支持这些开关的旧扩展。
 
 | 模式 | 实际工作 | 输出 |
 | --- | --- | --- |
 | off | 完全关闭采集 | rank 耗时/精度 JSON |
 | production | 普通采集路径，只设置 trace 目录，清除两个诊断环境变量；无诊断调用计数或批次计数 | kernel JSONL，无 diagnostic JSON |
+| record_only | 与 production 相同的前台元数据、launch、设备 tick/done_seq；不启动采集线程，所有 API 计时结束后才收集 | destroy 时完整 JSONL，无 diagnostic JSON |
 | metadata | 仅执行 API 元数据构造、原生上下文交换与恢复；不分配采集环、不启动校准 kernel 或采集线程 | rank JSON 中的元数据调用统计 |
 | native | 元数据、设备打点、Python 线程轮询原生 Drain；不把每条记录转换成 Python 字典 | 退出时的 diagnostic JSON |
 | json_discard | 与 json 一样在释放 GIL 时完整编码；随后在 C++ 释放文本，只返回计数和空字符串 | 退出时的 diagnostic JSON |
@@ -203,7 +204,7 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic \
 
 `diagnosis.json` 汇总五种模式相对 off 的开销，`diagnostic_valid=true` 只表示诊断证据通过完整性检查，`performance_acceptance` 始终为 false。完整性失败返回非零并保留原因；性能变慢本身不使诊断任务失败。native/json/full 的计数校验针对本用例当前 eager 非展开的 notify+dispatch、communication+reduce 路径（每次 API 两个 kernel）；改变执行策略后若 kernel 数不同，应先核对实际路径，不放宽丢样检查。
 
-诊断环境变量只供本功能排查，并在初始化时确定：`DEEPEP_TRACE_DIAGNOSTIC_MODE=metadata|native|json_discard|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`，开启模式还需设置 DEEPEP_TRACE_DIR。EP 内配置必须一致；不支持运行中修改。测试控制器自动管理并清除继承值，正常 `--npu` 验收也会清除诊断变量。没有诊断变量时保持原有完整采集路径。production 只是测试控制器的模式名称，不是诊断环境变量的合法值。
+诊断环境变量只供本功能排查，并在初始化时确定：`DEEPEP_TRACE_DIAGNOSTIC_MODE=record_only|metadata|native|json_discard|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`，开启模式还需设置 DEEPEP_TRACE_DIR。EP 内配置必须一致；不支持运行中修改。测试控制器自动管理并清除继承值，正常 `--npu` 验收也会清除诊断变量。没有诊断变量时保持原有完整采集路径。production 只是测试控制器的模式名称，不是诊断环境变量的合法值。
 
 相邻模式的差值包含工作重叠、线程调度变化及小额诊断统计成本，不能当作各模块的精确独占时间。优先用未加细分计时的五组结果定位增量，再结合计时轮次解释。json 与 native 的差值现在主要对应原生编码和批量文本传递，不能沿用旧版的逐事件 Python 转换/编码归因。最终优化必须回到原始完整采集开关 A/B 验收。
 
@@ -239,6 +240,38 @@ json_discard 保留相同的设备打点、done_seq 检查、回收、2 ms 轮�
 所有原生诊断批次新增 `encoded_bytes` 和 `returned_text_bytes`（UTF-8 文本字节累计）：native 两者为 0，json_discard 前者大于 0、后者为 0，json/full 两者相等且大于 0。控制器检查这些条件以及原有 completed/launch/end/dropped/incomplete，避免把未编码或错误返回文本当作有效对照。新计数仅存在于诊断路径，不改变普通采集输出。
 
 如需详细计时，可另跑第二步的模式组合，加 `--diagnostic-timing --rounds 1` 并使用新目录；此结果仅辅助定位，不纳入主性能比较。最终低于 1% 的验收仍需运行不带 `--diagnostic` 的普通 A/B 用例。
+
+## 只记录与后台并发收集的对照
+
+`record_only` 仅供诊断：保留业务线程和设备侧的采集写入，不启动 Python 轮询线程，也不做诊断的逐 API 计数。初始化仍写 calibration；从精度检查、预热到全部 API 计时完成之间不 Drain、不编码、不写事件日志。随后 `buffer.destroy()` 在计时之外同步并一次性收集、编码和落盘，保留原 done_seq 验证与完整日志校验。因此它测试的是 Host+设备的前台记录成本，不是纯设备打点成本。
+
+本 eager 用例每 rank 的总记录槽需求为 `8 × (1 + warmup + windows × iterations)`，包含全部四类 API 的精度、预热和稳态，每 API 两个 kernel。默认参数共 2488 个槽，不能使用默认 128 槽并依赖丢样完成试验。包含 record_only 时，控制器自动为同一试验中的所有开启模式设置相同的足额容量；`--trace-slots` 可显式指定，但不足会在启动前拒绝。范围为 128～16384，默认 0 表示自动选择，其他模式默认仍为 128。
+
+```bash
+# 主对照：同容量，只记录 vs 后台并发采集；六轮共 36 次初始化。
+python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
+    --modes off metadata record_only production --rounds 6 \
+    --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
+    --num-topk 8 --experts-per-rank 32 --aiv 32 --reduce-aiv 32 \
+    --windows 3 --iterations 100 --warmup 10 \
+    --output "$PWD/trace_record_control_$(date +%Y%m%d_%H%M%S)"
+
+# 标准容量参考：避免将大环的扫描/缓存影响当成默认采集成本。
+python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
+    --modes off production --trace-slots 128 --rounds 6 \
+    --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
+    --num-topk 8 --experts-per-rank 32 --aiv 32 --reduce-aiv 32 \
+    --windows 3 --iterations 100 --warmup 10 \
+    --output "$PWD/trace_default_capacity_$(date +%Y%m%d_%H%M%S)"
+```
+
+容量通过初始化变量 `DEEPEP_TRACE_SLOTS` 传入原生层，未设置时为 128；不支持运行中改变。控制器清除继承值，calibration 输出实际 `slots` 和 `slot_bytes`；Host 映射区大小是二者乘积，另有 Host 槽状态和待收集元数据。扩大容量会改变后台扫描范围和内存占用，所以大环 production 结果必须与默认 128 槽参考分别标注，不直接外推为正常部署开销。
+
+`rankN.json` 记录实际容量及 record_only 的 `deferred_evidence`：采集线程不存在、destroy 前收集次数为 0、destroy 后为 1。任一不符合、容量不匹配、丢样或未完成记录都会失败。释放资源及延后落盘耗时记录在 `destroy_and_drain_ns`，不计入 API 墙钟；该字段也包含业务资源销毁，不能全算作日志成本。record_only 与 production 都不允许细分诊断计时。
+
+执行顺序现在每两轮使用同一轮转位置，第二轮反转，然后再轮转。两个开启模式的前两轮为 A→B、B→A，避免旧的“每轮轮转再反转”相互抵消。各模式仍使用相邻独立 off，并交替 off/on 方向；查看 plan.json 确认，不依据口头顺序假定。
+
+重点比较 off→record_only 与 record_only→production；metadata 仅用于辅助估计 Host 上下文成本，仍带诊断计数，不与 record_only 形成完全纯净的累加层。新增对应的 layer_increments，保留每轮原始和基线校正值。前台记录变慢时再拆 Host 与设备发布；只有后台开启才明显变慢时再查并发收集、调度和 GIL。当前差值本身不能证明具体一种等待机制。
 
 ## 元数据缓存与原生批量编码的验证
 

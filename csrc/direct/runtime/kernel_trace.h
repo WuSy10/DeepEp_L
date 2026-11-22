@@ -63,10 +63,10 @@ private:
         int64_t input_rows{-1}, output_rows{-1};
         bool logged_launch{};
     };
-    static constexpr unsigned kSlots = 128;
     KernelTrace() = default;
     void Init(int device);
-    Slot slots_[kSlots];
+    unsigned slot_count_ = 128;
+    std::unique_ptr<Slot[]> slots_;
     std::mutex drain_mutex_;
     std::atomic<unsigned> cursor_{0};
     std::atomic<uint64_t> dropped_{0};
