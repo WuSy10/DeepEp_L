@@ -16,7 +16,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.attr("kernel_trace_diagnostic_version") = 2;
+    m.attr("kernel_trace_diagnostic_version") = 3;
     using ascend_deepep::trace::KernelTrace;
     using ascend_deepep::trace::TraceRecord;
     struct Snapshot { ascend_deepep::trace::TraceMetadataSnapshot value; };
@@ -74,7 +74,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             return result;
         }, pybind11::arg("closing") = false)
         .def("synchronize", &KernelTrace::Synchronize, pybind11::call_guard<pybind11::gil_scoped_release>())
-        .def("drain_trace_diagnostic", [](KernelTrace& trace, bool include_records, bool timing, bool closing) {
+        .def("drain_trace_diagnostic", [](KernelTrace& trace, bool include_records, bool timing, bool closing,
+                                         bool return_text) {
             using Clock = std::chrono::steady_clock;
             const auto now = [timing]() -> int64_t {
                 return timing ? std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -83,7 +84,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             std::vector<TraceRecord> records;
             std::map<std::string, int64_t> counters{{"polls", 1}, {"records", 0}, {"launches", 0},
                 {"ends", 0}, {"launch_errors", 0}, {"summaries", 0}, {"completed", 0},
-                {"incomplete", 0}, {"dropped", 0}};
+                {"incomplete", 0}, {"dropped", 0}, {"encoded_bytes", 0}, {"returned_text_bytes", 0}};
             int64_t drain_ns{}, serialize_ns{};
             std::string text;
             {
@@ -106,7 +107,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
                     const auto encode_begin = now();
                     text = ascend_deepep::trace::EncodeTraceRecords(records);
                     serialize_ns = now() - encode_begin;
+                    counters["encoded_bytes"] = text.size();
+                    if (!return_text) {
+                        // Keep encoding and recycling identical, but free the payload before reacquiring the GIL.
+                        std::string{}.swap(text);
+                    }
                 }
+                counters["returned_text_bytes"] = text.size();
                 records.clear();
             }
             const auto begin = now();
@@ -119,7 +126,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             result["text"] = converted;
             result["serialize_ns"] = serialize_ns;
             return result;
-        }, pybind11::arg("include_records"), pybind11::arg("timing") = false, pybind11::arg("closing") = false);
+        }, pybind11::arg("include_records"), pybind11::arg("timing") = false, pybind11::arg("closing") = false,
+           pybind11::arg("return_text") = true);
     m.def("get_kernel_trace", &KernelTrace::Open);
     m.def("get_shmem_unique_id" , &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);

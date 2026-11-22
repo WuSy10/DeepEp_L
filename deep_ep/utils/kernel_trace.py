@@ -20,7 +20,7 @@ def diagnostic_config():
     """Read once at initialization; an empty mode preserves the production path."""
     mode = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "")
     timing = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "0")
-    if mode not in ("", "metadata", "native", "json", "full") or timing not in ("0", "1"):
+    if mode not in ("", "metadata", "native", "json_discard", "json", "full") or timing not in ("0", "1"):
         raise ValueError("invalid KernelTrace diagnostic mode/timing")
     if timing == "1" and not mode:
         raise ValueError("diagnostic timing requires a diagnostic mode")
@@ -106,7 +106,7 @@ class KernelTrace:
     def _diagnostic_drain(entry, closing):
         mode, timing = entry["mode"], entry["timing"]
         begin = time.perf_counter_ns() if timing else 0
-        batch = entry["source"].drain_trace_diagnostic(mode != "native", timing, closing)
+        batch = entry["source"].drain_trace_diagnostic(mode != "native", timing, closing, mode != "json_discard")
         if timing:
             batch["drain_call_wall_ns"] = time.perf_counter_ns() - begin
         text = batch.pop("text")
@@ -287,7 +287,7 @@ def attach_trace_session(native, group, rank, ep_size, all_gather):
         raise ValueError("all EP ranks must agree on DEEPEP_TRACE_DIR enablement and diagnostic settings")
     if not enabled:
         return None, None
-    if getattr(native, "kernel_trace_diagnostic_version", 0) != 2:
+    if getattr(native, "kernel_trace_diagnostic_version", 0) != 3:
         raise RuntimeError("KernelTrace requires the matching rebuilt native extension")
     identity = None if mode == "metadata" else KernelTrace.attach(native)
     if identity is None and mode != "metadata":

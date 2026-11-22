@@ -164,13 +164,15 @@ $$
 
 当完整采集开销明显超过阈值时，同一个测试入口支持 `--diagnostic`。这是归因工具，不是性能验收，也不修改 kernel 的打点、done_seq 或 Host 映射内存协议。
 
-需要重新构建安装本分支的 Host 原生扩展；只复制 Python 文件不够。采集启动会检查原生扩展的版本标识（当前为 2），拒绝混用不支持这些开关的旧扩展。
+需要重新构建安装本分支的 Host 原生扩展；只复制 Python 文件不够。采集启动会检查原生扩展的版本标识（当前为 3），拒绝混用不支持这些开关的旧扩展。
 
 | 模式 | 实际工作 | 输出 |
 | --- | --- | --- |
 | off | 完全关闭采集 | rank 耗时/精度 JSON |
+| production | 普通采集路径，只设置 trace 目录，清除两个诊断环境变量；无诊断调用计数或批次计数 | kernel JSONL，无 diagnostic JSON |
 | metadata | 仅执行 API 元数据构造、原生上下文交换与恢复；不分配采集环、不启动校准 kernel 或采集线程 | rank JSON 中的元数据调用统计 |
 | native | 元数据、设备打点、Python 线程轮询原生 Drain；不把每条记录转换成 Python 字典 | 退出时的 diagnostic JSON |
+| json_discard | 与 json 一样在释放 GIL 时完整编码；随后在 C++ 释放文本，只返回计数和空字符串 | 退出时的 diagnostic JSON |
 | json | native 的工作，加释放 GIL 的原生 JSONL 编码；返回整批文本后丢弃 | 退出时的 diagnostic JSON |
 | full | 原生批量编码和 Python JSONL 写入/刷新 | kernel JSONL 和退出时的 diagnostic JSON |
 
@@ -201,10 +203,42 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic \
 
 `diagnosis.json` 汇总五种模式相对 off 的开销，`diagnostic_valid=true` 只表示诊断证据通过完整性检查，`performance_acceptance` 始终为 false。完整性失败返回非零并保留原因；性能变慢本身不使诊断任务失败。native/json/full 的计数校验针对本用例当前 eager 非展开的 notify+dispatch、communication+reduce 路径（每次 API 两个 kernel）；改变执行策略后若 kernel 数不同，应先核对实际路径，不放宽丢样检查。
 
-诊断环境变量只供本功能排查，并在初始化时确定：`DEEPEP_TRACE_DIAGNOSTIC_MODE=metadata|native|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`，开启模式还需设置 DEEPEP_TRACE_DIR。EP 内配置必须一致；不支持运行中修改。测试控制器自动管理并清除继承值，正常 `--npu` 验收也会清除诊断变量。没有诊断变量时保持原有完整采集路径。
+诊断环境变量只供本功能排查，并在初始化时确定：`DEEPEP_TRACE_DIAGNOSTIC_MODE=metadata|native|json_discard|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`，开启模式还需设置 DEEPEP_TRACE_DIR。EP 内配置必须一致；不支持运行中修改。测试控制器自动管理并清除继承值，正常 `--npu` 验收也会清除诊断变量。没有诊断变量时保持原有完整采集路径。production 只是测试控制器的模式名称，不是诊断环境变量的合法值。
 
 相邻模式的差值包含工作重叠、线程调度变化及小额诊断统计成本，不能当作各模块的精确独占时间。优先用未加细分计时的五组结果定位增量，再结合计时轮次解释。json 与 native 的差值现在主要对应原生编码和批量文本传递，不能沿用旧版的逐事件 Python 转换/编码归因。最终优化必须回到原始完整采集开关 A/B 验收。
 
+
+## 普通采集对照和编码返回链路定位
+
+诊断 full 即使关闭细分计时，仍包含每 API 调用计数、每批原生计数返回及 Python 累加；它与普通采集并非同一路径。先比较普通采集和诊断 full，再拆分编码与文本返回，两个步骤均沿用同一个 worker、shape、精度检查及计时边界。
+
+```bash
+# 第一步：普通 off/on 与诊断 off/full，六轮共 24 次进程组初始化。
+python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
+    --modes off production full --rounds 6 \
+    --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
+    --num-topk 8 --experts-per-rank 32 --aiv 32 --reduce-aiv 32 \
+    --windows 3 --iterations 100 --warmup 10 \
+    --output "$PWD/trace_production_control_$(date +%Y%m%d_%H%M%S)"
+
+# 第二步：编码与 Python 文本返回，六轮共 36 次进程组初始化。
+python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
+    --modes off native json_discard json --rounds 6 \
+    --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
+    --num-topk 8 --experts-per-rank 32 --aiv 32 --reduce-aiv 32 \
+    --windows 3 --iterations 100 --warmup 10 \
+    --output "$PWD/trace_encoding_control_$(date +%Y%m%d_%H%M%S)"
+```
+
+`--paired-baselines` 为每个开启模式运行独立且相邻的 off；轮转开启模式顺序，并交替 off→mode、mode→off。`plan.json` 记录执行顺序，`runs.json` 的 pair 标识对应本模式的 off。所有试次顺序执行，不共享或并发使用 Buffer。关闭该选项时仍使用原有同轮共享 off 的方式。
+
+`diagnosis.json.layer_increments` 提供 production→full、native→json_discard、json_discard→json 等可用对照的逐轮原始差值、各自 off 校正后的差值、中位数、范围及正增量轮数；单位 ns。这些差值不是独占耗时，不能因中位数为正就忽略符号不一致的轮次。production 与 full 都校验完整逐事件日志；production 还要求无诊断统计和诊断报告。带 production 的比较拒绝 `--diagnostic-timing`，避免把加计时的诊断路径与普通路径混为一谈。
+
+json_discard 保留相同的设备打点、done_seq 检查、回收、2 ms 轮询和 C++ 编码函数；只改变文本离开原生层的方式。它仍返回小型计数字典和空 Python 字符串，不是无 GIL 或无 Python 线程的模式。与 json 的差值包括文本转换、传递、释放位置及调度变化，不能直接称为 GIL 等待。没有关闭回收或故意填满槽位来省略采集。
+
+所有原生诊断批次新增 `encoded_bytes` 和 `returned_text_bytes`（UTF-8 文本字节累计）：native 两者为 0，json_discard 前者大于 0、后者为 0，json/full 两者相等且大于 0。控制器检查这些条件以及原有 completed/launch/end/dropped/incomplete，避免把未编码或错误返回文本当作有效对照。新计数仅存在于诊断路径，不改变普通采集输出。
+
+如需详细计时，可另跑第二步的模式组合，加 `--diagnostic-timing --rounds 1` 并使用新目录；此结果仅辅助定位，不纳入主性能比较。最终低于 1% 的验收仍需运行不带 `--diagnostic` 的普通 A/B 用例。
 
 ## 元数据缓存与原生批量编码的验证
 
