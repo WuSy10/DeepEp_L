@@ -170,7 +170,7 @@ $$
 | --- | --- | --- |
 | off | 完全关闭采集 | rank 耗时/精度 JSON |
 | production | 普通采集路径，只设置 trace 目录，清除两个诊断环境变量；无诊断调用计数或批次计数 | kernel JSONL，无 diagnostic JSON |
-| record_only | 与 production 相同的前台元数据、launch、设备 tick/done_seq；不启动采集线程，所有 API 计时结束后才收集 | destroy 时完整 JSONL，无 diagnostic JSON |
+| record_only | 与 production 相同的前台元数据、launch、设备 tick/done_seq；不启动采集线程，仅在显式窗口边界或 destroy 时收集 | 完整 JSONL，无 diagnostic JSON |
 | metadata | 仅执行 API 元数据构造、原生上下文交换与恢复；不分配采集环、不启动校准 kernel 或采集线程 | rank JSON 中的元数据调用统计 |
 | native | 元数据、设备打点、Python 线程轮询原生 Drain；不把每条记录转换成 Python 字典 | 退出时的 diagnostic JSON |
 | json_discard | 与 json 一样在释放 GIL 时完整编码；随后在 C++ 释放文本，只返回计数和空字符串 | 退出时的 diagnostic JSON |
@@ -242,6 +242,34 @@ json_discard 保留相同的设备打点、done_seq 检查、回收、2 ms 轮�
 如需详细计时，可另跑第二步的模式组合，加 `--diagnostic-timing --rounds 1` 并使用新目录；此结果仅辅助定位，不纳入主性能比较。最终低于 1% 的验收仍需运行不带 `--diagnostic` 的普通 A/B 用例。
 
 ## 只记录与后台并发收集的对照
+
+### 固定 128 槽的短窗口对照（推荐）
+
+为避免扩大槽位改变后台扫描和地址复用，使用 `--windowed-collection --trace-slots 128 --iterations 60 --windows 5`。每个计时窗口 60 次 API，最多产生 120 条 kernel 记录；五个窗口仍为每种 API 300 次稳态调用。record_only 全程没有后台线程，production 保留原有后台轮询。两组以及 off/metadata 使用完全相同的显式边界：
+
+1. 全部四种 API 精度检查完成后同步并收集一次，最多 8 条记录。
+2. 每种 API 的 10 次预热完成后同步并收集一次，最多 20 条记录。
+3. 每个窗口记录 API 耗时后，再同步、收集、编码和 flush。这些操作不进入 API 计时；窗口内仍只有原有 API 调用、消费流依赖和结束同步。
+
+合计每 rank 25 个显式边界（精度 1 + 预热 4 + 窗口 20），最终 destroy 再收集一次并输出 summary。没有在窗口内重置槽位、丢弃记录或关闭 kernel 打点。窗口间继续复用同一个 128 槽环，沿用 done_seq 代际检查。
+
+```bash
+python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
+    --windowed-collection --trace-slots 128 \
+    --modes off metadata record_only production --rounds 6 \
+    --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
+    --num-topk 8 --experts-per-rank 32 --aiv 32 --reduce-aiv 32 \
+    --windows 5 --iterations 60 --warmup 10 \
+    --output "$PWD/trace_window128_control_$(date +%Y%m%d_%H%M%S)"
+```
+
+仍为 36 次进程组初始化。控制器向所有 worker 传递窗口选项，并在启动前拒绝非 128 槽或任一边界间超容量的配置。`record_only` 在每个显式边界前后检查线程不存在及收集次数，发现额外收集立即失败。
+
+`rankN.json.collection_boundaries` 保存 25 个边界的标签和 `collect_ns`，控制器核对标签、顺序和数量。`collect_ns` 是窗口外收集调用墙钟，包含可能的锁等待、编码和 flush，不含该边界前的设备同步；不是单独的磁盘成本。record_only 的 `deferred_evidence` 应为 `thread_absent=true, drains_before_destroy=25, drains_after_destroy=26`。完整日志仍要求所有调用齐全、零丢样、零未完成，且完成数超过实际 128 槽容量。
+
+这是固定边界下的隔离实验，production 也执行显式边界收集，不完全等同于连续训练中的纯后台采集。不要直接与先前 100 次×3 窗口或 2488 槽结果相减。重点分析同一轮的 record_only−off 与 production−record_only；主测试不要启用额外分项计时。
+
+### 全过程仅记录的大容量对照（保留）
 
 `record_only` 仅供诊断：保留业务线程和设备侧的采集写入，不启动 Python 轮询线程，也不做诊断的逐 API 计数。初始化仍写 calibration；从精度检查、预热到全部 API 计时完成之间不 Drain、不编码、不写事件日志。随后 `buffer.destroy()` 在计时之外同步并一次性收集、编码和落盘，保留原 done_seq 验证与完整日志校验。因此它测试的是 Host+设备的前台记录成本，不是纯设备打点成本。
 

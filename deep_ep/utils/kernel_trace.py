@@ -95,10 +95,10 @@ class KernelTrace:
                 return None
 
     @staticmethod
-    def _drain(entry, closing=False):
+    def _drain(entry, closing=False, explicit=False):
         # Even if another source owns a polling thread, deferred sources are never collected early.
         if entry["mode"] == "record_only":
-            if not closing:
+            if not closing and not explicit:
                 return
             entry["deferred_drains"] += 1
         try:
@@ -139,6 +139,17 @@ class KernelTrace:
             with cls._lock:
                 for entry in cls._sources.values():
                     cls._drain(entry)
+
+    @classmethod
+    def collect_boundary(cls, identity):
+        """Diagnostic-only collection after the caller synchronizes, outside API timing."""
+        if identity is None:
+            return
+        with cls._lock:
+            entry = cls._sources[identity]
+            cls._drain(entry, explicit=True)
+            if entry["failed"]:
+                raise RuntimeError("KernelTrace boundary collection failed")
 
     @classmethod
     def detach(cls, identity):

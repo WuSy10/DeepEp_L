@@ -82,7 +82,8 @@ def test_python_monitor_shared_source_and_shutdown(tmp_path, monkeypatch):
     assert not worker.is_alive()
 
 
-def test_record_only_defers_all_collection_until_detach(tmp_path, monkeypatch):
+@pytest.mark.parametrize("windowed", [False, True])
+def test_record_only_defers_all_collection_until_detach(tmp_path, monkeypatch, windowed):
     monitor = load_monitor()
     monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "record_only")
@@ -100,9 +101,9 @@ def test_record_only_defers_all_collection_until_detach(tmp_path, monkeypatch):
             self.synced = True
 
         def drain_trace_json(self, closing=False):
-            assert closing and self.synced
+            assert self.synced
             self.calls += 1
-            return '{"event":"summary","completed":300,"dropped":0,"incomplete":0}\n'
+            return '{"event":"summary","completed":300,"dropped":0,"incomplete":0}\n' if closing else ""
 
     source = Source()
     native = type("Native", (), {"get_kernel_trace": staticmethod(lambda: source)})
@@ -114,8 +115,14 @@ def test_record_only_defers_all_collection_until_detach(tmp_path, monkeypatch):
             monitor._drain(entry)  # Also protects deferred sources if another source owns a poller.
         assert source.calls == entry["deferred_drains"] == 0
         assert len(next(tmp_path.glob("kernel-*.jsonl")).read_text().splitlines()) == 1
+        if windowed:
+            for _ in range(25):
+                source.synchronize()
+                monitor.collect_boundary(key)
+                monitor._drain(entry)  # A normal poll still cannot drain a deferred source.
+            assert source.calls == entry["deferred_drains"] == 25
         monitor.detach(key)
-        assert source.calls == entry["deferred_drains"] == 1
+        assert source.calls == entry["deferred_drains"] == (26 if windowed else 1)
         assert not list(tmp_path.glob("diagnostic-*.json"))
         assert json.loads(next(tmp_path.glob("kernel-*.jsonl")).read_text().splitlines()[-1])["completed"] == 300
     finally:
@@ -217,6 +224,24 @@ int main(){
     auto summary=sink->Drain(true);
     assert(summary.back().values.at("completed")==384);
     assert(summary.back().values.at("dropped")==0);
+    sink.reset();
+    sink=KernelTrace::Open(); assert(sink);
+    assert(sink->Calibration().values.at("slots")==128);
+    for (int window=0; window<5; ++window) {
+        for (int i=0; i<120; ++i) {
+            auto t=sink->Reserve(0,1,1,"dispatch","kernel"); assert(t.address);
+            sink->Submit(t,1000,0);
+            auto* p=reinterpret_cast<uint64_t*>(t.address);
+            __atomic_store_n(p,uint64_t{10},__ATOMIC_RELEASE);
+            __atomic_store_n(p+1,uint64_t{20},__ATOMIC_RELEASE);
+            __atomic_store_n(reinterpret_cast<uint64_t*>(t.address+kLineBytes),t.sequence,__ATOMIC_RELEASE);
+        }
+        assert(sink->Drain().size()==240); // Collect only at the boundary; wrap the 128-slot ring next window.
+    }
+    auto window_summary=sink->Drain(true);
+    assert(window_summary.back().values.at("completed")==600);
+    assert(window_summary.back().values.at("dropped")==0);
+    assert(window_summary.back().values.at("incomplete")==0);
     sink.reset();
     setenv("DEEPEP_TRACE_SLOTS", "512", 1);
     sink=KernelTrace::Open(); assert(sink);
@@ -868,6 +893,114 @@ def test_npu_metadata_acceptance(tmp_path, corruption):
         validate_npu_metadata(tmp_path, manifests, args)
 
 
+def boundary_labels(args):
+    return ["precision"] + [
+        label for name in PERF_OPS for label in [f"{name}/warmup", *[f"{name}/window{w}" for w in range(args.windows)]]
+    ]
+
+
+def record_slot_requirement(args):
+    # Precision has four APIs; each subsequent boundary contains only one API kind.
+    if args.windowed_collection:
+        return max(8, 2 * args.warmup, 2 * args.iterations)
+    return 8 * (1 + args.warmup + args.windows * args.iterations)
+
+
+def measure_api_windows(args, operations, consume, synchronize, barrier, collect=None, clock=time.perf_counter_ns):
+    """Keep synchronization/collection at matched boundaries, never within the measured API window."""
+    boundaries, timings = [], {}
+
+    def boundary(label):
+        if collect is None:
+            return
+        synchronize()
+        begin = clock()
+        collect(label)
+        boundaries.append(dict(label=label, collect_ns=clock() - begin))
+
+    boundary("precision")
+    for name, operation in zip(PERF_OPS, operations):
+        for _ in range(args.warmup):
+            consume(operation())
+        boundary(f"{name}/warmup")
+        timings[name] = []
+        for window in range(args.windows):
+            synchronize()
+            barrier()
+            started = clock()
+            for _ in range(args.iterations):
+                consume(operation())
+            synchronize()
+            timings[name].append((clock() - started) / args.iterations)
+            boundary(f"{name}/window{window}")
+    return timings, boundaries
+
+
+def test_window_collection_is_outside_timing_and_fits_128_slots():
+    args = npu_parser().parse_args(
+        ["--output", "unused", "--windowed-collection", "--windows", "5", "--iterations", "60"]
+    )
+    elapsed, pending = 0, 8  # Four precision APIs have already run.
+    occupancies, labels = [], []
+
+    def operation():
+        nonlocal elapsed, pending
+        elapsed += 10
+        pending += 2
+        assert pending <= 128
+
+    def consume(_):
+        nonlocal elapsed
+        elapsed += 2
+
+    def synchronize():
+        nonlocal elapsed
+        elapsed += 3
+
+    def barrier():
+        nonlocal elapsed
+        elapsed += 5
+
+    def collect(label):
+        nonlocal elapsed, pending
+        occupancies.append(pending)
+        labels.append(label)
+        pending = 0
+        elapsed += 100000  # A deliberately expensive collector must not affect API timings.
+
+    timings, boundaries = measure_api_windows(
+        args, [operation] * 4, consume, synchronize, barrier, collect, lambda: elapsed
+    )
+    assert labels == boundary_labels(args)
+    assert occupancies == [8] + [v for _ in PERF_OPS for v in [20, 120, 120, 120, 120, 120]]
+    assert pending == 0 and len(boundaries) == 25
+    assert all(b["collect_ns"] == 100000 for b in boundaries)
+    assert all(values == pytest.approx([12.05] * 5) for values in timings.values())
+
+
+@pytest.mark.parametrize(
+    "options",
+    [["--iterations", "65"], ["--warmup", "65", "--iterations", "60"], ["--trace-slots", "256", "--iterations", "60"]],
+)
+def test_window_collection_rejects_capacity_overflow(tmp_path, options):
+    args = npu_parser().parse_args(
+        [
+            "--npu",
+            "--diagnostic",
+            "--windowed-collection",
+            "--modes",
+            "off",
+            "record_only",
+            "--output",
+            str(tmp_path / "unused"),
+            *options,
+        ]
+    )
+    with pytest.raises(ValueError, match="windowed collection requires"):
+        run_npu_acceptance(args)
+    assert not args.output.exists()
+
+
 def npu_worker(args):
     """Use the installed wheel. CPU references and assertions stay outside timing."""
     import datetime
@@ -906,7 +1039,7 @@ def npu_worker(args):
     deferred = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE") == "record_only"
     if deferred:
         assert trace_entry is not None and KernelTrace._thread is None
-        assert trace_entry["slots"] >= 8 * (1 + args.warmup + args.windows * args.iterations)
+        assert trace_entry["slots"] >= record_slot_requirement(args)
 
     def dispatch(handle=None):
         return buffer.dispatch(
@@ -960,21 +1093,26 @@ def npu_worker(args):
             golden._assert_equal("combine weights", result[1], expected_weights)
         else:
             assert result[1] is None
-    timings = {}
-    for name, operation in zip(
-        PERF_OPS, (dispatch, lambda: dispatch(handle), lambda: combine(False), lambda: combine(True))
-    ):
-        for _ in range(args.warmup):
-            consume(operation())
-        timings[name] = []
-        for _ in range(args.windows):
-            torch.npu.synchronize()
-            dist.barrier()
-            started = time.perf_counter_ns()
-            for _ in range(args.iterations):
-                consume(operation())
-            torch.npu.synchronize()
-            timings[name].append((time.perf_counter_ns() - started) / args.iterations)
+    boundary_count = 0
+
+    def collect(label):
+        nonlocal boundary_count
+        if deferred:
+            assert KernelTrace._thread is None
+            assert trace_entry["deferred_drains"] == boundary_count, "collection outside declared boundary"
+        KernelTrace.collect_boundary(buffer._kernel_trace)
+        boundary_count += 1
+        if deferred:
+            assert trace_entry["deferred_drains"] == boundary_count
+
+    timings, boundaries = measure_api_windows(
+        args,
+        (dispatch, lambda: dispatch(handle), lambda: combine(False), lambda: combine(True)),
+        consume,
+        torch.npu.synchronize,
+        dist.barrier,
+        collect if args.windowed_collection else None,
+    )
     manifest = dict(
         rank=rank,
         pid=os.getpid(),
@@ -990,6 +1128,8 @@ def npu_worker(args):
         trace_ring_active=buffer._kernel_trace is not None,
         metadata_statistics=getattr(buffer._trace_session, "diagnostic_stats", {}),
         trace_slots=trace_entry["slots"] if trace_entry else 0,
+        windowed_collection=args.windowed_collection,
+        collection_boundaries=boundaries,
     )
     if deferred:
         manifest["deferred_evidence"] = dict(
@@ -1013,6 +1153,11 @@ def npu_parser():
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--diagnostic", action="store_true", help="layered attribution, not performance acceptance")
     parser.add_argument("--diagnostic-timing", action="store_true", help="separate instrumented run only")
+    parser.add_argument(
+        "--windowed-collection",
+        action="store_true",
+        help="diagnostic: collect outside each window using 128 slots; use --iterations 60 --windows 5",
+    )
     parser.add_argument(
         "--paired-baselines",
         action="store_true",
@@ -1081,12 +1226,16 @@ def run_npu_acceptance(args):
             raise ValueError("--diagnostic-timing requires --diagnostic")
         if args.paired_baselines and not args.diagnostic:
             raise ValueError("--paired-baselines requires --diagnostic")
+        if args.windowed_collection and not args.diagnostic:
+            raise ValueError("--windowed-collection requires --diagnostic")
         if args.diagnostic and args.diagnostic_timing and any(m in args.modes for m in ("production", "record_only")):
             raise ValueError("production control and record_only must run without --diagnostic-timing")
-        required_slots = 8 * (1 + args.warmup + args.windows * args.iterations)
+        required_slots = record_slot_requirement(args)
         deferred = args.diagnostic and "record_only" in args.modes
         if args.trace_slots == 0:
-            args.trace_slots = max(128, required_slots) if deferred else 128
+            args.trace_slots = max(128, required_slots) if deferred and not args.windowed_collection else 128
+        if args.windowed_collection and (args.trace_slots != 128 or required_slots > 128):
+            raise ValueError("windowed collection requires 128 slots and at most 128 kernels between boundaries")
         if not 128 <= args.trace_slots <= 16384 or (deferred and args.trace_slots < required_slots):
             raise ValueError("trace slots must be in [128, 16384] and cover all record_only kernels")
         return _run_npu_diagnostic(args) if args.diagnostic else _run_npu_acceptance(args)
@@ -1131,6 +1280,8 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
     for key, value in vars(args).items():
         if type(value) is int and not key.startswith("_"):
             command += ["--" + key.replace("_", "-"), str(value)]
+    if args.windowed_collection:
+        command.append("--windowed-collection")
     print(f"RUN {destination.name}", flush=True)
     with (destination / "run.log").open("w") as log:
         run_npu_process(command, destination, env, log, args.timeout)
@@ -1164,8 +1315,18 @@ def validate_diagnostic_trial(destination, manifests, args, mode):
             raise ValueError("unexpected trace ring state")
         if manifest["trace_ring_active"] and manifest.get("trace_slots") != args.trace_slots:
             raise ValueError("trace capacity does not match the paired control")
+        expected_boundaries = boundary_labels(args) if args.windowed_collection else []
+        actual_boundaries = manifest.get("collection_boundaries", [])
+        if (
+            manifest.get("windowed_collection", False) != args.windowed_collection
+            or [b["label"] for b in actual_boundaries] != expected_boundaries
+            or any(type(b.get("collect_ns")) is not int or b["collect_ns"] < 0 for b in actual_boundaries)
+        ):
+            raise ValueError("mismatched collection boundaries")
         if mode == "record_only" and manifest.get("deferred_evidence") != dict(
-            thread_absent=True, drains_before_destroy=0, drains_after_destroy=1
+            thread_absent=True,
+            drains_before_destroy=len(expected_boundaries),
+            drains_after_destroy=len(expected_boundaries) + 1,
         ):
             raise ValueError("record_only collected early or started a polling thread")
         metadata = manifest["metadata_statistics"]
@@ -1374,11 +1535,11 @@ def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
         assert result["median_percent"] == pytest.approx(-1)
 
 
-@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize("paired,windowed", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize(
     "corruption", [None, "dropped", "completed", "summaries", "returned_text_bytes", "encoded_bytes"]
 )
-def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, corruption, paired):
+def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, corruption, paired, windowed):
     args = npu_parser().parse_args(
         ["--npu", "--diagnostic", "--rounds", "2", "--output", str(tmp_path / "diagnosis")]
         + (
@@ -1396,11 +1557,13 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
             if paired
             else ["--diagnostic-timing"]
         )
+        + (["--windowed-collection", "--windows", "5", "--iterations", "60"] if windowed else [])
     )
     order = []
     per_kind = 1 + args.warmup + args.windows * args.iterations
 
     def launch(command, destination, env, log, timeout):
+        assert ("--windowed-collection" in command) == windowed
         mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if "DEEPEP_TRACE_DIR" in env else "off")
         order.append(mode)
         if mode in ("off", "production"):
@@ -1420,7 +1583,15 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
                 trace_mode=mode,
                 trace_ring_active=mode in ("production", "record_only", "native", "json_discard", "json", "full"),
                 trace_slots=args.trace_slots,
-                deferred_evidence=dict(thread_absent=True, drains_before_destroy=0, drains_after_destroy=1),
+                windowed_collection=windowed,
+                collection_boundaries=[dict(label=label, collect_ns=10) for label in boundary_labels(args)]
+                if windowed
+                else [],
+                deferred_evidence=dict(
+                    thread_absent=True,
+                    drains_before_destroy=25 if windowed else 0,
+                    drains_after_destroy=26 if windowed else 1,
+                ),
                 precision_passed=True,
                 metadata_statistics={}
                 if mode in ("off", "production", "record_only")
@@ -1546,28 +1717,37 @@ def test_record_only_rejects_insufficient_capacity(tmp_path, slots):
     assert not args.output.exists()
 
 
-@pytest.mark.parametrize("corruption", ["capacity", "thread", "early", "missing_final"])
-def test_record_only_rejects_invalid_collection_evidence(tmp_path, monkeypatch, corruption):
-    args = npu_parser().parse_args(["--output", str(tmp_path), "--trace-slots", "2488"])
-    evidence = dict(thread_absent=True, drains_before_destroy=0, drains_after_destroy=1)
+@pytest.mark.parametrize("windowed", [False, True])
+@pytest.mark.parametrize("corruption", ["capacity", "thread", "early", "missing_final", "boundaries"])
+def test_record_only_rejects_invalid_collection_evidence(tmp_path, monkeypatch, corruption, windowed):
+    args = npu_parser().parse_args(
+        ["--output", str(tmp_path), "--trace-slots", "128" if windowed else "2488"]
+        + (["--windowed-collection", "--windows", "5", "--iterations", "60"] if windowed else [])
+    )
+    count = 25 if windowed else 0
+    evidence = dict(thread_absent=True, drains_before_destroy=count, drains_after_destroy=count + 1)
     manifest = dict(
         trace_mode="record_only",
         precision_passed=True,
         trace_ring_active=True,
-        trace_slots=2488,
+        trace_slots=args.trace_slots,
+        windowed_collection=windowed,
+        collection_boundaries=[dict(label=label, collect_ns=10) for label in boundary_labels(args)] if windowed else [],
         metadata_statistics={},
         deferred_evidence=evidence,
     )
     if corruption == "capacity":
-        manifest["trace_slots"] = 128
+        manifest["trace_slots"] = 256
     elif corruption == "thread":
         evidence["thread_absent"] = False
     elif corruption == "early":
-        evidence["drains_before_destroy"] = 1
+        evidence["drains_before_destroy"] += 1
+    elif corruption == "boundaries":
+        manifest["collection_boundaries"] = [] if windowed else [dict(label="unexpected", collect_ns=0)]
     else:
         evidence["drains_after_destroy"] = 0
     monkeypatch.setattr(sys.modules[__name__], "validate_npu_metadata", lambda *items: None)
-    with pytest.raises(ValueError, match="trace capacity|record_only collected"):
+    with pytest.raises(ValueError, match="trace capacity|record_only collected|mismatched collection boundaries"):
         validate_diagnostic_trial(tmp_path, [manifest], args, "record_only")
 
 
