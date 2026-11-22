@@ -113,8 +113,12 @@ using namespace ascend_deepep::trace;
 extern "C" void kernel_trace_clock_do(void*,uint8_t* p){*reinterpret_cast<uint64_t*>(p)=100;}
 int main(){
     auto sink=KernelTrace::Open(); assert(sink);
+    const char* ops[] = {"notify_dispatch", "dispatch", "cached_notify_dispatch", "cached_notify_combine", "combine"};
+    const char* kernels[] = {"notify_dispatch_kernel", "v1_dispatch_udma_kernel", "cached_notify_dispatch_kernel",
+                             "cached_notify_combine_kernel", "v1_combine_udma_reduce_kernel"};
     for(int round=0;round<384;++round) {
-        auto ticket=sink->Reserve(0,0,2,"dispatch","kernel"); assert(ticket.address);
+        const int kind = round % 5;
+        auto ticket=sink->Reserve(0,0,2,ops[kind],kernels[kind]); assert(ticket.address);
         sink->Submit(ticket,1000,0);
         auto* bytes=reinterpret_cast<uint8_t*>(ticket.address);
         auto store=[&](int offset,uint64_t value){
@@ -132,6 +136,8 @@ int main(){
         store(kCoreBytes,5);store(kCoreBytes+8,40);
         store(kCoreBytes+kLineBytes,ticket.sequence);
         auto done=sink->Drain();assert(done.size()==1 && done[0].event=="end");
+        assert(done[0].op_name==ops[kind] && done[0].kernel_name==kernels[kind]);
+        assert(done[0].values.at("gid")==static_cast<int64_t>(ticket.sequence));
         assert(done[0].values.at("elapsed_ns")==40); // Zero start tick is valid.
     }
     auto summary=sink->Drain(true);
@@ -159,3 +165,102 @@ int main(){
     )
     monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
     subprocess.run([str(binary)], check=True, timeout=20)
+
+
+@pytest.fixture
+def mixed_trace(tmp_path):
+    spec = importlib.util.spec_from_file_location("trace_checker_test", ROOT / "scripts/check_kernel_trace.py")
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    rows = [{"event": "calibration", "tick_hz": 1_000_000_000, "tick": 10, "offset_ns": 1000}]
+    ends = []
+    kernels = list(checker.KERNEL_OPS.items())
+    # Multiple operation types, varying AIV counts, and interleaved completions.
+    for i in range(130):
+        name, op = kernels[i % len(kernels)]
+        common = dict(
+            gid=i + 1,
+            rank=0,
+            local_instance=0,
+            launch_ns=1000 + i,
+            op_name=op,
+            kernel_name=name,
+            aiv=16 if i % 2 else 32,
+        )
+        rows.append(dict(common, event="launch", status=0))
+        ends.append(
+            dict(
+                common, event="end", start_tick=i, end_tick=i + 100, start_ns=i + 1000, end_ns=i + 1100, elapsed_ns=100
+            )
+        )
+        if len(ends) == 2:
+            rows.extend(reversed(ends))
+            ends.clear()
+    rows.append(dict(event="summary", completed=130, incomplete=0, dropped=0))
+    path = tmp_path / "kernel-mixed.jsonl"
+    return checker, path, rows
+
+
+def test_python_monitor_mixed_kernels_and_checker(mixed_trace, monkeypatch):
+    checker, path, rows = mixed_trace
+    monitor = load_monitor()
+    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(path.parent))
+    written = threading.Event()
+
+    class Source:
+        identity = 456
+        pending = rows[1:-1]
+
+        def calibration(self):
+            return dict(rows[0], device=0)
+
+        def drain_trace(self, closing=False):
+            result, self.pending = self.pending, []
+            if result:
+                written.set()
+            if closing:
+                result.append(rows[-1])
+            return result
+
+        def synchronize(self):
+            pass
+
+    class Native:
+        @staticmethod
+        def get_kernel_trace():
+            return source
+
+    source = Source()
+    try:
+        key = monitor.attach(Native)
+        assert written.wait(2), "background monitor did not collect records"
+        # Lock acquisition also waits for the current write/flush to finish.
+        with monitor._lock:
+            log = next(path.parent.glob("kernel-*.jsonl"))
+            assert len(log.read_text().splitlines()) == len(rows) - 1
+        monitor.detach(key)
+        assert checker.check(path.parent, 1, set(checker.KERNEL_OPS.values()), require_reuse=True) == 130
+    finally:
+        monitor.shutdown()
+
+
+@pytest.mark.parametrize("corruption", ["kernel", "aiv", "gid", "time", "dropped", "missing_op"])
+def test_checker_rejects_mixed_trace_corruption(mixed_trace, corruption):
+    checker, path, rows = mixed_trace
+    end = next(row for row in rows if row["event"] == "end")
+    if corruption == "kernel":
+        end["kernel_name"] = "notify_dispatch_kernel"
+    elif corruption == "aiv":
+        end["aiv"] = 64
+    elif corruption == "gid":
+        end["gid"] = 10000
+    elif corruption == "time":
+        end["elapsed_ns"] += 1
+    elif corruption == "dropped":
+        rows[-1]["dropped"] = 1
+    else:
+        rows = [row for row in rows if row.get("op_name") != "combine"]
+        rows[-1]["completed"] = sum(row["event"] == "end" for row in rows)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(ValueError):
+        checker.check(path.parent, 1, require_ops=["notify_dispatch", "dispatch", "combine"])

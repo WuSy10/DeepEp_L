@@ -1,3 +1,4 @@
+#include "kernels/common/kernel_trace.h"
 #include <cstdint>
 
 #include "kernels/common/ub_workspace.h"
@@ -263,6 +264,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -278,6 +280,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_kernel_do(
@@ -296,6 +299,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -311,6 +315,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
@@ -329,6 +334,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_u
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -344,6 +350,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_u
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_reduce_kernel_do(
@@ -362,6 +369,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -377,6 +385,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_early_kernel_do(
@@ -396,6 +405,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -411,6 +421,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_remaining_kernel_do(
@@ -430,6 +441,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -443,6 +455,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         ascend_deepep::udma::CombinePipelineImpl<half>(
             x, topk_weights, src_idx, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_pipeline_kernel_do(

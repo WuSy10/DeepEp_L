@@ -1,4 +1,5 @@
 #include "ops/combine.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -151,7 +152,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     c10::optional<torch::Tensor> expanded_x, c10::optional<torch::Tensor> single_source_slots,
     std::function<void()> aggregate, c10::optional<torch::Tensor> pipeline_mapping,
     c10::optional<torch::Tensor> pipeline_values, int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv,
-    const std::vector<int64_t>& launch_plan)
+    const std::vector<int64_t>& launch_plan, trace::KernelTrace* trace_sink)
 {
     const auto udma_launch =
         shmem.ResolveLaunch(launch_plan, true, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
@@ -399,6 +400,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         tiling.pipeline_topk = static_cast<uint32_t>(pipeline_mapping->size(1));
     }
     const auto ffts_addr = shmem.FftsAddr();
+    if (c10_npu::currentStreamCaptureStatusMayInitCtx() != c10_npu::CaptureStatus::None) trace_sink = nullptr;
     // Capture the prepared tensors/tiling by value once; no recomputation or
     // allocation between communication and reduction, and no host synchronize.
     auto launch = [=](CombinePhase phase) {
@@ -414,7 +416,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         }
         LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
                               send_head, recv_x, recv_topk_weights, phase_tiling, symmetric_buffer, ffts_addr, use_udma,
-                              phase);
+                              phase, trace_sink);
 
         return CombineResult{recv_x, recv_topk_weights};
     };

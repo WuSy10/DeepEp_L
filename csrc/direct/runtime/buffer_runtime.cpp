@@ -363,7 +363,7 @@ BufferRuntime::IntranodeDispatchWithPlan(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan);
+        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan, kernel_trace_.get());
     symmetric_workspace_active_ = true;
     return result;
 }
@@ -416,7 +416,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> BufferRuntime::Intranode
         static_cast<int>(num_ranks_), static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes),
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, nullptr,
-        c10::nullopt, c10::nullopt, {}, c10::nullopt, c10::nullopt, 0, 0, launch_plan);
+        c10::nullopt, c10::nullopt, {}, c10::nullopt, c10::nullopt, 0, 0, launch_plan, kernel_trace_.get());
     symmetric_workspace_active_ = true;
     return result;
 }
@@ -465,7 +465,8 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, &epilogue,
         expanded_x, single_source_slots, aggregate, pipeline_chunk_tokens ? early_aggregate_map : c10::nullopt,
-        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv, launch_plan);
+        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv, launch_plan,
+        kernel_trace_.get());
     symmetric_workspace_active_ = true;
     epilogue->SetOwner(c10::intrusive_ptr<BufferRuntime>::reclaim_copy(this));
     return epilogue;

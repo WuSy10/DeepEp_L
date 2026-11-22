@@ -6,6 +6,10 @@
 
 #include "common/types.h"
 
+namespace ascend_deepep::trace {
+class KernelTrace;
+}
+
 void LaunchDispatchLayoutKernel(torch::Tensor topk_idx, torch::Tensor num_tokens_per_rank,
                                 torch::Tensor num_tokens_per_expert, torch::Tensor is_token_in_rank,
                                 const ascend_deepep::DispatchLayoutTilingData& tiling, torch::Tensor scratch_buffer,
@@ -17,14 +21,13 @@ void LaunchNotifyDispatchKernel(torch::Tensor num_tokens_per_rank, torch::Tensor
                                 torch::Tensor num_recv_tokens, torch::Tensor num_recv_tokens_per_expert,
                                 const c10::optional<torch::Tensor>& dispatch_plan, torch::Tensor send_head,
                                 const ascend_deepep::DispatchTilingData& tiling, void* symmetric_buffer,
-                                uint64_t ffts_addr);
+                                uint64_t ffts_addr, ascend_deepep::trace::KernelTrace* trace_sink);
 
-void LaunchCachedNotifyDispatchKernel(const ascend_deepep::DispatchTilingData& tiling, uint64_t ffts_addr);
+void LaunchCachedNotifyDispatchKernel(const ascend_deepep::DispatchTilingData& tiling, uint64_t ffts_addr,
+                                      ascend_deepep::trace::KernelTrace* trace_sink);
 
 void LaunchCachedDispatchPlanKernel(torch::Tensor routes, torch::Tensor plan, torch::Tensor send_head,
                                     const ascend_deepep::DispatchTilingData& tiling, uint64_t ffts_addr);
-
-namespace ascend_deepep::trace { class KernelTrace; }
 
 void LaunchV1DispatchKernel(
     torch::Tensor x, const c10::optional<torch::Tensor>& x_scales, const c10::optional<torch::Tensor>& topk_idx,
@@ -45,7 +48,7 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
                            torch::Tensor send_head, torch::Tensor recv_x,
                            const c10::optional<torch::Tensor>& recv_topk_weights,
                            const ascend_deepep::CombineTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr,
-                           bool use_udma, CombinePhase phase);
+                           bool use_udma, CombinePhase phase, ascend_deepep::trace::KernelTrace* trace_sink);
 
 void LaunchExpandKernel(torch::Tensor x, const c10::optional<torch::Tensor>& x_scales,
                         const c10::optional<torch::Tensor>& topk_idx, const c10::optional<torch::Tensor>& topk_weights,

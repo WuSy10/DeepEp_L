@@ -113,6 +113,8 @@ struct alignas(8) DispatchTilingData {
 };
 
 struct alignas(8) CombineTilingData {
+    uint64_t kernel_trace_slot = 0;
+    uint64_t kernel_trace_seq = 0;
     uint32_t rank;
     uint32_t world_size;
     uint32_t num_tokens;

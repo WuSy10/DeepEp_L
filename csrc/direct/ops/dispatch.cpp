@@ -635,14 +635,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         tiling.notify_host_counts = reinterpret_cast<uint64_t>(shmem.PrepareNotifyHostCounts(1 + num_local_experts));
     }
     if (cached_mode) {
-        LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());
+        LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr(), !capturing && use_udma ? trace_sink : nullptr);
         if (rebuild_cached_plan)
             LaunchCachedDispatchPlanKernel(is_token_in_rank, *dispatch_plan, send_head, tiling, shmem.FftsAddr());
     } else {
         LaunchNotifyDispatchKernel(*num_tokens_per_rank, *num_tokens_per_expert, is_token_in_rank, rank_prefix_matrix,
                                    channel_prefix_matrix, recv_channel_prefix_matrix, notify_num_recv_tokens,
                                    notify_num_recv_tokens_per_expert, dispatch_plan, send_head, tiling,
-                                   symmetric_buffer, shmem.FftsAddr());
+                                   symmetric_buffer, shmem.FftsAddr(), !capturing && use_udma ? trace_sink : nullptr);
     }
     int64_t num_recv_tokens = 0;
     std::vector<int64_t> num_recv_tokens_per_expert_list;
@@ -718,7 +718,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                            num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
                            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
                            send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma,
-                           !capturing && !cached_mode && public_handle ? trace_sink : nullptr);
+                           !capturing ? trace_sink : nullptr);
     return {recv_x,
             recv_x_scales,
             recv_topk_idx,

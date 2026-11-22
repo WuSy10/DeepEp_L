@@ -8,13 +8,14 @@
 #include "kernels/dispatch/dispatch_recv_copy.h"
 #include "kernels/common/v2_handle.h"
 #include "common/launch.h"
-#include "common/kernel_trace_layout.h"
+#include "kernels/common/kernel_trace.h"
 #include "common/types.h"
 #include "kernels/dispatch/udma_dispatch_schedule.h"
 #include "kernels/dispatch/udma_token_dispatch_schedule.h"
 #include "kernels/dispatch/udma_dispatch_metadata.h"
 
 using namespace AscendC;
+using ascend_deepep::trace::PublishTraceTick;
 
 namespace {
 
@@ -36,23 +37,6 @@ __aicore__ inline uint32_t DispatchAlignUp32(uint32_t value)
     return (value + 31U) / 32U * 32U;
 }
 
-// Trace publication reuses the first 32 UB bytes after the final reader.
-// MTE3_S drains the tick payload before publishing the generation marker.
-__aicore__ inline void PublishTraceTick(uint64_t address, LocalTensor<uint64_t> scratch, uint64_t tick, uint64_t end = 0)
-{
-    GlobalTensor<uint64_t> output;
-    output.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(address), 4);
-    output.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
-    scratch.SetValue(0, tick);
-    scratch.SetValue(1, end);
-    scratch.SetValue(2, 0);
-    scratch.SetValue(3, 0);
-    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
-    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-    DataCopy(output, scratch, 4);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-}
 } // namespace
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void kernel_trace_clock(GM_ADDR output)

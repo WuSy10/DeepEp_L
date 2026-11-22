@@ -19,6 +19,10 @@
 #endif
 
 extern "C" {
+ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_trace_kernel_do(
+    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence);
+ASCEND_DEEPEP_EXPORT void cached_notify_combine_trace_kernel_do(
+    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence);
 
 ASCEND_DEEPEP_EXPORT void kernel_trace_clock_do(void* stream, uint8_t* mapped);
 

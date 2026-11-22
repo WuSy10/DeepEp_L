@@ -1,3 +1,4 @@
+#include "kernels/common/kernel_trace.h"
 #include <cstdint>
 
 #include "kernels/common/ub_workspace.h"
@@ -102,6 +103,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         return;
     }
 
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const int32_t core_num = get_block_num() * get_subblockdim();
     const int32_t rank = static_cast<int32_t>(tiling.rank);
@@ -572,6 +574,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
     }
+    if (tiling.kernel_trace_slot && uint32_t(core_num) == tiling.block_dim) {
+        const auto line = tiling.kernel_trace_slot + uint64_t(core_idx) * ascend_deepep::trace::kCoreBytes;
+        auto scratch = accumulator_ub.ReinterpretCast<uint64_t>();
+        ascend_deepep::trace::PublishTraceTick(line, scratch, trace_start, AscendC::GetSystemCycle());
+        ascend_deepep::trace::PublishTraceTick(line + ascend_deepep::trace::kLineBytes, scratch, tiling.kernel_trace_seq);
+    }
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
@@ -587,17 +595,21 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
         dispatch_plan, send_head, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr, uint32_t instance_id)
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(
+    uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence, uint32_t cores)
 {
+    const uint64_t start = slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(instance_id);
     util_set_ffts_config(ffts_addr);
     aclshmemx_sync_vec_all();
+    ascend_deepep::trace::Finish(slot, sequence, cores, start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
     uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id)
 {
-    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, instance_id);
+    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(32), stream>>>(
+        ffts_addr, instance_id, 0, 0, block_dim);
 }
 
 // Legacy six-tensor handles have no private plan. Rebuild locally on the same
@@ -617,4 +629,11 @@ extern "C" ASCEND_DEEPEP_EXPORT void cached_dispatch_plan_kernel_do(
     auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
     cached_dispatch_plan_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kNotifyDispatchUbBytes), stream>>>(
         routes, plan, head, *td, ffts_addr);
+}
+
+extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_trace_kernel_do(
+    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence)
+{
+    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(32), stream>>>(
+        ffts_addr, instance_id, slot, sequence, block_dim);
 }
