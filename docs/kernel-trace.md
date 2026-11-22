@@ -301,6 +301,47 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselin
 
 重点比较 off→record_only 与 record_only→production；metadata 仅用于辅助估计 Host 上下文成本，仍带诊断计数，不与 record_only 形成完全纯净的累加层。新增对应的 layer_increments，保留每轮原始和基线校正值。前台记录变慢时再拆 Host 与设备发布；只有后台开启才明显变慢时再查并发收集、调度和 GIL。当前差值本身不能证明具体一种等待机制。
 
+## Fresh dispatch 的 Host 计数等待与 GIL 定位
+
+`--host-dispatch-timing` 是单独的诊断开关，必须配合 `--diagnostic`，不能与 `--diagnostic-timing` 同时使用。普通业务不启用探针；关闭时不读取时钟、查询 GIL 或分配样本，但原生入口仍有关闭状态判断。启用后按业务线程预分配样本空间，在全部 API 计时窗口结束后才转换成 Python 对象并写入 `host_dispatch_rankN.json`。它不修改 kernel、计数发布协议、同步或业务线程的 GIL 策略。
+
+```bash
+python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
+    --host-dispatch-timing --windowed-collection --trace-slots 128 \
+    --modes off record_only production --rounds 6 \
+    --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
+    --num-topk 8 --experts-per-rank 32 --aiv 32 --reduce-aiv 32 \
+    --windows 5 --iterations 60 --warmup 10 \
+    --output "$PWD/trace_host_counts_$(date +%Y%m%d_%H%M%S)"
+```
+
+六轮共 24 次进程组初始化，每个模式（包括 off）均启用相同探针，保留相邻独立 off 和交替顺序。需要重新编译 Host 扩展：`host_dispatch_probe_version=1`；采集诊断接口版本仍为 4。每 rank 导出 622 次原生 dispatch 调用，fresh/cached 各 311 次，分别标记精度、预热、稳态窗口及窗口内序号。每种 API 的 300 次稳态样本用于分段汇总，不把同一进程内的样本当作 300 次独立实验。
+
+| 分段 | 含义 |
+| --- | --- |
+| `native_prepare` | 原生 dispatch 入口到 notify 提交包装函数前 |
+| `notify_launch_call` | notify 提交包装函数耗时；cached 时也包含该段内的计划重建 |
+| `counts_wait` | 进入计数读取到返回；包括读取路径内部的准备和返回成本 |
+| `first_count_wait` | 映射内存路径中，进入读取到观察到第一个总接收计数 |
+| `remaining_counts` | 观察到总计数后，继续读取全部专家计数 |
+| `counts_postprocess` | 计数读取返回后的校验、列表处理，到输出准备前 |
+| `outputs_prepare` | 输出 tensor 和相关输出元数据的准备 |
+| `wait_end_to_dispatch` | 计数返回到 dispatch 提交包装函数前，覆盖上述后处理和输出准备 |
+| `dispatch_launch_call` | dispatch 提交包装函数耗时，含其内部准备和采集提交工作 |
+| `native_scope` | 原生 dispatch 函数作用域的总耗时 |
+
+这些区间存在包含关系，不能全部相加。使用 C++ `steady_clock` 纳秒值，只用于同一进程内分段相减，不与日志墙钟或 NPU tick 直接相减。提交函数耗时不是设备 kernel 耗时；Python layout 和原生函数外的 Python 包装工作不在 `native_scope` 内。`api_call_id` 在已有采集上下文存在时可关联 trace，off 等没有上下文的样本为 -1，使用 rank、调用类型、窗口和序号对照。
+
+`wait_path=1` 表示映射内存轮询，2 表示 `Tensor.cpu()` 回读，3 表示固定容量不等待，4 表示 cached 不等待。本测试要求 fresh 实际走 1 或 2，cached 走 4。计数就绪表示 Host 已观察到数据，不证明整个 notify kernel 已结束，也不提供设备实际发布计数的精确时刻。
+
+GIL 状态通过当前线程的 `PyGILState_Check()` 获取，不使用 heartbeat 推测，也不获取或释放业务线程的 GIL。初始化自检分别在持有 GIL 和显式释放 GIL 的两个控制区调用同一个探针，标准 CPython 应返回 1/0。自由线程构建暂标 -1（不支持判定），不能将其解释为未持有 GIL。
+
+映射轮询在入口、首次观察到某个计数未就绪、总计数就绪、所有计数就绪及出口采样 GIL；不在每次自旋迭代读取时间或查询 GIL。`first_pending` 没出现表示没有观察到未就绪，不填造等待样本；它也可能出现在总计数就绪之后。`Tensor.cpu()` 路径只观察调用前后，不能根据这两个值推断其内部始终持有或释放 GIL。采样时刻的值记录在 `gil_held`，未执行的点为 -1，稳态汇总包含各状态计数。
+
+先逐 rank、逐轮检查 `counts_wait` 是否随采集开启而增加，再比较 `outputs_prepare` 和 `wait_end_to_dispatch`。GIL 为 0 时不能将等待增长归因于业务线程持有 GIL；仍可能存在 CPU 调度或设备计数发布延迟。GIL 为 1 也仅说明持有状态，不能单凭此证明它解释了全部劣化。
+
+`diagnosis.json` 将该运行标记为 `instrumented=true, performance_acceptance=false`。探针本身有开销，因此该运行只用于定位，不能作为 <1% 验收或与先前未插桩耗时直接相减。控制器校验 GIL 自检、样本数量、阶段顺序、实际等待路径和零丢样；CPU 回归还覆盖关闭时无探针调用、容量溢出、异常退出及错误证据拒绝。
+
 ## 元数据缓存与原生批量编码的验证
 
 缓存只保留标量和原生快照，不保留用户 tensor 或 handle 对象。shape、dtype、容量或模式变化会使用新模板；超过 64 种时清空模板缓存。正在执行或延迟执行的 kernel 持有 shared_ptr 父快照引用，不受缓存清空影响。上下文仍是线程局部的，嵌套调用及异常退出使用原生句柄恢复。

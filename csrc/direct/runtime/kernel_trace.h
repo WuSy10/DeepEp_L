@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -32,6 +33,44 @@ struct TraceRecord {
     std::map<std::string, std::string> labels;
 };
 std::string EncodeTraceRecords(const std::vector<TraceRecord>& records);
+// Opt-in Host diagnostics. Fixed-size samples are reserved before the workload and read afterwards.
+enum class DispatchProbePoint : unsigned {
+    NativeEntry, NotifyBegin, NotifyEnd, WaitBegin, FirstPending, FirstCountReady, AllCountsReady,
+    WaitEnd, OutputsBegin, OutputsEnd, DispatchBegin, DispatchEnd, NativeExit, Count
+};
+constexpr unsigned kDispatchProbePoints = static_cast<unsigned>(DispatchProbePoint::Count);
+struct HostDispatchSample {
+    uint64_t ordinal;
+    int rank, cached, wait_path; // 1=mapped polling, 2=Tensor.cpu, 3=fixed capacity, 4=cached.
+    int64_t api_call_id;
+    bool success;
+    std::array<int64_t, kDispatchProbePoints> ticks, gil;
+};
+struct HostDispatchReport {
+    std::vector<HostDispatchSample> samples;
+    uint64_t dropped;
+};
+void ConfigureHostDispatchProbe(std::size_t capacity, int (*gil_state)());
+HostDispatchReport TakeHostDispatchProbe();
+class HostDispatchProbe {
+public:
+    HostDispatchProbe(int rank, bool cached);
+    ~HostDispatchProbe();
+    HostDispatchProbe(const HostDispatchProbe&) = delete;
+    HostDispatchProbe& operator=(const HostDispatchProbe&) = delete;
+    void Mark(DispatchProbePoint point) { if (enabled_) MarkEnabled(point); }
+    void SetWaitPath(int path) { if (enabled_) sample_.wait_path = path; }
+    void Finish() { if (enabled_) sample_.success = true; }
+    bool Has(DispatchProbePoint point) const { return enabled_ && sample_.ticks[static_cast<unsigned>(point)] >= 0; }
+private:
+    void MarkEnabled(DispatchProbePoint point);
+    bool enabled_ = false;
+    int exceptions_;
+    HostDispatchProbe* previous_ = nullptr;
+    HostDispatchSample sample_;
+};
+HostDispatchProbe* CurrentHostDispatchProbe();
+
 class KernelTrace {
 public:
     static std::shared_ptr<KernelTrace> Open();

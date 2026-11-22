@@ -1,6 +1,7 @@
 #include "shmem_instance.h"
 #include "runtime/instances.hpp"
 #include "runtime/instance_endpoint.hpp"
+#include "runtime/kernel_trace.h"
 
 #include <algorithm>
 #include <charconv>
@@ -672,6 +673,8 @@ void* ShmemInstance::PrepareNotifyHostCounts(std::size_t count)
 
 std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
 {
+    auto* probe = ascend_deepep::trace::CurrentHostDispatchProbe();
+    using ProbePoint = ascend_deepep::trace::DispatchProbePoint;
     TORCH_CHECK(notify_host_pending_ && count <= notify_count_capacity_, "Notify host counts were not prepared");
     const auto start = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::seconds(notify_host_timeout_seconds_);
@@ -679,6 +682,9 @@ std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
     std::vector<int32_t> counts(count);
     for (std::size_t i = 0; i < count; ++i) {
         uint32_t value;
+        if (probe && !probe->Has(ProbePoint::FirstPending) &&
+            __atomic_load_n(slots + i, __ATOMIC_ACQUIRE) == 0)
+            probe->Mark(ProbePoint::FirstPending);
         while ((value = __atomic_load_n(slots + i, __ATOMIC_ACQUIRE)) == 0) {
             const auto elapsed = std::chrono::steady_clock::now() - start;
             if (elapsed >= timeout) {
@@ -695,7 +701,9 @@ std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
         }
         TORCH_CHECK(value - 1U <= uint32_t(std::numeric_limits<int32_t>::max()), "invalid Notify host count");
         counts[i] = static_cast<int32_t>(value - 1U);
+        if (probe && i == 0) probe->Mark(ProbePoint::FirstCountReady);
     }
+    if (probe) probe->Mark(ProbePoint::AllCountsReady);
     notify_host_pending_ = false;
     return counts;
 }

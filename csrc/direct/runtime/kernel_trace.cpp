@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 
 #include <limits>
 #include <map>
@@ -21,6 +22,14 @@ namespace {
 constexpr size_t kSlotBytes = platform::kMaxNumAiv * kCoreBytes;
 std::atomic<uint64_t> next_sequence{1};
 thread_local TraceMetadataSnapshot active_metadata;
+struct HostProbeState {
+    std::size_t capacity = 0;
+    uint64_t ordinal = 0, dropped = 0;
+    int (*gil_state)() = nullptr;
+    HostDispatchProbe* active = nullptr;
+    std::vector<HostDispatchSample> samples;
+};
+thread_local HostProbeState host_probe;
 
 template <typename Clock>
 int64_t NowNs()
@@ -157,6 +166,67 @@ void KernelTrace::Init(int device)
     calibration_tick_ = tick;
     window_ns_ = after - before;
 
+}
+
+void ConfigureHostDispatchProbe(std::size_t capacity, int (*gil_state)())
+{
+    if (host_probe.active) throw std::runtime_error("cannot configure an active Host dispatch probe");
+    if (capacity > 1000000) throw std::runtime_error("Host dispatch probe capacity exceeds 1000000");
+    host_probe.samples.clear();
+    host_probe.samples.reserve(capacity);
+    host_probe.capacity = capacity;
+    host_probe.ordinal = host_probe.dropped = 0;
+    host_probe.gil_state = gil_state;
+}
+
+HostDispatchReport TakeHostDispatchProbe()
+{
+    if (host_probe.active) throw std::runtime_error("cannot take an active Host dispatch probe");
+    HostDispatchReport report{std::move(host_probe.samples), host_probe.dropped};
+    host_probe.capacity = 0;
+    host_probe.gil_state = nullptr;
+    return report;
+}
+
+HostDispatchProbe* CurrentHostDispatchProbe() { return host_probe.active; }
+
+HostDispatchProbe::HostDispatchProbe(int rank, bool cached)
+{
+    if (!host_probe.capacity) return;
+    enabled_ = true;
+    exceptions_ = std::uncaught_exceptions();
+    sample_.ordinal = ++host_probe.ordinal;
+    sample_.rank = rank;
+    sample_.cached = cached;
+    sample_.wait_path = 0;
+    sample_.api_call_id = -1;
+    sample_.success = false;
+    sample_.ticks.fill(-1);
+    sample_.gil.fill(-1);
+    previous_ = host_probe.active;
+    host_probe.active = this;
+    Mark(DispatchProbePoint::NativeEntry);
+    for (auto metadata = CurrentTraceMetadata(); metadata; metadata = metadata->parent) {
+        auto found = metadata->values.find("api_call_id");
+        if (found != metadata->values.end()) { sample_.api_call_id = found->second; break; }
+    }
+}
+
+void HostDispatchProbe::MarkEnabled(DispatchProbePoint point)
+{
+    const auto index = static_cast<unsigned>(point);
+    sample_.ticks[index] = NowNs<std::chrono::steady_clock>();
+    sample_.gil[index] = host_probe.gil_state ? host_probe.gil_state() : -1;
+}
+
+HostDispatchProbe::~HostDispatchProbe()
+{
+    if (!enabled_) return;
+    sample_.success = sample_.success && std::uncaught_exceptions() == exceptions_;
+    Mark(DispatchProbePoint::NativeExit);
+    host_probe.active = previous_;
+    if (host_probe.samples.size() < host_probe.capacity) host_probe.samples.push_back(sample_);
+    else ++host_probe.dropped;
 }
 
 KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t cores, const char* op_name,

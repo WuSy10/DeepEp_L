@@ -162,9 +162,31 @@ inline int aclrtSynchronizeDevice(){return 0;}
 #include <cassert>
 #include <thread>
 #include <iostream>
+#include <stdexcept>
 using namespace ascend_deepep::trace;
+int gil_calls=0;
+int fake_gil(){++gil_calls; return 1;}
 extern "C" void kernel_trace_clock_do(void*,uint8_t* p){*reinterpret_cast<uint64_t*>(p)=100;}
 int main(){
+    using P=DispatchProbePoint;
+    ConfigureHostDispatchProbe(0, &fake_gil);
+    {HostDispatchProbe p(0,false); p.Mark(P::WaitBegin); p.Finish();}
+    assert(gil_calls==0 && TakeHostDispatchProbe().samples.empty());
+    ConfigureHostDispatchProbe(2, &fake_gil);
+    for (int i=0;i<3;++i) {
+        HostDispatchProbe p(0,false);
+        assert(CurrentHostDispatchProbe()==&p);
+        p.SetWaitPath(1); p.Mark(P::WaitBegin); p.Mark(P::FirstPending); p.Mark(P::WaitEnd); p.Finish();
+    }
+    assert(!CurrentHostDispatchProbe());
+    auto host=TakeHostDispatchProbe();
+    assert(host.samples.size()==2 && host.dropped==1);
+    assert(host.samples[0].gil[static_cast<unsigned>(P::FirstPending)]==1);
+    assert(host.samples[0].ticks[static_cast<unsigned>(P::WaitEnd)]>=host.samples[0].ticks[static_cast<unsigned>(P::WaitBegin)]);
+    assert(host.samples[0].success && host.samples[0].wait_path==1);
+    ConfigureHostDispatchProbe(1, &fake_gil);
+    try {HostDispatchProbe p(0,false); p.Finish(); throw std::runtime_error("test");} catch (...) {}
+    assert(!TakeHostDispatchProbe().samples[0].success && !CurrentHostDispatchProbe());
     setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata", 1);
     assert(!KernelTrace::Open()); // No collector/calibration for Host-only metadata.
     unsetenv("DEEPEP_TRACE_DIAGNOSTIC_MODE");
@@ -692,6 +714,206 @@ def test_checker_host_metadata(mixed_trace, corruption):
 
 PERF_OPS = ("fresh_dispatch", "cached_dispatch", "combine_unweighted", "combine_weighted")
 
+HOST_DISPATCH_POINTS = (
+    "native_entry",
+    "notify_begin",
+    "notify_end",
+    "wait_begin",
+    "first_pending",
+    "first_count_ready",
+    "all_counts_ready",
+    "wait_end",
+    "outputs_begin",
+    "outputs_end",
+    "dispatch_begin",
+    "dispatch_end",
+    "native_exit",
+)
+HOST_DISPATCH_INTERVALS = {
+    "native_prepare": ("native_entry", "notify_begin"),
+    "notify_launch_call": ("notify_begin", "notify_end"),
+    "counts_wait": ("wait_begin", "wait_end"),
+    "first_count_wait": ("wait_begin", "first_count_ready"),
+    "remaining_counts": ("first_count_ready", "all_counts_ready"),
+    "counts_postprocess": ("wait_end", "outputs_begin"),
+    "outputs_prepare": ("outputs_begin", "outputs_end"),
+    "wait_end_to_dispatch": ("wait_end", "dispatch_begin"),
+    "dispatch_launch_call": ("dispatch_begin", "dispatch_end"),
+    "native_scope": ("native_entry", "native_exit"),
+}
+
+
+def validate_host_dispatch_report(report, args, rank):
+    per_kind = 1 + args.warmup + args.windows * args.iterations
+    rows = report["samples"]
+    control = report.get("gil_control")
+    if control not in (dict(held_control=1, released_control=0), dict(held_control=-1, released_control=-1)):
+        raise ValueError("Host GIL probe controls failed")
+    supported = control["held_control"] == 1
+    if report.get("version") != 1 or report.get("dropped") != 0 or len(rows) != 2 * per_kind:
+        raise ValueError("incomplete Host dispatch probe")
+    seen = [0, 0]
+    for ordinal, row in enumerate(rows, 1):
+        cached = row["cached"]
+        if row["ordinal"] != ordinal or row["rank"] != rank or cached not in (0, 1) or not row["success"]:
+            raise ValueError("invalid Host dispatch sample identity")
+        ticks, gil = row["steady_ns"], row["gil_held"]
+        if set(ticks) != set(HOST_DISPATCH_POINTS) or set(gil) != set(HOST_DISPATCH_POINTS):
+            raise ValueError("missing Host dispatch points")
+        for point in HOST_DISPATCH_POINTS:
+            if type(ticks[point]) is not int or ticks[point] < -1:
+                raise ValueError("invalid Host dispatch timestamp")
+            valid_gil = (0, 1) if supported and ticks[point] >= 0 else (-1,)
+            if gil[point] not in valid_gil:
+                raise ValueError("invalid Host GIL observation")
+        path = row["wait_path"]
+        if (cached and path != 4) or (not cached and path not in (1, 2)):
+            raise ValueError("unexpected Host count wait path")
+        ordered = ["native_entry", "notify_begin", "notify_end"]
+        if not cached:
+            ordered += ["wait_begin"]
+            if path == 1:
+                ordered += ["first_count_ready", "all_counts_ready"]
+            ordered += ["wait_end"]
+        ordered += ["outputs_begin", "outputs_end", "dispatch_begin", "dispatch_end", "native_exit"]
+        values = [ticks[p] for p in ordered]
+        if any(v < 0 for v in values) or values != sorted(values):
+            raise ValueError("unordered Host dispatch phases")
+        for point in ("wait_begin", "wait_end", "first_pending", "first_count_ready", "all_counts_ready"):
+            if (cached or (path == 2 and point not in ("wait_begin", "wait_end"))) and ticks[point] != -1:
+                raise ValueError("unexpected Host wait observation")
+        if (
+            ticks["first_pending"] >= 0
+            and not ticks["wait_begin"] <= ticks["first_pending"] <= ticks["all_counts_ready"]
+        ):
+            raise ValueError("pending observation outside count wait")
+        index = seen[cached]
+        seen[cached] += 1
+        row["kind"] = "cached_dispatch" if cached else "fresh_dispatch"
+        row["phase"] = "precision" if index == 0 else "warmup" if index <= args.warmup else "steady"
+        row["window"] = (index - 1 - args.warmup) // args.iterations if row["phase"] == "steady" else -1
+        row["iteration"] = (index - 1 - args.warmup) % args.iterations if row["phase"] == "steady" else -1
+        row["durations_ns"] = {
+            name: ticks[b] - ticks[a]
+            for name, (a, b) in HOST_DISPATCH_INTERVALS.items()
+            if ticks[a] >= 0 and ticks[b] >= 0
+        }
+    if seen != [per_kind, per_kind]:
+        raise ValueError("Host dispatch call count mismatch")
+    summary = {}
+    for kind in PERF_OPS[:2]:
+        steady = [r for r in rows if r["kind"] == kind and r["phase"] == "steady"]
+        durations = {}
+        for name in HOST_DISPATCH_INTERVALS:
+            values = sorted(r["durations_ns"][name] for r in steady if name in r["durations_ns"])
+            if values:
+                durations[name] = dict(
+                    count=len(values), median_ns=statistics.median(values), min_ns=values[0], max_ns=values[-1]
+                )
+        summary[kind] = dict(
+            durations=durations,
+            gil_observations={
+                point: {
+                    str(state): sum(r["gil_held"][point] == state and r["steady_ns"][point] >= 0 for r in steady)
+                    for state in (-1, 0, 1)
+                }
+                for point in HOST_DISPATCH_POINTS
+            },
+        )
+    report["steady_summary"] = summary
+    report["clock"] = "C++ steady_clock nanoseconds; not CPU wall time or NPU time"
+    return report
+
+
+def make_host_probe_report(args, rank=0, path=1, gil_state=1):
+    per_kind = 1 + args.warmup + args.windows * args.iterations
+    rows = []
+    for cached in (0, 1):
+        for _ in range(per_kind):
+            ordinal = len(rows) + 1
+            ticks = {name: ordinal * 1000 + i * 10 for i, name in enumerate(HOST_DISPATCH_POINTS)}
+            for point in ("wait_begin", "wait_end", "first_pending", "first_count_ready", "all_counts_ready"):
+                if cached or (path == 2 and point not in ("wait_begin", "wait_end")):
+                    ticks[point] = -1
+            rows.append(
+                dict(
+                    ordinal=ordinal,
+                    rank=rank,
+                    cached=cached,
+                    success=True,
+                    api_call_id=ordinal,
+                    wait_path=4 if cached else path,
+                    steady_ns=ticks,
+                    gil_held={p: gil_state if ticks[p] >= 0 else -1 for p in HOST_DISPATCH_POINTS},
+                )
+            )
+    return dict(
+        version=1,
+        dropped=0,
+        samples=rows,
+        gil_control=dict(held_control=1, released_control=0)
+        if gil_state != -1
+        else dict(held_control=-1, released_control=-1),
+    )
+
+
+@pytest.mark.parametrize("path", [1, 2])
+@pytest.mark.parametrize("gil_state", [0, 1, -1])
+def test_host_dispatch_report_phases_and_gil(path, gil_state):
+    args = npu_parser().parse_args(["--output", "unused", "--windows", "5", "--iterations", "60"])
+    report = validate_host_dispatch_report(make_host_probe_report(args, path=path, gil_state=gil_state), args, 0)
+    fresh = report["steady_summary"]["fresh_dispatch"]
+    assert fresh["durations"]["counts_wait"]["count"] == 300
+    assert fresh["durations"]["counts_wait"]["median_ns"] == 40
+    assert fresh["gil_observations"]["wait_begin"][str(gil_state)] == 300
+    assert "counts_wait" not in report["steady_summary"]["cached_dispatch"]["durations"]
+    steady = [r for r in report["samples"] if r["phase"] == "steady" and not r["cached"]]
+    assert [(r["window"], r["iteration"]) for r in steady] == [(w, i) for w in range(5) for i in range(60)]
+
+
+@pytest.mark.parametrize("corruption", ["control", "dropped", "missing", "order", "gil", "path", "cached_wait"])
+def test_host_dispatch_report_rejects_invalid_evidence(corruption):
+    args = npu_parser().parse_args(["--output", "unused", "--windows", "1", "--iterations", "32"])
+    report = make_host_probe_report(args)
+    row = report["samples"][0]
+    if corruption == "control":
+        report["gil_control"]["released_control"] = 1
+    elif corruption == "dropped":
+        report["dropped"] = 1
+    elif corruption == "missing":
+        report["samples"].pop()
+    elif corruption == "order":
+        row["steady_ns"]["wait_end"] = 0
+    elif corruption == "gil":
+        row["gil_held"]["wait_begin"] = 2
+    elif corruption == "path":
+        row["wait_path"] = 3
+    else:
+        row = report["samples"][-1]
+        row["steady_ns"]["wait_begin"] = row["steady_ns"]["notify_end"]
+        row["gil_held"]["wait_begin"] = 1
+    with pytest.raises(ValueError):
+        validate_host_dispatch_report(report, args, 0)
+
+
+@pytest.mark.parametrize("pending", ["absent", "after_total"])
+def test_host_dispatch_pending_is_an_observation(pending):
+    args = npu_parser().parse_args(["--output", "unused", "--windows", "1", "--iterations", "32"])
+    report = make_host_probe_report(args)
+    for row in report["samples"]:
+        if not row["cached"]:
+            row["steady_ns"]["first_pending"] = -1 if pending == "absent" else row["steady_ns"]["first_count_ready"] + 1
+            row["gil_held"]["first_pending"] = -1 if pending == "absent" else 1
+    validate_host_dispatch_report(report, args, 0)
+
+
+@pytest.mark.parametrize("extra", [[], ["--diagnostic", "--diagnostic-timing"]])
+def test_host_dispatch_timing_requires_separate_diagnostic_run(tmp_path, extra):
+    args = npu_parser().parse_args(["--host-dispatch-timing", "--output", str(tmp_path / "unused"), *extra])
+    with pytest.raises(ValueError, match="--host-dispatch-timing requires"):
+        run_npu_acceptance(args)
+    assert not args.output.exists()
+
 
 def overhead_result(off, on):
     """Paired, process-level samples; inner windows are not independent trials."""
@@ -1040,6 +1262,18 @@ def npu_worker(args):
     if deferred:
         assert trace_entry is not None and KernelTrace._thread is None
         assert trace_entry["slots"] >= record_slot_requirement(args)
+    host_probe_native = None
+    gil_control = None
+    if args.host_dispatch_timing:
+        from deep_ep.backends.direct._native import load_native_module
+
+        host_probe_native = load_native_module()
+        if getattr(host_probe_native, "host_dispatch_probe_version", 0) != 1:
+            raise RuntimeError("Host dispatch timing requires the matching rebuilt native extension")
+        gil_control = host_probe_native.check_host_dispatch_gil_probe()
+        if gil_control not in (dict(held_control=1, released_control=0), dict(held_control=-1, released_control=-1)):
+            raise RuntimeError(f"GIL observation controls failed: {gil_control}")
+        host_probe_native.configure_host_dispatch_probe(2 * (1 + args.warmup + args.windows * args.iterations))
 
     def dispatch(handle=None):
         return buffer.dispatch(
@@ -1113,6 +1347,15 @@ def npu_worker(args):
         dist.barrier,
         collect if args.windowed_collection else None,
     )
+    if host_probe_native is not None:
+        host_report = host_probe_native.take_host_dispatch_probe()  # Disable and export only after all timed windows.
+        host_report.update(
+            gil_control=gil_control,
+            python_version=sys.version,
+            python_gil_enabled=getattr(sys, "_is_gil_enabled", lambda: None)(),
+        )
+        validate_host_dispatch_report(host_report, args, rank)
+        (args.output / f"host_dispatch_rank{rank}.json").write_text(json.dumps(host_report, indent=2))
     manifest = dict(
         rank=rank,
         pid=os.getpid(),
@@ -1130,6 +1373,7 @@ def npu_worker(args):
         trace_slots=trace_entry["slots"] if trace_entry else 0,
         windowed_collection=args.windowed_collection,
         collection_boundaries=boundaries,
+        host_dispatch_timing=args.host_dispatch_timing,
     )
     if deferred:
         manifest["deferred_evidence"] = dict(
@@ -1153,6 +1397,11 @@ def npu_parser():
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--diagnostic", action="store_true", help="layered attribution, not performance acceptance")
     parser.add_argument("--diagnostic-timing", action="store_true", help="separate instrumented run only")
+    parser.add_argument(
+        "--host-dispatch-timing",
+        action="store_true",
+        help="separate diagnostic run: native dispatch phases and sampled GIL state",
+    )
     parser.add_argument(
         "--windowed-collection",
         action="store_true",
@@ -1228,6 +1477,8 @@ def run_npu_acceptance(args):
             raise ValueError("--paired-baselines requires --diagnostic")
         if args.windowed_collection and not args.diagnostic:
             raise ValueError("--windowed-collection requires --diagnostic")
+        if args.host_dispatch_timing and (not args.diagnostic or args.diagnostic_timing):
+            raise ValueError("--host-dispatch-timing requires --diagnostic without --diagnostic-timing")
         if args.diagnostic and args.diagnostic_timing and any(m in args.modes for m in ("production", "record_only")):
             raise ValueError("production control and record_only must run without --diagnostic-timing")
         required_slots = record_slot_requirement(args)
@@ -1282,6 +1533,8 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
             command += ["--" + key.replace("_", "-"), str(value)]
     if args.windowed_collection:
         command.append("--windowed-collection")
+    if args.host_dispatch_timing:
+        command.append("--host-dispatch-timing")
     print(f"RUN {destination.name}", flush=True)
     with (destination / "run.log").open("w") as log:
         run_npu_process(command, destination, env, log, args.timeout)
@@ -1309,6 +1562,12 @@ def validate_diagnostic_trial(destination, manifests, args, mode):
     elif reports:
         raise ValueError("off/metadata/production unexpectedly produced diagnostic collector reports")
     for rank, manifest in enumerate(manifests):
+        if manifest.get("host_dispatch_timing", False) != args.host_dispatch_timing:
+            raise ValueError("Host dispatch timing option was not applied")
+        if args.host_dispatch_timing:
+            validate_host_dispatch_report(
+                json.loads((destination / f"host_dispatch_rank{rank}.json").read_text()), args, rank
+            )
         if manifest["trace_mode"] != mode or not manifest["precision_passed"]:
             raise ValueError("wrong mode or precision failure")
         if manifest["trace_ring_active"] != (mode in (*collector_modes, "production", "record_only")):
@@ -1459,7 +1718,8 @@ def _run_npu_diagnostic(args):
     report = dict(
         diagnostic_valid=True,
         performance_acceptance=False,
-        instrumented=args.diagnostic_timing,
+        instrumented=args.diagnostic_timing or args.host_dispatch_timing,
+        host_dispatch_timing=args.host_dispatch_timing,
         paired_baselines=args.paired_baselines,
         layer_increments=diagnostic_layer_increments(runs),
         attribution_note="Layer differences include overlap and scheduling; they are not exclusive component costs.",
@@ -1658,6 +1918,58 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
                 assert report["layer_increments"][edge]["fresh_dispatch"]["baseline_adjusted_ns"] == [10, 10]
         else:
             assert report["comparisons"]["json"]["fresh_dispatch"]["median_percent"] == pytest.approx(40)
+
+
+def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkeypatch):
+    args = npu_parser().parse_args(
+        [
+            "--npu",
+            "--diagnostic",
+            "--host-dispatch-timing",
+            "--windowed-collection",
+            "--modes",
+            "off",
+            "record_only",
+            "production",
+            "--rounds",
+            "1",
+            "--warmup",
+            "1",
+            "--windows",
+            "1",
+            "--iterations",
+            "32",
+            "--output",
+            str(tmp_path / "host"),
+        ]
+    )
+
+    def launch(command, destination, env, log, timeout):
+        assert "--host-dispatch-timing" in command and "--windowed-collection" in command
+        mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if "DEEPEP_TRACE_DIR" in env else "off")
+        count = len(boundary_labels(args))
+        for rank in range(args.ep_size):
+            manifest = dict(
+                trace_mode=mode,
+                precision_passed=True,
+                trace_ring_active=mode != "off",
+                trace_slots=128 if mode != "off" else 0,
+                metadata_statistics={},
+                host_dispatch_timing=True,
+                windowed_collection=True,
+                collection_boundaries=[dict(label=label, collect_ns=1) for label in boundary_labels(args)],
+                deferred_evidence=dict(thread_absent=True, drains_before_destroy=count, drains_after_destroy=count + 1),
+                timings_ns={op: [100] for op in PERF_OPS},
+            )
+            (destination / f"rank{rank}.json").write_text(json.dumps(manifest))
+            (destination / f"host_dispatch_rank{rank}.json").write_text(json.dumps(make_host_probe_report(args, rank)))
+
+    monkeypatch.setattr(sys.modules[__name__], "run_npu_process", launch)
+    monkeypatch.setattr(sys.modules[__name__], "validate_npu_metadata", lambda *items: None)
+    assert run_npu_acceptance(args)
+    report = json.loads((args.output / "diagnosis.json").read_text())
+    assert report["instrumented"] and report["host_dispatch_timing"] and not report["performance_acceptance"]
+    assert len(list(args.output.glob("round*/host_dispatch_rank*.json"))) == 3 * args.ep_size
 
 
 def test_diagnostic_paired_schedule_and_production_guard(tmp_path):

@@ -14,9 +14,63 @@
 #include "runtime/kernel_trace.h"
 #include "runtime/shmem_instance.h"
 
+namespace {
+int ProbePythonGil()
+{
+#ifdef Py_GIL_DISABLED
+    return -1;
+#else
+    return PyGILState_Check(); // Observe only; never acquire or release the GIL.
+#endif
+}
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.attr("kernel_trace_diagnostic_version") = 4;
+    m.attr("host_dispatch_probe_version") = 1;
+    m.def("check_host_dispatch_gil_probe", []() {
+        const int held = ProbePythonGil();
+        int released;
+        { pybind11::gil_scoped_release release; released = ProbePythonGil(); }
+        pybind11::dict result;
+        result["held_control"] = held;
+        result["released_control"] = released;
+        return result;
+    });
+    m.def("configure_host_dispatch_probe", [](int64_t capacity) {
+        if (capacity < 0) throw std::runtime_error("negative Host dispatch probe capacity");
+        ascend_deepep::trace::ConfigureHostDispatchProbe(static_cast<std::size_t>(capacity), &ProbePythonGil);
+    });
+    m.def("take_host_dispatch_probe", []() {
+        auto report = ascend_deepep::trace::TakeHostDispatchProbe();
+        static constexpr const char* names[] = {"native_entry", "notify_begin", "notify_end", "wait_begin",
+            "first_pending", "first_count_ready", "all_counts_ready", "wait_end", "outputs_begin", "outputs_end",
+            "dispatch_begin", "dispatch_end", "native_exit"};
+        static_assert(sizeof(names) / sizeof(names[0]) == ascend_deepep::trace::kDispatchProbePoints);
+        pybind11::list samples;
+        for (const auto& row : report.samples) {
+            pybind11::dict item, ticks, gil;
+            item["ordinal"] = row.ordinal;
+            item["rank"] = row.rank;
+            item["cached"] = row.cached;
+            item["wait_path"] = row.wait_path;
+            item["api_call_id"] = row.api_call_id;
+            item["success"] = row.success;
+            for (unsigned i = 0; i < ascend_deepep::trace::kDispatchProbePoints; ++i) {
+                ticks[names[i]] = row.ticks[i];
+                gil[names[i]] = row.gil[i];
+            }
+            item["steady_ns"] = ticks;
+            item["gil_held"] = gil;
+            samples.append(item);
+        }
+        pybind11::dict result;
+        result["version"] = 1;
+        result["dropped"] = report.dropped;
+        result["samples"] = samples;
+        return result;
+    });
     using ascend_deepep::trace::KernelTrace;
     using ascend_deepep::trace::TraceRecord;
     struct Snapshot { ascend_deepep::trace::TraceMetadataSnapshot value; };
