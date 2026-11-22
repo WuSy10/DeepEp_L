@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
+import itertools
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,7 @@ import socket
 import threading
 import time
 import warnings
+import uuid
 
 
 class KernelTrace:
@@ -108,3 +111,85 @@ class KernelTrace:
 
 
 atexit.register(KernelTrace.shutdown)
+
+
+_identity_lock = threading.Lock()
+_identities = itertools.count(1)
+_process_id = uuid.uuid4().hex
+
+
+def _next_identity():
+    with _identity_lock:
+        return next(_identities)
+
+
+def _global_rank():
+    import torch.distributed as dist
+
+    return dist.get_rank() if dist.is_available() and dist.is_initialized() else None
+
+
+class KernelTraceSession:
+    """Host-only metadata for one Buffer; each call is snapshotted by native Reserve."""
+
+    def __init__(self, native, comm_id, ep_size, global_rank=None):
+        self.native = native
+        self.fields = dict(
+            metadata_version=1,
+            comm_id=comm_id,
+            buffer_id=_next_identity(),
+            process_id=_process_id,
+            hostname=socket.gethostname(),
+            ep_size=ep_size,
+        )
+        if global_rank is not None:
+            self.fields["global_rank"] = global_rank
+
+    @contextmanager
+    def call(self, api_name, x, routes, num_experts, handle=None, *, cached=False, expanded=False, capacity=0):
+        with _identity_lock:
+            handle_id = getattr(handle, "_trace_handle_id", None) if handle is not None else None
+            if handle_id is None:
+                handle_id = next(_identities)
+                if handle is not None:
+                    handle._trace_handle_id = handle_id
+        fields = dict(
+            self.fields,
+            api_name=api_name,
+            api_call_id=_next_identity(),
+            handle_id=handle_id,
+            hidden_size=int(x.size(1)),
+            element_bytes=x.element_size(),
+            dtype=str(x.dtype),
+            num_experts=int(num_experts),
+            topk=int(routes.size(1)),
+            num_tokens=int(routes.size(0)),
+            api_input_rows=int(x.size(0)),
+            cached=int(cached),
+            do_expand=int(expanded),
+            token_capacity=int(capacity),
+        )
+        previous = self.native.exchange_kernel_trace_metadata(fields)
+        try:
+            yield fields
+        finally:
+            self.native.exchange_kernel_trace_metadata(previous)
+
+
+def attach_trace_session(native, group, rank, ep_size, all_gather):
+    """Agree once at Buffer initialization, including disabled ranks; no per-call collective."""
+    enabled = bool(os.environ.get("DEEPEP_TRACE_DIR"))
+    proposal = uuid.uuid4().hex if enabled and rank == 0 else None
+    peers = all_gather(group, None, ep_size, (enabled, proposal))
+    if any(peer[0] != enabled for peer in peers):
+        raise ValueError("all EP ranks must agree on whether DEEPEP_TRACE_DIR is enabled")
+    if not enabled:
+        return None, None
+    identity = KernelTrace.attach(native)
+    if identity is None:
+        return None, None
+    try:
+        global_rank = _global_rank()
+    except (ImportError, RuntimeError):
+        global_rank = None
+    return identity, KernelTraceSession(native, peers[0][1], ep_size, global_rank)

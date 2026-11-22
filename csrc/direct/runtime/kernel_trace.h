@@ -9,9 +9,26 @@
 #include <acl/acl.h>
 
 namespace ascend_deepep::trace {
+struct TraceMetadata {
+    std::map<std::string, int64_t> values;
+    std::map<std::string, std::string> labels;
+};
+using TraceMetadataSnapshot = std::shared_ptr<const TraceMetadata>;
+TraceMetadataSnapshot CurrentTraceMetadata();
+TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata);
+class ScopedTraceMetadata {
+public:
+    explicit ScopedTraceMetadata(TraceMetadataSnapshot metadata);
+    ~ScopedTraceMetadata();
+    ScopedTraceMetadata(const ScopedTraceMetadata&) = delete;
+    ScopedTraceMetadata& operator=(const ScopedTraceMetadata&) = delete;
+private:
+    TraceMetadataSnapshot previous_;
+};
 struct TraceRecord {
     std::string event, op_name, kernel_name;
     std::map<std::string, int64_t> values;
+    std::map<std::string, std::string> labels;
 };
 class KernelTrace {
 public:
@@ -23,7 +40,8 @@ public:
         uint64_t sequence = 0;
     };
     Ticket Reserve(int rank, uint32_t instance, uint32_t cores,
-                   const char* op_name, const char* kernel_name);
+                   const char* op_name, const char* kernel_name, uint64_t stream = 0, uint32_t ep_size = 0,
+                   int64_t input_rows = -1, int64_t output_rows = -1);
     void Submit(Ticket ticket, int64_t launch_ns, int status);
     std::vector<TraceRecord> Drain(bool closing = false);
     TraceRecord Calibration() const;
@@ -37,6 +55,10 @@ private:
         int rank{}, status{};
         uint32_t instance{}, cores{};
         std::string op_name, kernel_name;
+        TraceMetadataSnapshot metadata;
+        uint64_t stream{};
+        uint32_t ep_size{};
+        int64_t input_rows{-1}, output_rows{-1};
         bool logged_launch{};
     };
     static constexpr unsigned kSlots = 128;

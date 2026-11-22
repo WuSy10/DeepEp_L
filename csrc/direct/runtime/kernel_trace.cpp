@@ -20,6 +20,7 @@ namespace ascend_deepep::trace {
 namespace {
 constexpr size_t kSlotBytes = platform::kMaxNumAiv * kCoreBytes;
 std::atomic<uint64_t> next_sequence{1};
+thread_local TraceMetadataSnapshot active_metadata;
 
 template <typename Clock>
 int64_t NowNs()
@@ -32,6 +33,24 @@ void Check(aclError status, const char* op)
     if (status != ACL_SUCCESS) throw std::runtime_error(std::string(op) + ": " + std::to_string(status));
 }
 }  // namespace
+
+TraceMetadataSnapshot CurrentTraceMetadata()
+{
+    return active_metadata;
+}
+TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata)
+{
+    std::swap(metadata, active_metadata);
+    return metadata;
+}
+ScopedTraceMetadata::ScopedTraceMetadata(TraceMetadataSnapshot metadata)
+    : previous_(ExchangeTraceMetadata(std::move(metadata)))
+{
+}
+ScopedTraceMetadata::~ScopedTraceMetadata()
+{
+    ExchangeTraceMetadata(std::move(previous_));
+}
 
 std::shared_ptr<KernelTrace> KernelTrace::Open()
 {
@@ -87,7 +106,9 @@ void KernelTrace::Init(int device)
 
 }
 
-KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t cores, const char* op_name, const char* kernel_name)
+KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t cores, const char* op_name,
+                                       const char* kernel_name, uint64_t stream, uint32_t ep_size,
+                                       int64_t input_rows, int64_t output_rows)
 {
     const auto index = cursor_.fetch_add(1, std::memory_order_relaxed) % kSlots;
     auto& slot = slots_[index];
@@ -109,6 +130,11 @@ KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t c
     slot.rank = rank;
     slot.instance = instance;
     slot.cores = cores;
+    slot.metadata = CurrentTraceMetadata();
+    slot.stream = stream;
+    slot.ep_size = ep_size;
+    slot.input_rows = input_rows;
+    slot.output_rows = output_rows;
     slot.logged_launch = false;
     return {reinterpret_cast<uint64_t>(mapped_) + index * kSlotBytes, index, slot.sequence};
 }
@@ -147,7 +173,16 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
         if (slot.state.load(std::memory_order_acquire) != State::Submitted) continue;
         TraceRecord record{"", slot.op_name, slot.kernel_name,
             {{"gid", static_cast<int64_t>(slot.sequence)}, {"rank", slot.rank},
-             {"local_instance", slot.instance}, {"launch_ns", slot.launch_ns}, {"aiv", slot.cores}}};
+             {"local_instance", slot.instance}, {"launch_ns", slot.launch_ns}, {"aiv", slot.cores},
+             {"pid", getpid()}, {"device", device_}}};
+        if (slot.ep_size) record.values["ep_size"] = slot.ep_size;
+        if (slot.input_rows >= 0) record.values["kernel_input_rows"] = slot.input_rows;
+        if (slot.output_rows >= 0) record.values["kernel_output_rows"] = slot.output_rows;
+        if (slot.metadata) {
+            record.values.insert(slot.metadata->values.begin(), slot.metadata->values.end());
+            record.labels = slot.metadata->labels;
+        }
+        record.labels["stream"] = std::to_string(slot.stream);
         if (!slot.logged_launch) {
             record.event = slot.status ? "launch_error" : "launch";
             record.values["status"] = slot.status;

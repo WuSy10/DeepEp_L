@@ -1,4 +1,5 @@
 #include "ops/combine.h"
+#include "runtime/kernel_trace.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 
 #include <cstdint>
@@ -403,7 +404,9 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     if (c10_npu::currentStreamCaptureStatusMayInitCtx() != c10_npu::CaptureStatus::None) trace_sink = nullptr;
     // Capture the prepared tensors/tiling by value once; no recomputation or
     // allocation between communication and reduction, and no host synchronize.
+    const auto trace_metadata = trace_sink ? trace::CurrentTraceMetadata() : trace::TraceMetadataSnapshot{};
     auto launch = [=](CombinePhase phase) {
+        trace::ScopedTraceMetadata trace_scope(trace_metadata);
         // Explicit odr-use retains GM source owners, not just tiling addresses.
         (void)expanded_x;
         (void)single_source_slots;

@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Tuple, Union
 from ._native import get_native_class
 from .buffer import (
     _BOOTSTRAP_LOCK,
+    _bootstrap_all_gather,
     _compact_extra_tensors,
     get_global_comm_stream,
     _get_allocation_stream_id,
@@ -341,11 +342,14 @@ class ElasticBuffer:
         # stream. The native barrier kernel is reused from the V1 resource layer.
         self.barrier(use_comm_stream=True, with_cpu_sync=True)
         self._kernel_trace = None
+        self._trace_session = None
         if transport == "udma":
-            from ...utils.kernel_trace import KernelTrace
+            from ...utils.kernel_trace import attach_trace_session
             from ._native import load_native_module
 
-            self._kernel_trace = KernelTrace.attach(load_native_module())
+            self._kernel_trace, self._trace_session = attach_trace_session(
+                load_native_module(), resolved_group, rank, num_ranks, _bootstrap_all_gather
+            )
 
     @property
     def udma_auto_policy(self):
@@ -805,7 +809,21 @@ class ElasticBuffer:
 
             allocation_stream = self._communication_stream if allocate_on_comm_stream else _current_npu_stream()
         dependency = previous_event or _try_record_event(None)
-        with _use_stream_after_event(self._communication_stream, dependency):
+        trace_call = (
+            self._trace_session.call(
+                "dispatch",
+                x_tensor,
+                resolved_topk_idx,
+                resolved_num_experts,
+                handle,
+                cached=cached_mode,
+                expanded=do_expand,
+                capacity=resolved_capacity,
+            )
+            if getattr(self, "_trace_session", None) is not None
+            else nullcontext(None)
+        )
+        with trace_call as trace_metadata, _use_stream_after_event(self._communication_stream, dependency):
             if cached_mode:
                 dispatch_layout = handle._dispatch_layout
                 rank_prefix_matrix, channel_prefix_matrix, _, _, is_token_in_rank, _ = dispatch_layout
@@ -966,6 +984,7 @@ class ElasticBuffer:
                 None,
             )
             _record_recv_outputs_on_current_stream(*public_handle)
+            handle._trace_handle_id = trace_metadata["handle_id"] if trace_metadata is not None else None
             handle._buffer_token = self._handle_token
             handle._buffer_owner = self
             handle._udma_policy = policy
@@ -1105,7 +1124,20 @@ class ElasticBuffer:
             if self._udma_schedule == "token" and (comm_sms != 32 or self.num_ranks > 8):
                 raise ValueError("self-send aggregate pipeline requires 32 AIV and EP <= 8")
         dependency = previous_event or _try_record_event(None)
-        with _use_stream_after_event(self._communication_stream, dependency):
+        trace_call = (
+            self._trace_session.call(
+                "combine",
+                x,
+                handle.topk_idx,
+                handle.num_experts,
+                handle,
+                expanded=handle.do_expand,
+                capacity=handle.num_max_tokens_per_rank,
+            )
+            if getattr(self, "_trace_session", None) is not None
+            else nullcontext(None)
+        )
+        with trace_call, _use_stream_after_event(self._communication_stream, dependency):
             combine_x, combine_topk_weights = x, topk_weights
             single_source_slots = (
                 getattr(handle, "_single_source_slots", None)

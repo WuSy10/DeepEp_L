@@ -109,16 +109,36 @@ inline int aclrtSynchronizeDevice(){return 0;}
 #include "runtime/kernel_trace.h"
 #include "common/kernel_trace_layout.h"
 #include <cassert>
+#include <thread>
 using namespace ascend_deepep::trace;
 extern "C" void kernel_trace_clock_do(void*,uint8_t* p){*reinterpret_cast<uint64_t*>(p)=100;}
 int main(){
     auto sink=KernelTrace::Open(); assert(sink);
+    TraceMetadata outer;
+    outer.values["api_call_id"] = 999;
+    ExchangeTraceMetadata(std::make_shared<const TraceMetadata>(outer));
+    std::thread other([] {
+        assert(!CurrentTraceMetadata());
+        TraceMetadata local; local.values["api_call_id"] = 123;
+        ScopedTraceMetadata scope(std::make_shared<const TraceMetadata>(local));
+        assert(CurrentTraceMetadata()->values.at("api_call_id") == 123);
+    });
+    other.join();
+    assert(CurrentTraceMetadata()->values.at("api_call_id") == 999);
     const char* ops[] = {"notify_dispatch", "dispatch", "cached_notify_dispatch", "cached_notify_combine", "combine"};
     const char* kernels[] = {"notify_dispatch_kernel", "v1_dispatch_udma_kernel", "cached_notify_dispatch_kernel",
                              "cached_notify_combine_kernel", "v1_combine_udma_reduce_kernel"};
     for(int round=0;round<384;++round) {
         const int kind = round % 5;
-        auto ticket=sink->Reserve(0,0,2,ops[kind],kernels[kind]); assert(ticket.address);
+        TraceMetadata call;
+        call.values["api_call_id"] = round + 1;
+        call.labels["comm_id"] = "test-comm";
+        KernelTrace::Ticket ticket;
+        {
+            ScopedTraceMetadata scope(std::make_shared<const TraceMetadata>(call));
+            ticket=sink->Reserve(0,0,2,ops[kind],kernels[kind],12345); assert(ticket.address);
+        }
+        assert(CurrentTraceMetadata()->values.at("api_call_id") == 999);
         sink->Submit(ticket,1000,0);
         auto* bytes=reinterpret_cast<uint8_t*>(ticket.address);
         auto store=[&](int offset,uint64_t value){
@@ -137,6 +157,9 @@ int main(){
         store(kCoreBytes+kLineBytes,ticket.sequence);
         auto done=sink->Drain();assert(done.size()==1 && done[0].event=="end");
         assert(done[0].op_name==ops[kind] && done[0].kernel_name==kernels[kind]);
+        assert(done[0].values.at("api_call_id")==round+1);
+        assert(done[0].labels.at("comm_id")=="test-comm");
+        assert(done[0].labels.at("stream")=="12345");
         assert(done[0].values.at("gid")==static_cast<int64_t>(ticket.sequence));
         assert(done[0].values.at("elapsed_ns")==40); // Zero start tick is valid.
     }
@@ -264,3 +287,165 @@ def test_checker_rejects_mixed_trace_corruption(mixed_trace, corruption):
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(ValueError):
         checker.check(path.parent, 1, require_ops=["notify_dispatch", "dispatch", "combine"])
+
+
+class MetadataTensor:
+    dtype = "torch.bfloat16"
+
+    def __init__(self, rows, cols):
+        self.shape = (rows, cols)
+
+    def size(self, dim):
+        return self.shape[dim]
+
+    def element_size(self):
+        return 2
+
+    def cpu(self):
+        raise AssertionError("metadata collection must not read the device")
+
+
+class MetadataNative:
+    def __init__(self):
+        self.context = threading.local()
+
+    def exchange_kernel_trace_metadata(self, fields):
+        previous = getattr(self.context, "fields", {})
+        self.context.fields = dict(fields)
+        return previous
+
+
+def load_trace_module():
+    spec = importlib.util.spec_from_file_location("trace_metadata_test", ROOT / "deep_ep/utils/kernel_trace.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_call_and_handle_metadata_scopes():
+    module = load_trace_module()
+    native = MetadataNative()
+    session = module.KernelTraceSession(native, "comm-a", 4, 12)
+    routes = MetadataTensor(32, 8)
+    x = MetadataTensor(32, 6144)
+    handle = type("Handle", (), {})()
+    with session.call("dispatch", x, routes, 128, capacity=64) as fresh:
+        assert fresh["topk"] == 8 and fresh["global_rank"] == 12
+        handle._trace_handle_id = fresh["handle_id"]
+        snapshot = dict(native.context.fields)
+        with pytest.raises(RuntimeError):
+            with session.call("combine", MetadataTensor(90, 6144), routes, 128, handle, capacity=64) as combine:
+                assert combine["api_call_id"] != fresh["api_call_id"]
+                assert combine["handle_id"] == fresh["handle_id"]
+                assert combine["num_tokens"] == 32 and combine["api_input_rows"] == 90
+                assert combine["topk"] == 8  # No weights needed to preserve routing K.
+                raise RuntimeError("launch failed")
+        assert native.context.fields == snapshot
+    assert native.context.fields == {}
+    with session.call("dispatch", x, routes, 128, handle, cached=True) as cached:
+        assert cached["handle_id"] == fresh["handle_id"] and cached["cached"] == 1
+        assert cached["api_call_id"] != fresh["api_call_id"]
+    with session.call("dispatch", x, routes, 128) as another:
+        assert another["handle_id"] != fresh["handle_id"]
+    assert snapshot["api_name"] == "dispatch"
+
+
+def test_metadata_thread_isolation():
+    module = load_trace_module()
+    native = MetadataNative()
+    session = module.KernelTraceSession(native, "comm", 4)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def run(rows):
+        with session.call("dispatch", MetadataTensor(rows, 128), MetadataTensor(rows, 8), 128) as fields:
+            barrier.wait(timeout=2)
+            assert native.context.fields == fields
+            results.append(dict(fields))
+        assert native.context.fields == {}
+
+    threads = [threading.Thread(target=run, args=(rows,)) for rows in (32, 64)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+    assert len(results) == 2
+    assert results[0]["api_call_id"] != results[1]["api_call_id"]
+    assert {row["num_tokens"] for row in results} == {32, 64}
+
+
+def test_trace_group_initialization(monkeypatch):
+    module = load_trace_module()
+    native = MetadataNative()
+    monkeypatch.setenv("DEEPEP_TRACE_DIR", "test")
+    monkeypatch.setattr(module.KernelTrace, "attach", lambda native: 456)
+    monkeypatch.setattr(module, "_global_rank", lambda: 9)
+    proposals = []
+
+    def gather(group, comm, size, value):
+        proposals.append(value)
+        return [(True, "rank0-uuid"), (True, None)]
+
+    first = module.attach_trace_session(native, None, 0, 2, gather)[1]
+    second = module.attach_trace_session(native, None, 1, 2, gather)[1]
+    assert first.fields["comm_id"] == second.fields["comm_id"] == "rank0-uuid"
+    assert first.fields["buffer_id"] != second.fields["buffer_id"]
+    assert proposals[0][1] and proposals[1][1] is None
+    monkeypatch.delenv("DEEPEP_TRACE_DIR")
+    with pytest.raises(ValueError, match="all EP ranks"):
+        module.attach_trace_session(native, None, 1, 2, gather)
+    assert module.attach_trace_session(native, None, 0, 2, lambda *args: [(False, None)] * 2) == (None, None)
+
+
+@pytest.mark.parametrize("corruption", [None, "missing", "end", "api", "handle"])
+def test_checker_host_metadata(mixed_trace, corruption):
+    checker, path, rows = mixed_trace
+    for row in rows:
+        if row["event"] not in ("launch", "end"):
+            continue
+        row.update(
+            metadata_version=1,
+            comm_id="comm",
+            buffer_id=1,
+            process_id="process",
+            hostname="host",
+            ep_size=1,
+            api_name="combine" if "combine" in row["op_name"] else "dispatch",
+            api_call_id=row["gid"],
+            handle_id=1,
+            hidden_size=6144,
+            element_bytes=2,
+            dtype="torch.bfloat16",
+            num_experts=32,
+            topk=8,
+            num_tokens=2048,
+            api_input_rows=2048,
+            cached=0,
+            do_expand=0,
+            token_capacity=4096,
+            pid=100,
+            device=0,
+            stream="12345",
+        )
+        if row["op_name"] in ("dispatch", "combine"):
+            row.update(kernel_input_rows=2048, kernel_output_rows=2048)
+    first = next(row for row in rows if row["event"] == "launch")
+    if corruption == "missing":
+        first.pop("topk")
+    elif corruption == "end":
+        next(row for row in rows if row["event"] == "end")["comm_id"] = "other"
+    elif corruption in ("api", "handle"):
+        for row in rows:
+            if row.get("gid") == 2:
+                if corruption == "api":
+                    row["api_call_id"] = 1
+                    row["api_input_rows"] = 100
+                else:
+                    row["topk"] = 4
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    if corruption:
+        with pytest.raises(ValueError):
+            checker.check(path.parent, 1, require_metadata=True)
+    else:
+        assert checker.check(path.parent, 1, require_metadata=True) == 130

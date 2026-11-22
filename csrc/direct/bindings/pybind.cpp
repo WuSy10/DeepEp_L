@@ -19,6 +19,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     using ascend_deepep::trace::TraceRecord;
     auto to_dict = [](const TraceRecord& record) {
         pybind11::dict result;
+        for (const auto& item : record.labels) result[pybind11::str(item.first)] = item.second;
         result["event"] = record.event;
         if (!record.op_name.empty()) result["op_name"] = record.op_name;
         if (!record.kernel_name.empty()) result["kernel_name"] = record.kernel_name;
@@ -41,6 +42,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             return result;
         }, pybind11::arg("closing") = false)
         .def("synchronize", &KernelTrace::Synchronize, pybind11::call_guard<pybind11::gil_scoped_release>());
+    // Thread-local Host context; Reserve snapshots it before device launch.
+    m.def("exchange_kernel_trace_metadata", [](pybind11::dict fields) {
+        ascend_deepep::trace::TraceMetadata metadata;
+        for (const auto& item : fields) {
+            const auto key = pybind11::cast<std::string>(item.first);
+            if (pybind11::isinstance<pybind11::str>(item.second))
+                metadata.labels[key] = pybind11::cast<std::string>(item.second);
+            else
+                metadata.values[key] = pybind11::cast<int64_t>(item.second);
+        }
+        const auto previous = ascend_deepep::trace::ExchangeTraceMetadata(
+            std::make_shared<const ascend_deepep::trace::TraceMetadata>(std::move(metadata)));
+        pybind11::dict result;
+        if (previous) {
+            for (const auto& item : previous->values) result[pybind11::str(item.first)] = item.second;
+            for (const auto& item : previous->labels) result[pybind11::str(item.first)] = item.second;
+        }
+        return result;
+    });
     m.def("get_kernel_trace", &KernelTrace::Open);
     m.def("get_shmem_unique_id" , &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);

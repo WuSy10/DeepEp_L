@@ -17,14 +17,80 @@ KERNEL_OPS = {
 }
 
 
+METADATA_FIELDS = (
+    "metadata_version",
+    "comm_id",
+    "buffer_id",
+    "process_id",
+    "hostname",
+    "ep_size",
+    "api_name",
+    "api_call_id",
+    "handle_id",
+    "hidden_size",
+    "element_bytes",
+    "dtype",
+    "num_experts",
+    "topk",
+    "num_tokens",
+    "api_input_rows",
+    "cached",
+    "do_expand",
+    "token_capacity",
+    "pid",
+    "device",
+    "stream",
+)
+
+
+def metadata_identity(row):
+    keys = METADATA_FIELDS + ("global_rank", "kernel_input_rows", "kernel_output_rows")
+    return tuple((key, row.get(key)) for key in keys)
+
+
+def validate_metadata(row, ranks, where):
+    if any(key not in row for key in METADATA_FIELDS):
+        raise ValueError(f"{where}: missing Host metadata")
+    if (
+        row["metadata_version"] != 1
+        or row["ep_size"] != ranks
+        or row["api_name"] not in ("dispatch", "combine")
+        or any(not row[key] for key in ("comm_id", "process_id", "hostname", "dtype"))
+        or any(
+            row[key] <= 0
+            for key in ("buffer_id", "api_call_id", "handle_id", "hidden_size", "element_bytes", "num_experts", "topk")
+        )
+        or row["num_tokens"] < 0
+        or row["api_input_rows"] < 0
+        or row["cached"] not in (0, 1)
+        or row["do_expand"] not in (0, 1)
+        or not str(row["stream"]).isdigit()
+        or int(row["stream"]) <= 0
+    ):
+        raise ValueError(f"{where}: invalid Host metadata")
+    if row["op_name"] in ("dispatch", "combine"):
+        if any(key not in row or row[key] < 0 for key in ("kernel_input_rows", "kernel_output_rows")):
+            raise ValueError(f"{where}: missing kernel row counts")
+    expected = "combine" if "combine" in row["op_name"] else "dispatch"
+    if row["api_name"] != expected:
+        raise ValueError(f"{where}: wrong API association")
+
+
 def identity(row):
-    return tuple(row[key] for key in ("rank", "local_instance", "launch_ns", "op_name", "kernel_name", "aiv"))
+    return (
+        tuple(row[key] for key in ("rank", "local_instance", "launch_ns", "op_name", "kernel_name", "aiv")),
+        metadata_identity(row),
+    )
 
 
-def check(directory, ranks, require_ops=(), require_reuse=False):
+def check(directory, ranks, require_ops=(), require_reuse=False, require_metadata=False):
     observed = set()
     completed = 0
     rank_ops = {}
+    calls = {}
+    handles = {}
+    comm_ranks = {}
+    buffer_comms = {}
     paths = sorted(directory.glob("kernel-*.jsonl"))
     if not paths:
         raise ValueError(f"no trace files in {directory}")
@@ -54,6 +120,26 @@ def check(directory, ranks, require_ops=(), require_reuse=False):
                         or not 1 <= row["aiv"] <= 64
                     ):
                         raise ValueError(f"{where}: invalid launch")
+                    if require_metadata or "metadata_version" in row:
+                        validate_metadata(row, ranks, where)
+                        comm_ranks.setdefault(row["comm_id"], set()).add(row["rank"])
+                        buffer_key = (row["process_id"], row["buffer_id"])
+                        if buffer_key in buffer_comms and buffer_comms[buffer_key] != row["comm_id"]:
+                            raise ValueError(f"{where}: Buffer communication identity changed")
+                        buffer_comms[buffer_key] = row["comm_id"]
+                        call_key = (row["process_id"], row["api_call_id"])
+                        call_fields = tuple((key, row.get(key)) for key in METADATA_FIELDS if key not in ("stream",))
+                        if call_key in calls and calls[call_key] != call_fields:
+                            raise ValueError(f"{where}: API metadata changed within one call")
+                        calls[call_key] = call_fields
+                        handle_key = (row["process_id"], row["handle_id"])
+                        route = tuple(
+                            row[key]
+                            for key in ("comm_id", "buffer_id", "num_experts", "topk", "num_tokens", "do_expand")
+                        )
+                        if handle_key in handles and handles[handle_key] != route:
+                            raise ValueError(f"{where}: handle routing metadata changed")
+                        handles[handle_key] = route
                     launches[gid] = identity(row)
                 elif kind == "end":
                     gid = row["gid"]
@@ -91,6 +177,10 @@ def check(directory, ranks, require_ops=(), require_reuse=False):
         missing = set(require_ops) - ops
         if missing:
             raise ValueError(f"rank {rank}: missing operations {sorted(missing)}")
+    if require_metadata:
+        for comm_id, members in comm_ranks.items():
+            if members != set(range(ranks)):
+                raise ValueError(f"communication group {comm_id}: missing ranks, got {sorted(members)}")
     return completed
 
 
@@ -100,7 +190,8 @@ if __name__ == "__main__":
     parser.add_argument("--ranks", type=int, required=True)
     parser.add_argument("--require-ops", nargs="+", choices=sorted(set(KERNEL_OPS.values())), default=[])
     parser.add_argument("--require-reuse", action="store_true")
+    parser.add_argument("--require-metadata", action="store_true")
     args = parser.parse_args()
     print(
-        f"verified {check(args.directory, args.ranks, args.require_ops, args.require_reuse)} completed kernel records"
+        f"verified {check(args.directory, args.ranks, args.require_ops, args.require_reuse, args.require_metadata)} completed kernel records"
     )

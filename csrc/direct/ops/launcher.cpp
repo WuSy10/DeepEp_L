@@ -30,9 +30,11 @@ uint8_t* OptionalTensorPtr(const c10::optional<torch::Tensor>& tensor)
 // Use a launch-local tiling copy: notify and communication must never share a ticket.
 template <class Tiling, class Launch>
 void TraceLaunch(ascend_deepep::trace::KernelTrace* sink, Tiling tiling, const char* op_name,
-                 const char* kernel_name, Launch launch)
+                 const char* kernel_name, Launch launch, int64_t input_rows = -1, int64_t output_rows = -1)
 {
-    const auto ticket = sink ? sink->Reserve(tiling.rank, tiling.instance_id, tiling.block_dim, op_name, kernel_name)
+    const auto ticket = sink ? sink->Reserve(tiling.rank, tiling.instance_id, tiling.block_dim, op_name, kernel_name,
+                                              reinterpret_cast<uint64_t>(GetCurrentAclStream()), tiling.world_size,
+                                              input_rows, output_rows)
                              : ascend_deepep::trace::KernelTrace::Ticket{};
     tiling.kernel_trace_slot = ticket.address;
     tiling.kernel_trace_seq = ticket.sequence;
@@ -138,7 +140,7 @@ void LaunchV1DispatchKernel(
                 BytePtr(channel_prefix_matrix.data_ptr()), BytePtr(recv_channel_prefix_matrix.data_ptr()),
                 BytePtr(recv_src_idx.data_ptr()), BytePtr(send_head.data_ptr()), OptionalTensorPtr(dispatch_plan),
                 reinterpret_cast<uint8_t*>(&td), ffts_addr);
-        });
+        }, x.size(0), recv_x.size(0));
     } else {
         v1_dispatch_kernel_do(
             tiling.block_dim, stream, BytePtr(x.data_ptr()), OptionalTensorPtr(x_scales), OptionalTensorPtr(topk_idx),
@@ -212,7 +214,7 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
                           BytePtr(send_head.data_ptr()), BytePtr(symmetric_buffer), BytePtr(recv_x.data_ptr()),
                           OptionalTensorPtr(recv_topk_weights),
                           reinterpret_cast<uint8_t*>(&td), ffts_addr);
-    });
+    }, x.size(0), recv_x.size(0));
 }
 
 void LaunchExpandKernel(torch::Tensor x, const c10::optional<torch::Tensor>& x_scales,
