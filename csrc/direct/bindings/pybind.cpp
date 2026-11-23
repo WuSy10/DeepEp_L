@@ -29,6 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.attr("kernel_trace_diagnostic_version") = 4;
     m.attr("host_dispatch_probe_version") = 3;
+    m.attr("kernel_trace_metadata_version") = 2;
     m.def("check_host_dispatch_gil_probe", []() {
         const int held = ProbePythonGil();
         int released;
@@ -101,9 +102,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         return Snapshot{value};
     }, pybind11::arg("fields"), pybind11::arg("parent") = Snapshot{});
     m.def("push_trace_metadata", [](const Snapshot& base, int64_t api, int64_t handle) {
-        auto value = std::make_shared<ascend_deepep::trace::TraceMetadata>();
-        value->parent = base.value;
-        value->values = {{"api_call_id", api}, {"handle_id", handle}};
+        auto value = ascend_deepep::trace::MakeCallMetadata(base.value, api, handle);
         return Snapshot{ascend_deepep::trace::ExchangeTraceMetadata(value)};
     });
     m.def("restore_trace_metadata", [](const Snapshot& previous) {

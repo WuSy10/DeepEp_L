@@ -15,8 +15,11 @@ struct TraceMetadata {
     std::shared_ptr<const TraceMetadata> parent;
     std::map<std::string, int64_t> values;
     std::map<std::string, std::string> labels;
+    bool has_call_ids = false;
+    int64_t api_call_id = 0, handle_id = 0;
 };
 using TraceMetadataSnapshot = std::shared_ptr<const TraceMetadata>;
+TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle);
 TraceMetadataSnapshot CurrentTraceMetadata();
 TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata);
 class ScopedTraceMetadata {

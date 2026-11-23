@@ -242,7 +242,13 @@ int main(){
         call.labels["comm_id"] = "test-comm";
         KernelTrace::Ticket ticket;
         {
-            ScopedTraceMetadata scope(std::make_shared<const TraceMetadata>(call));
+            call.values["api_call_id"] = -7; // Dynamic scalars must override the parent map.
+            auto dynamic=MakeCallMetadata(std::make_shared<const TraceMetadata>(call), round+1, 10000+round);
+            assert(dynamic->values.empty() && dynamic->labels.empty());
+            ScopedTraceMetadata scope(dynamic);
+            ConfigureHostDispatchProbe(1, &fake_gil);
+            {HostDispatchProbe p(0,false); p.Finish();}
+            assert(TakeHostDispatchProbe().samples[0].api_call_id==round+1);
             ticket=sink->Reserve(0,0,2,ops[kind],kernels[kind],12345); assert(ticket.address);
         }
         assert(CurrentTraceMetadata()->values.at("api_call_id") == 999);
@@ -265,6 +271,7 @@ int main(){
         auto done=sink->Drain();assert(done.size()==1 && done[0].event=="end");
         assert(done[0].op_name==ops[kind] && done[0].kernel_name==kernels[kind]);
         assert(done[0].values.at("api_call_id")==round+1);
+        assert(done[0].values.at("handle_id")==10000+round);
         assert(done[0].labels.at("comm_id")=="test-comm");
         assert(done[0].labels.at("inherited")=="parent");
         assert(done[0].labels.at("stream")=="12345");
@@ -472,6 +479,7 @@ class MetadataTensor:
 
 class MetadataNative:
     kernel_trace_diagnostic_version = 4
+    kernel_trace_metadata_version = 2
 
     def __init__(self):
         self.context = threading.local()
@@ -573,6 +581,51 @@ def test_metadata_cache_shape_changes_and_eviction():
         assert native.context.fields is saved
         assert saved["hidden_size"] == 128
     assert native.context.fields == {}
+
+
+def test_metadata_scalar_shape_cache_and_view_lifetime():
+    import weakref
+    import gc
+
+    module = load_trace_module()
+    native = MetadataNative()
+    session = module.KernelTraceSession(native, "comm", 4)
+
+    class Tensor(MetadataTensor):
+        element_queries = 0
+
+        def size(self, dim):
+            raise AssertionError("metadata should use one shape snapshot")
+
+        def element_size(self):
+            self.element_queries += 1
+            return 2 if self.dtype == "torch.bfloat16" else 4
+
+    x, routes = Tensor(32, 128), Tensor(32, 8)
+    with session.call("dispatch", x, routes, 128) as saved:
+        original = dict(saved)
+    for _ in range(10):
+        with session.call("dispatch", x, routes, 128):
+            pass
+    assert x.element_queries == 1 and native.templates == 2
+    x.shape = (64, 256)
+    x.dtype = "torch.float32"
+    with session.call("dispatch", x, routes, 128) as changed:
+        assert changed["api_input_rows"] == 64 and changed["hidden_size"] == 256
+        assert changed["element_bytes"] == 4
+    assert x.element_queries == 2 and dict(saved) == original
+    refs = weakref.ref(x), weakref.ref(routes)
+    del x, routes
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+    assert dict(saved) == original
+
+
+def test_metadata_rejects_old_native_extension():
+    native = MetadataNative()
+    native.kernel_trace_metadata_version = 1
+    with pytest.raises(RuntimeError, match="version 2"):
+        load_trace_module().KernelTraceSession(native, "comm", 4)
 
 
 def test_trace_group_initialization(monkeypatch):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import atexit
 from contextlib import contextmanager
-from collections import ChainMap
+from collections.abc import Mapping
 import itertools
 import json
 import os
@@ -286,10 +286,39 @@ def _global_rank():
     return dist.get_rank() if dist.is_available() and dist.is_initialized() else None
 
 
+class _CallMetadata(Mapping):
+    """Lazy read-only mapping; no per-call dict/ChainMap and no tensor ownership."""
+
+    __slots__ = ("api", "handle", "template", "base")
+
+    def __init__(self, api, handle, template, base):
+        self.api, self.handle, self.template, self.base = api, handle, template, base
+
+    def __getitem__(self, key):
+        if key == "api_call_id":
+            return self.api
+        if key == "handle_id":
+            return self.handle
+        if key in self.template:
+            return self.template[key]
+        return self.base[key]
+
+    def __iter__(self):
+        yield "api_call_id"
+        yield "handle_id"
+        yield from (k for k in self.template if k not in ("api_call_id", "handle_id"))
+        yield from (k for k in self.base if k not in self.template and k not in ("api_call_id", "handle_id"))
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+
 class KernelTraceSession:
     """Host-only metadata for one Buffer; each call is snapshotted by native Reserve."""
 
     def __init__(self, native, comm_id, ep_size, global_rank=None):
+        if getattr(native, "kernel_trace_metadata_version", 0) != 2:
+            raise RuntimeError("KernelTrace metadata requires the matching rebuilt native extension (version 2)")
         self.native = native
         self.diagnostic_mode, self.diagnostic_timing = diagnostic_config()
         if self.diagnostic_mode == "record_only":
@@ -307,6 +336,7 @@ class KernelTraceSession:
             self.fields["global_rank"] = global_rank
         self._base = native.make_trace_metadata(self.fields)
         self._templates = {}
+        self._element_bytes = {}
 
     @contextmanager
     def call(
@@ -321,18 +351,26 @@ class KernelTraceSession:
                 handle_id = next(_identities)
                 if handle is not None:
                     handle._trace_handle_id = handle_id
+            api_call_id = next(_identities)
         # Cache by scalar shape/context only; never retain user tensors or handles.
         if _probe is not None:
             _probe.mark("identity_done")
+        x_shape, route_shape, dtype = x.shape, routes.shape, x.dtype
+        element_bytes = self._element_bytes.get(dtype)
+        if element_bytes is None:
+            element_bytes = x.element_size()
+            if len(self._element_bytes) >= 64:
+                self._element_bytes.clear()
+            self._element_bytes[dtype] = element_bytes
         key = (
             api_name,
-            x.size(1),
-            x.element_size(),
-            x.dtype,
+            x_shape[1],
+            element_bytes,
+            dtype,
             int(num_experts),
-            routes.size(1),
-            routes.size(0),
-            x.size(0),
+            route_shape[1],
+            route_shape[0],
+            x_shape[0],
             int(cached),
             int(expanded),
             int(capacity),
@@ -366,10 +404,10 @@ class KernelTraceSession:
             self._templates[key] = template
         if _probe is not None:
             _probe.mark("template_done")
-        dynamic = dict(api_call_id=_next_identity(), handle_id=handle_id)
+        fields_view = _CallMetadata(api_call_id, handle_id, template[0], self.fields)
         if _probe is not None:
             _probe.mark("dynamic_ready")
-        previous = self.native.push_trace_metadata(template[1], dynamic["api_call_id"], handle_id)
+        previous = self.native.push_trace_metadata(template[1], api_call_id, handle_id)
         if _probe is not None:
             _probe.mark("push_done")
         if self.diagnostic_mode:
@@ -379,7 +417,7 @@ class KernelTraceSession:
             if self.diagnostic_timing:
                 stats["enter_ns"] += time.perf_counter_ns() - started
         try:
-            yield ChainMap(dynamic, template[0], self.fields)
+            yield fields_view
         finally:
             if _probe is not None:
                 _probe.mark("restore_begin")

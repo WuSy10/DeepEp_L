@@ -108,6 +108,15 @@ TraceMetadataSnapshot CurrentTraceMetadata()
 {
     return active_metadata;
 }
+TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle)
+{
+    auto value = std::make_shared<TraceMetadata>();
+    value->parent = std::move(parent);
+    value->has_call_ids = true;
+    value->api_call_id = api;
+    value->handle_id = handle;
+    return value;
+}
 TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata)
 {
     std::swap(metadata, active_metadata);
@@ -262,6 +271,7 @@ HostDispatchProbe::HostDispatchProbe(int rank, bool cached)
     host_probe.active = this;
     Mark(DispatchProbePoint::NativeEntry);
     for (auto metadata = CurrentTraceMetadata(); metadata; metadata = metadata->parent) {
+        if (metadata->has_call_ids) { sample_.api_call_id = metadata->api_call_id; break; }
         auto found = metadata->values.find("api_call_id");
         if (found != metadata->values.end()) { sample_.api_call_id = found->second; break; }
     }
@@ -358,6 +368,10 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
         if (slot.input_rows >= 0) record.values["kernel_input_rows"] = slot.input_rows;
         if (slot.output_rows >= 0) record.values["kernel_output_rows"] = slot.output_rows;
         for (auto metadata = slot.metadata; metadata; metadata = metadata->parent) {
+            if (metadata->has_call_ids) {
+                record.values.emplace("api_call_id", metadata->api_call_id);
+                record.values.emplace("handle_id", metadata->handle_id);
+            }
             record.values.insert(metadata->values.begin(), metadata->values.end());
             record.labels.insert(metadata->labels.begin(), metadata->labels.end());
         }
