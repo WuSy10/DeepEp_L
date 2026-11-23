@@ -637,6 +637,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         (!host_poll || std::strcmp(host_poll, "1") == 0)) {
         tiling.notify_host_counts = reinterpret_cast<uint64_t>(shmem.PrepareNotifyHostCounts(1 + num_local_experts));
     }
+    if (tiling.notify_host_counts && !cached_mode && !capturing) {
+        tiling.notify_probe_slot = probe.NotifyAddress();
+        tiling.notify_probe_seq = probe.NotifySequence();
+    }
     probe.Mark(ProbePoint::NotifyBegin);
     if (cached_mode) {
         LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr(), !capturing && use_udma ? trace_sink : nullptr);

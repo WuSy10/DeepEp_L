@@ -45,12 +45,14 @@ struct HostDispatchSample {
     int64_t api_call_id;
     bool success;
     std::array<int64_t, kDispatchProbePoints> ticks, gil;
+    uint64_t notify_address = 0, notify_sequence = 0, notify_done = 0;
+    std::array<uint64_t, 4> notify_ticks{};
 };
 struct HostDispatchReport {
     std::vector<HostDispatchSample> samples;
     uint64_t dropped;
 };
-void ConfigureHostDispatchProbe(std::size_t capacity, int (*gil_state)());
+void ConfigureHostDispatchProbe(std::size_t capacity, int (*gil_state)(), bool device_timing = false);
 HostDispatchReport TakeHostDispatchProbe();
 class HostDispatchProbe {
 public:
@@ -61,6 +63,8 @@ public:
     void Mark(DispatchProbePoint point) { if (enabled_) MarkEnabled(point); }
     void SetWaitPath(int path) { if (enabled_) sample_.wait_path = path; }
     void Finish() { if (enabled_) sample_.success = true; }
+    uint64_t NotifyAddress();
+    uint64_t NotifySequence() const { return enabled_ ? sample_.notify_sequence : 0; }
     bool Has(DispatchProbePoint point) const { return enabled_ && sample_.ticks[static_cast<unsigned>(point)] >= 0; }
 private:
     void MarkEnabled(DispatchProbePoint point);

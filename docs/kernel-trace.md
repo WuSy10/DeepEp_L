@@ -315,7 +315,7 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselin
     --output "$PWD/trace_host_counts_$(date +%Y%m%d_%H%M%S)"
 ```
 
-六轮共 24 次进程组初始化，每个模式（包括 off）均启用相同探针，保留相邻独立 off 和交替顺序。需要重新编译 Host 扩展：`host_dispatch_probe_version=1`；采集诊断接口版本仍为 4。每 rank 导出 622 次原生 dispatch 调用，fresh/cached 各 311 次，分别标记精度、预热、稳态窗口及窗口内序号。每种 API 的 300 次稳态样本用于分段汇总，不把同一进程内的样本当作 300 次独立实验。
+六轮共 24 次进程组初始化，每个模式（包括 off）均启用相同探针，保留相邻独立 off 和交替顺序。需要重新编译 Host 扩展：`host_dispatch_probe_version=2`；采集诊断接口版本仍为 4。每 rank 导出 622 次原生 dispatch 调用，fresh/cached 各 311 次，分别标记精度、预热、稳态窗口及窗口内序号。每种 API 的 300 次稳态样本用于分段汇总，不把同一进程内的样本当作 300 次独立实验。
 
 | 分段 | 含义 |
 | --- | --- |
@@ -341,6 +341,35 @@ GIL 状态通过当前线程的 `PyGILState_Check()` 获取，不使用 heartbea
 先逐 rank、逐轮检查 `counts_wait` 是否随采集开启而增加，再比较 `outputs_prepare` 和 `wait_end_to_dispatch`。GIL 为 0 时不能将等待增长归因于业务线程持有 GIL；仍可能存在 CPU 调度或设备计数发布延迟。GIL 为 1 也仅说明持有状态，不能单凭此证明它解释了全部劣化。
 
 `diagnosis.json` 将该运行标记为 `instrumented=true, performance_acceptance=false`。探针本身有开销，因此该运行只用于定位，不能作为 <1% 验收或与先前未插桩耗时直接相减。控制器校验 GIL 自检、样本数量、阶段顺序、实际等待路径和零丢样；CPU 回归还覆盖关闭时无探针调用、容量溢出、异常退出及错误证据拒绝。
+
+### Notify 计数发布的设备分段
+
+在上述命令中增加 `--notify-device-timing`，其余参数不变。这是独立的第二轮定位：所有模式（包括 off）增加同样的设备诊断，不能与未加此选项的历史结果直接相减。必须同时启用 `--host-dispatch-timing`；Host 和 device 均须重新构建，因为 `DispatchTilingData` 新增了诊断地址和序号，原有运行时 ABI 大小检查仍然生效。
+
+只在 fresh 的映射计数发布路径启用，cached、固定容量和图捕获不打这些点。测试遇到 fresh 回退到 `Tensor.cpu()` 会拒绝结果，而不是悄悄缺失设备样本。每条 Host 样本新增 `notify_device`：
+
+| tick | core 0 的观察位置 |
+| --- | --- |
+| `entry` | notify 初始化上下文之后、算法主体之前，与原有 trace 起点一致 |
+| `counts_ready` | 原有本地全核同步之后、准备向 Host 发布计数之前 |
+| `publish_begin` | 第一批计数的 DataCopyPad 提交之前，已完成打包及 V_MTE3 等待 |
+| `publish_end` | 第一批计数拷贝的原有 MTE3_S 等待完成之后 |
+
+第一批包含总接收计数，也可能包含全部专家计数，因此最后一个区间不是单个 4 字节计数的传输时间。`entry→counts_ready` 包含 notify 中的计算、访存和同步等待，不能单独称为计算成本。`publish_end` 不是 CPU 实际读到计数的时刻，也不是整个 notify 结束时刻。
+
+导出 `device_entry_to_counts_ready`、`device_count_pack`、`device_first_count_copy`、`device_entry_to_publish_begin/end` 的同卡 tick 差。当前 Ascend950 使用 1 GHz 系统计数器，差值单位为 ns；与 Host `counts_wait` 分别比较各模式的增量，不跨时钟直接相减，不据此计算精确的“发布到 CPU 观察”延迟。
+
+内存与同步约定：
+
+- 初始化时分配独立 Host 映射区，每个原生调用保留 256 字节，当前 622 条共 159232 字节/rank。它不改变普通 trace 的 128 槽容量。
+- 只有 core 0 写本次调用的独占地址：偏移 0 写四个 uint64 tick（32 字节），偏移 128 写本轮 `done_seq`（32 字节）。不在诊断运行内复用地址，序号为该 Host 样本的 ordinal。
+- 四个时间戳先保存在标量中。原有计数发布循环全部完成后，才复用已排空、32 字节对齐的 accumulator UB 前 32 字节；沿用 S_MTE3/MTE3_S 发布 payload，再发布 done_seq。不增加全卡或全核同步。
+- 普通采集线程不扫描这个诊断区，CPU 业务不等待诊断 done_seq。所有计时窗口结束后显式导出，设备同步后核对序号、读取并释放映射区；异常清理同样先确保设备不再写入。
+- 新增 tick 和两次 32 字节诊断写入仍可能扰动 notify 尾部及后续调用，只能用于定位。不能以“异步”宣称零开销。
+
+分析优先逐 rank、逐轮、逐窗口比较 Host `native_prepare`、`notify_launch_call`、`counts_wait` 和设备上述区间。若设备 `entry→publish_begin` 也明显增长，继续定位 notify 内部及对端到达；若设备区间不增长而 Host 等待增长，仍需区分 kernel 入队/启动、CPU 进入等待时刻变化和 CPU 观察调度，不能直接断言是 CPU 调度。
+
+CPU 测试覆盖序号不匹配、漏报、时间倒序、cached 意外报告及回读路径误用；Linux 原生协议测试模拟独立槽写入、完成标志和重新配置后的清零。模拟不替代真实设备的编译、精度和内存可见性验证。
 
 ## 元数据缓存与原生批量编码的验证
 

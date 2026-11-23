@@ -103,8 +103,9 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         return;
     }
 
-    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
+    const bool notify_probe = tiling.notify_probe_slot != 0 && core_idx == 0;
+    const uint64_t trace_start = (tiling.kernel_trace_slot || notify_probe) ? AscendC::GetSystemCycle() : 0;
     const int32_t core_num = get_block_num() * get_subblockdim();
     const int32_t rank = static_cast<int32_t>(tiling.rank);
     const int32_t world_size = static_cast<int32_t>(tiling.world_size);
@@ -524,6 +525,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     AscendC::SyncAll<true>();
 
     if (tiling.notify_host_counts != 0 && core_idx == 0) {
+        const uint64_t counts_ready = notify_probe ? AscendC::GetSystemCycle() : 0;
+        uint64_t publish_begin = 0, publish_end = 0;
         // The mapped host address is only accessed by MTE3. Core 0 owns all
         // slots and reuses its aligned accumulator after the local barrier.
         AscendC::GlobalTensor<uint32_t> host_counts_gm;
@@ -541,10 +544,21 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
             AscendC::DataCopyExtParams copy(1, length * kNotifyInt32Bytes, 0, 0, 0);
+            if (notify_probe && offset == 0) publish_begin = AscendC::GetSystemCycle();
             AscendC::DataCopyPad(host_counts_gm[offset], packed_ub, copy);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+            if (notify_probe && offset == 0) publish_end = AscendC::GetSystemCycle();
             offset += length;
+        }
+        if (notify_probe) {
+            // All count stores have completed. Core 0 alone owns this diagnostic slot.
+            // Reuse the drained, aligned accumulator; payload precedes done_seq.
+            auto scratch = packed_ub.ReinterpretCast<uint64_t>();
+            ascend_deepep::trace::PublishTraceTick(tiling.notify_probe_slot, scratch, trace_start,
+                                                  counts_ready, publish_begin, publish_end);
+            ascend_deepep::trace::PublishTraceTick(
+                tiling.notify_probe_slot + ascend_deepep::trace::kLineBytes, scratch, tiling.notify_probe_seq);
         }
     }
     if (tiling.v2_rank_prefix != 0 && core_idx == 0) {

@@ -6,15 +6,16 @@ namespace ascend_deepep::trace {
 using namespace AscendC;
 // Trace publication reuses the first 32 UB bytes after the final reader.
 // MTE3_S drains the tick payload before publishing the generation marker.
-__aicore__ inline void PublishTraceTick(uint64_t address, LocalTensor<uint64_t> scratch, uint64_t tick, uint64_t end = 0)
+__aicore__ inline void PublishTraceTick(uint64_t address, LocalTensor<uint64_t> scratch, uint64_t tick, uint64_t end = 0,
+                                      uint64_t third = 0, uint64_t fourth = 0)
 {
     GlobalTensor<uint64_t> output;
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(address), 4);
     output.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
     scratch.SetValue(0, tick);
     scratch.SetValue(1, end);
-    scratch.SetValue(2, 0);
-    scratch.SetValue(3, 0);
+    scratch.SetValue(2, third);
+    scratch.SetValue(3, fourth);
     SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
     DataCopy(output, scratch, 4);

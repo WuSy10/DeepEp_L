@@ -187,6 +187,29 @@ int main(){
     ConfigureHostDispatchProbe(1, &fake_gil);
     try {HostDispatchProbe p(0,false); p.Finish(); throw std::runtime_error("test");} catch (...) {}
     assert(!TakeHostDispatchProbe().samples[0].success && !CurrentHostDispatchProbe());
+    ConfigureHostDispatchProbe(2, &fake_gil, true);
+    uint64_t first_address=0;
+    for (int i=0;i<2;++i) {
+        HostDispatchProbe p(0,false);
+        auto address=p.NotifyAddress();
+        if (i==0) first_address=address;
+        else assert(address-first_address==kCoreBytes);
+        auto* ticks=reinterpret_cast<uint64_t*>(address);
+        ticks[0]=10; ticks[1]=20; ticks[2]=30; ticks[3]=40;
+        ticks[kLineBytes/sizeof(uint64_t)]=p.NotifySequence();
+        p.Finish();
+    }
+    auto device_report=TakeHostDispatchProbe();
+    assert(device_report.samples.size()==2);
+    for (int i=0;i<2;++i) {
+        assert(device_report.samples[i].notify_sequence==uint64_t(i+1));
+        assert(device_report.samples[i].notify_done==uint64_t(i+1));
+        assert(device_report.samples[i].notify_ticks[3]==40);
+    }
+    ConfigureHostDispatchProbe(1, &fake_gil, true);
+    {HostDispatchProbe p(0,false); (void)p.NotifyAddress(); p.Finish();}
+    auto missing=TakeHostDispatchProbe();
+    assert(missing.samples[0].notify_done==0 && missing.samples[0].notify_ticks[0]==0);
     setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata", 1);
     assert(!KernelTrace::Open()); // No collector/calibration for Host-only metadata.
     unsetenv("DEEPEP_TRACE_DIAGNOSTIC_MODE");
@@ -741,6 +764,14 @@ HOST_DISPATCH_INTERVALS = {
     "dispatch_launch_call": ("dispatch_begin", "dispatch_end"),
     "native_scope": ("native_entry", "native_exit"),
 }
+NOTIFY_DEVICE_POINTS = ("entry", "counts_ready", "publish_begin", "publish_end")
+NOTIFY_DEVICE_INTERVALS = {
+    "device_entry_to_counts_ready": ("entry", "counts_ready"),
+    "device_count_pack": ("counts_ready", "publish_begin"),
+    "device_first_count_copy": ("publish_begin", "publish_end"),
+    "device_entry_to_publish_begin": ("entry", "publish_begin"),
+    "device_entry_to_publish_end": ("entry", "publish_end"),
+}
 
 
 def validate_host_dispatch_report(report, args, rank):
@@ -798,17 +829,36 @@ def validate_host_dispatch_report(report, args, rank):
             for name, (a, b) in HOST_DISPATCH_INTERVALS.items()
             if ticks[a] >= 0 and ticks[b] >= 0
         }
+        device = row.get("notify_device", {})
+        if args.notify_device_timing and not cached:
+            if path != 1:
+                raise ValueError("notify device timing requires mapped count publication")
+            if device.get("sequence") != ordinal or device.get("done_seq") != ordinal:
+                raise ValueError("missing or stale notify device completion")
+            values = [device.get(p) for p in NOTIFY_DEVICE_POINTS]
+            if any(type(v) is not int or v <= 0 for v in values) or values != sorted(values):
+                raise ValueError("invalid notify device ticks")
+            # Ascend950 system counter is 1 GHz. Only subtract ticks on the same device.
+            row["durations_ns"].update(
+                {name: device[b] - device[a] for name, (a, b) in NOTIFY_DEVICE_INTERVALS.items()}
+            )
+        elif device.get("sequence", 0) or device.get("done_seq", 0):
+            raise ValueError("unexpected notify device probe")
     if seen != [per_kind, per_kind]:
         raise ValueError("Host dispatch call count mismatch")
     summary = {}
     for kind in PERF_OPS[:2]:
         steady = [r for r in rows if r["kind"] == kind and r["phase"] == "steady"]
         durations = {}
-        for name in HOST_DISPATCH_INTERVALS:
+        for name in (*HOST_DISPATCH_INTERVALS, *NOTIFY_DEVICE_INTERVALS):
             values = sorted(r["durations_ns"][name] for r in steady if name in r["durations_ns"])
             if values:
                 durations[name] = dict(
-                    count=len(values), median_ns=statistics.median(values), min_ns=values[0], max_ns=values[-1]
+                    count=len(values),
+                    mean_ns=statistics.mean(values),
+                    median_ns=statistics.median(values),
+                    min_ns=values[0],
+                    max_ns=values[-1],
                 )
         summary[kind] = dict(
             durations=durations,
@@ -822,6 +872,8 @@ def validate_host_dispatch_report(report, args, rank):
         )
     report["steady_summary"] = summary
     report["clock"] = "C++ steady_clock nanoseconds; not CPU wall time or NPU time"
+    report["notify_device_timing"] = args.notify_device_timing
+    report["notify_tick_hz"] = 1000000000
     return report
 
 
@@ -847,6 +899,12 @@ def make_host_probe_report(args, rank=0, path=1, gil_state=1):
                     gil_held={p: gil_state if ticks[p] >= 0 else -1 for p in HOST_DISPATCH_POINTS},
                 )
             )
+            if args.notify_device_timing and not cached:
+                rows[-1]["notify_device"] = dict(
+                    sequence=ordinal,
+                    done_seq=ordinal,
+                    **{p: ordinal * 100 + i * 10 for i, p in enumerate(NOTIFY_DEVICE_POINTS)},
+                )
     return dict(
         version=1,
         dropped=0,
@@ -905,6 +963,37 @@ def test_host_dispatch_pending_is_an_observation(pending):
             row["steady_ns"]["first_pending"] = -1 if pending == "absent" else row["steady_ns"]["first_count_ready"] + 1
             row["gil_held"]["first_pending"] = -1 if pending == "absent" else 1
     validate_host_dispatch_report(report, args, 0)
+
+
+@pytest.mark.parametrize("corruption", [None, "missing", "stale", "order", "fallback", "cached"])
+def test_notify_device_publication_evidence(corruption):
+    args = npu_parser().parse_args(["--output", "unused", "--notify-device-timing"])
+    report = make_host_probe_report(args)
+    row = report["samples"][0]
+    if corruption == "missing":
+        row.pop("notify_device")
+    elif corruption == "stale":
+        row["notify_device"]["done_seq"] = 999
+    elif corruption == "order":
+        row["notify_device"]["publish_begin"] = 1
+    elif corruption == "fallback":
+        report = make_host_probe_report(args, path=2)
+    elif corruption == "cached":
+        report["samples"][-1]["notify_device"] = row["notify_device"]
+    if corruption:
+        with pytest.raises(ValueError):
+            validate_host_dispatch_report(report, args, 0)
+    else:
+        validate_host_dispatch_report(report, args, 0)
+        summary = report["steady_summary"]["fresh_dispatch"]["durations"]
+        assert summary["device_entry_to_publish_end"]["mean_ns"] == 30
+        assert summary["device_first_count_copy"]["mean_ns"] == 10
+
+
+def test_notify_device_timing_requires_host_probe(tmp_path):
+    args = npu_parser().parse_args(["--notify-device-timing", "--diagnostic", "--output", str(tmp_path / "unused")])
+    with pytest.raises(ValueError, match="--notify-device-timing requires"):
+        run_npu_acceptance(args)
 
 
 @pytest.mark.parametrize("extra", [[], ["--diagnostic", "--diagnostic-timing"]])
@@ -1268,12 +1357,14 @@ def npu_worker(args):
         from deep_ep.backends.direct._native import load_native_module
 
         host_probe_native = load_native_module()
-        if getattr(host_probe_native, "host_dispatch_probe_version", 0) != 1:
+        if getattr(host_probe_native, "host_dispatch_probe_version", 0) != 2:
             raise RuntimeError("Host dispatch timing requires the matching rebuilt native extension")
         gil_control = host_probe_native.check_host_dispatch_gil_probe()
         if gil_control not in (dict(held_control=1, released_control=0), dict(held_control=-1, released_control=-1)):
             raise RuntimeError(f"GIL observation controls failed: {gil_control}")
-        host_probe_native.configure_host_dispatch_probe(2 * (1 + args.warmup + args.windows * args.iterations))
+        host_probe_native.configure_host_dispatch_probe(
+            2 * (1 + args.warmup + args.windows * args.iterations), args.notify_device_timing
+        )
 
     def dispatch(handle=None):
         return buffer.dispatch(
@@ -1374,6 +1465,7 @@ def npu_worker(args):
         windowed_collection=args.windowed_collection,
         collection_boundaries=boundaries,
         host_dispatch_timing=args.host_dispatch_timing,
+        notify_device_timing=args.notify_device_timing,
     )
     if deferred:
         manifest["deferred_evidence"] = dict(
@@ -1397,6 +1489,9 @@ def npu_parser():
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--diagnostic", action="store_true", help="layered attribution, not performance acceptance")
     parser.add_argument("--diagnostic-timing", action="store_true", help="separate instrumented run only")
+    parser.add_argument(
+        "--notify-device-timing", action="store_true", help="diagnostic core-0 notify publication ticks"
+    )
     parser.add_argument(
         "--host-dispatch-timing",
         action="store_true",
@@ -1479,6 +1574,8 @@ def run_npu_acceptance(args):
             raise ValueError("--windowed-collection requires --diagnostic")
         if args.host_dispatch_timing and (not args.diagnostic or args.diagnostic_timing):
             raise ValueError("--host-dispatch-timing requires --diagnostic without --diagnostic-timing")
+        if args.notify_device_timing and not args.host_dispatch_timing:
+            raise ValueError("--notify-device-timing requires --host-dispatch-timing")
         if args.diagnostic and args.diagnostic_timing and any(m in args.modes for m in ("production", "record_only")):
             raise ValueError("production control and record_only must run without --diagnostic-timing")
         required_slots = record_slot_requirement(args)
@@ -1535,6 +1632,8 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
         command.append("--windowed-collection")
     if args.host_dispatch_timing:
         command.append("--host-dispatch-timing")
+    if args.notify_device_timing:
+        command.append("--notify-device-timing")
     print(f"RUN {destination.name}", flush=True)
     with (destination / "run.log").open("w") as log:
         run_npu_process(command, destination, env, log, args.timeout)
@@ -1564,6 +1663,8 @@ def validate_diagnostic_trial(destination, manifests, args, mode):
     for rank, manifest in enumerate(manifests):
         if manifest.get("host_dispatch_timing", False) != args.host_dispatch_timing:
             raise ValueError("Host dispatch timing option was not applied")
+        if manifest.get("notify_device_timing", False) != args.notify_device_timing:
+            raise ValueError("notify device timing option was not applied")
         if args.host_dispatch_timing:
             validate_host_dispatch_report(
                 json.loads((destination / f"host_dispatch_rank{rank}.json").read_text()), args, rank
@@ -1720,6 +1821,7 @@ def _run_npu_diagnostic(args):
         performance_acceptance=False,
         instrumented=args.diagnostic_timing or args.host_dispatch_timing,
         host_dispatch_timing=args.host_dispatch_timing,
+        notify_device_timing=args.notify_device_timing,
         paired_baselines=args.paired_baselines,
         layer_increments=diagnostic_layer_increments(runs),
         attribution_note="Layer differences include overlap and scheduling; they are not exclusive component costs.",
@@ -1920,7 +2022,8 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
             assert report["comparisons"]["json"]["fresh_dispatch"]["median_percent"] == pytest.approx(40)
 
 
-def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize("device_timing", [False, True])
+def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkeypatch, device_timing):
     args = npu_parser().parse_args(
         [
             "--npu",
@@ -1943,9 +2046,11 @@ def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkey
             str(tmp_path / "host"),
         ]
     )
+    args.notify_device_timing = device_timing
 
     def launch(command, destination, env, log, timeout):
         assert "--host-dispatch-timing" in command and "--windowed-collection" in command
+        assert ("--notify-device-timing" in command) == device_timing
         mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if "DEEPEP_TRACE_DIR" in env else "off")
         count = len(boundary_labels(args))
         for rank in range(args.ep_size):
@@ -1956,6 +2061,7 @@ def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkey
                 trace_slots=128 if mode != "off" else 0,
                 metadata_statistics={},
                 host_dispatch_timing=True,
+                notify_device_timing=device_timing,
                 windowed_collection=True,
                 collection_boundaries=[dict(label=label, collect_ns=1) for label in boundary_labels(args)],
                 deferred_evidence=dict(thread_absent=True, drains_before_destroy=count, drains_after_destroy=count + 1),

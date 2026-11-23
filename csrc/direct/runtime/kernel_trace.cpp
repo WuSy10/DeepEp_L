@@ -22,12 +22,31 @@ namespace {
 constexpr size_t kSlotBytes = platform::kMaxNumAiv * kCoreBytes;
 std::atomic<uint64_t> next_sequence{1};
 thread_local TraceMetadataSnapshot active_metadata;
+struct NotifyProbeMemory {
+    void* host = nullptr;
+    void* mapped = nullptr;
+    aclrtContext context = nullptr;
+    ~NotifyProbeMemory()
+    {
+        if (!host) return;
+        aclrtContext previous = nullptr;
+        if (aclrtGetCurrentContext(&previous) != ACL_SUCCESS ||
+            aclrtSetCurrentContext(context) != ACL_SUCCESS || aclrtSynchronizeDevice() != ACL_SUCCESS) {
+            std::fprintf(stderr, "DeepEP notify probe cleanup failed; retaining device-accessible memory\n");
+            if (previous) (void)aclrtSetCurrentContext(previous);
+            return;
+        }
+        if (!mapped || aclrtHostUnregister(host) == ACL_SUCCESS) (void)aclrtFreeHost(host);
+        if (previous) (void)aclrtSetCurrentContext(previous);
+    }
+};
 struct HostProbeState {
     std::size_t capacity = 0;
     uint64_t ordinal = 0, dropped = 0;
     int (*gil_state)() = nullptr;
     HostDispatchProbe* active = nullptr;
     std::vector<HostDispatchSample> samples;
+    std::unique_ptr<NotifyProbeMemory> device;
 };
 thread_local HostProbeState host_probe;
 
@@ -168,24 +187,60 @@ void KernelTrace::Init(int device)
 
 }
 
-void ConfigureHostDispatchProbe(std::size_t capacity, int (*gil_state)())
+void ConfigureHostDispatchProbe(std::size_t capacity, int (*gil_state)(), bool device_timing)
 {
     if (host_probe.active) throw std::runtime_error("cannot configure an active Host dispatch probe");
+    if (host_probe.device) throw std::runtime_error("take previous notify device probe before configuring again");
     if (capacity > 1000000) throw std::runtime_error("Host dispatch probe capacity exceeds 1000000");
+    std::unique_ptr<NotifyProbeMemory> device;
+    if (device_timing && capacity) {
+        device = std::make_unique<NotifyProbeMemory>();
+        Check(aclrtGetCurrentContext(&device->context), "notify probe context");
+        Check(aclrtMallocHost(&device->host, capacity * kCoreBytes), "allocate notify probe");
+        std::memset(device->host, 0, capacity * kCoreBytes);
+        Check(aclrtHostRegister(device->host, capacity * kCoreBytes, ACL_HOST_REGISTER_MAPPED, &device->mapped),
+              "map notify probe");
+    }
     host_probe.samples.clear();
     host_probe.samples.reserve(capacity);
     host_probe.capacity = capacity;
     host_probe.ordinal = host_probe.dropped = 0;
     host_probe.gil_state = gil_state;
+    host_probe.device = std::move(device);
 }
 
 HostDispatchReport TakeHostDispatchProbe()
 {
     if (host_probe.active) throw std::runtime_error("cannot take an active Host dispatch probe");
+    if (host_probe.device) {
+        aclrtContext current{};
+        Check(aclrtGetCurrentContext(&current), "take notify probe context");
+        if (current != host_probe.device->context) throw std::runtime_error("notify probe context changed");
+        // Only at explicit export, outside timed workload. Do not free a device writer's memory early.
+        Check(aclrtSynchronizeDevice(), "complete notify probe before export");
+        for (auto& sample : host_probe.samples) {
+            if (!sample.notify_sequence) continue;
+            const auto* line = reinterpret_cast<const uint64_t*>(
+                static_cast<const uint8_t*>(host_probe.device->host) + (sample.ordinal - 1) * kCoreBytes);
+            sample.notify_done = __atomic_load_n(line + kLineBytes / sizeof(uint64_t), __ATOMIC_ACQUIRE);
+            if (sample.notify_done == sample.notify_sequence)
+                std::copy_n(line, sample.notify_ticks.size(), sample.notify_ticks.begin());
+        }
+    }
     HostDispatchReport report{std::move(host_probe.samples), host_probe.dropped};
     host_probe.capacity = 0;
     host_probe.gil_state = nullptr;
+    host_probe.device.reset();
     return report;
+}
+
+uint64_t HostDispatchProbe::NotifyAddress()
+{
+    if (!enabled_ || !host_probe.device || sample_.ordinal > host_probe.capacity) return 0;
+    sample_.notify_sequence = sample_.ordinal;
+    sample_.notify_address = reinterpret_cast<uint64_t>(host_probe.device->mapped) +
+                             (sample_.ordinal - 1) * kCoreBytes;
+    return sample_.notify_address;
 }
 
 HostDispatchProbe* CurrentHostDispatchProbe() { return host_probe.active; }

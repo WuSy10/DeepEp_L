@@ -28,7 +28,7 @@ int ProbePythonGil()
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.attr("kernel_trace_diagnostic_version") = 4;
-    m.attr("host_dispatch_probe_version") = 1;
+    m.attr("host_dispatch_probe_version") = 2;
     m.def("check_host_dispatch_gil_probe", []() {
         const int held = ProbePythonGil();
         int released;
@@ -38,10 +38,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         result["released_control"] = released;
         return result;
     });
-    m.def("configure_host_dispatch_probe", [](int64_t capacity) {
+    m.def("configure_host_dispatch_probe", [](int64_t capacity, bool device_timing) {
         if (capacity < 0) throw std::runtime_error("negative Host dispatch probe capacity");
-        ascend_deepep::trace::ConfigureHostDispatchProbe(static_cast<std::size_t>(capacity), &ProbePythonGil);
-    });
+        ascend_deepep::trace::ConfigureHostDispatchProbe(static_cast<std::size_t>(capacity), &ProbePythonGil, device_timing);
+    }, pybind11::arg("capacity"), pybind11::arg("device_timing") = false);
     m.def("take_host_dispatch_probe", []() {
         auto report = ascend_deepep::trace::TakeHostDispatchProbe();
         static constexpr const char* names[] = {"native_entry", "notify_begin", "notify_end", "wait_begin",
@@ -57,6 +57,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             item["wait_path"] = row.wait_path;
             item["api_call_id"] = row.api_call_id;
             item["success"] = row.success;
+            pybind11::dict device;
+            device["sequence"] = row.notify_sequence;
+            device["done_seq"] = row.notify_done;
+            static constexpr const char* device_names[] = {"entry", "counts_ready", "publish_begin", "publish_end"};
+            for (unsigned i = 0; i < 4; ++i) device[device_names[i]] = row.notify_ticks[i];
+            item["notify_device"] = device;
             for (unsigned i = 0; i < ascend_deepep::trace::kDispatchProbePoints; ++i) {
                 ticks[names[i]] = row.ticks[i];
                 gil[names[i]] = row.gil[i];
