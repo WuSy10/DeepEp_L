@@ -417,6 +417,41 @@ notify 的 core 0 在原有八处同步调用前后读取 tick，循环内的调
 
 分析顺序：先报告本轮 fresh 总耗时劣化及获选 rank，再展示对应窗口闭合的 Host 增量，最后用该 rank 的设备同步分类解释等待变化。如果只能定位到 `device_ready_other`，或条件同步次数变化，应保留这一不确定性，不按平均占比分摊。
 
+### Fresh Python/绑定边界残差细分
+
+在上一节的命令上增加 `--python-dispatch-timing`，必须同时带 `--align-fresh-timing`。所有模式（包括 off）都启用相同的外层探针。该探针仅记录 fresh，cached 不占用样本；初始化预分配时间戳行，业务期间只保存整数，不保存 tensor/handle，不进行文件输出，也不启动新线程。普通业务没有配置探针时不读取这些 Python 时钟，仍有关闭状态判断。
+
+本次仅改 Python 诊断和用例，未修改 kernel、同步及流依赖。Host 原生探针版本仍为 3，采集诊断版本仍为 4；Python `DispatchPythonProbe.version=1`。重新安装匹配的 Python 包，不能只更新 benchmark 文件。
+
+新增 `python_dispatch_rankN.json`，当前 fixture 每 rank 为 311 条（精度 1、预热 10、稳态 300），与原有 622 条 Host 原生报告里的 fresh 子集按调用顺序、窗口和 iteration 关联。控制器检查数量、序号、必需点、时间顺序及元数据区间包含关系；漏打点或加载旧包装代码会失败。
+
+`fresh_alignment.json` 中原 `python_and_native_boundary` 被以下互不重叠的 ledger 项替代：
+
+| 项目 | 含义 |
+| --- | --- |
+| `py_checks_and_policy` | 参数/容量校验、策略选择及前置准备 |
+| `py_dependency_event` | 原有依赖事件获取或记录 |
+| `py_trace_context_create` | trace context 对象创建；元数据生成器主体尚未执行 |
+| `py_trace_context_enter` | 上下文进入，包含元数据构造和原生 push |
+| `py_stream_enter` | 原有通信流上下文进入及依赖处理 |
+| `py_layout_prepare` / `py_layout_call` | layout 前边界和 get_dispatch_layout 调用/返回字段处理；不是设备 layout kernel 时长 |
+| `py_config_and_args` | Config 与 dispatch 参数组装 |
+| `py_native_binding_residual` | Python 中测得的原生方法调用时长减去已测 C++ dispatch 作用域；包含 launch plan 参数求值、绑定转换及原生作用域外的工作，不代表纯绑定或 GIL 成本 |
+| `py_result_epilogue` | 返回值拆包、可选 expand、路由索引 clone 等 |
+| `py_stream_exit` / `py_trace_context_exit` | 流上下文退出、trace 元数据恢复 |
+| `py_handle_and_record` | EPHandle 构造及相关 stream 记录 |
+| `py_output_record` / `py_output_pack` | 输出 stream 记录与输出包装 |
+| `py_finish_event` / `py_return_tail` | 原有完成事件提交及返回前边界 |
+| `py_outer_boundary` | benchmark 测得的调用时长减 Python 函数内部起止区间，保留装饰器/返回/探针边界等剩余成本 |
+
+原生 dispatch 内部 ledger 保留，新的 Python ledger 与其合并后继续核对每窗口总耗时。`py_native_binding_residual` 和 `py_outer_boundary` 是时长之差，原样保留正负值；不跨 Python/C++ 绝对时间戳相减。窗口尾部同步仍单列，不新增逐次设备同步，也不额外持有返回对象跨到下一次调用。
+
+元数据进一步单列为 `metadata_nested_ns` / `metadata_nested_mean_ns`，包括 identity 获取、shape/context key 与模板查找、缓存未命中时的模板构造/原生转换、动态 API ID、原生 push、原生 restore。off 没有 trace session，原始点为 -1，汇总这些嵌套项为 0。它们已经包含在 `py_trace_context_enter/exit` 内，不再加到 ledger；缓存命中时 template_build 只包含分支和打点边界成本，不代表仍在重建模板。
+
+读取报告时先确认本轮总劣化和获选最慢 rank，再看原残差主要落在哪个新项。若仍集中在 `py_native_binding_residual`，只能继续向绑定/原生方法外层追踪；不能直接认定 GIL 竞争。新增 Python 时钟和方法调用会产生诊断成本，metadata 内层点只在有 trace session 时执行，因此不能把它的全部增量当成未插桩的业务成本，也不以本轮结果作 <1% 验收。
+
+CPU 回归实际调用 fresh/cached 包装，检查采集开关、模板复用和异常时上下文恢复；另覆盖缺样、乱序、错误 off 元数据、探针容量、未完成导出以及控制器参数传递和总账加和。
+
 ## 元数据缓存与原生批量编码的验证
 
 缓存只保留标量和原生快照，不保留用户 tensor 或 handle 对象。shape、dtype、容量或模式变化会使用新模板；超过 64 种时清空模板缓存。正在执行或延迟执行的 kernel 持有 shared_ptr 父快照引用，不受缓存清空影响。上下文仍是线程局部的，嵌套调用及异常退出使用原生句柄恢复。

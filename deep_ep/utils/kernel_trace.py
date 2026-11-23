@@ -204,6 +204,77 @@ _identities = itertools.count(1)
 _process_id = uuid.uuid4().hex
 
 
+class DispatchPythonProbe:
+    """Opt-in single-thread diagnostic; retains only preallocated timestamp rows, never tensors."""
+
+    version = 1
+    points = (
+        "entry",
+        "dependency_begin",
+        "dependency_end",
+        "trace_created",
+        "trace_entered",
+        "stream_entered",
+        "layout_begin",
+        "layout_end",
+        "args_ready",
+        "native_end",
+        "epilogue_end",
+        "stream_exited",
+        "trace_exited",
+        "handle_end",
+        "outputs_recorded",
+        "finish_event_begin",
+        "finish_event_end",
+        "return",
+        "metadata_begin",
+        "identity_done",
+        "template_lookup_done",
+        "template_done",
+        "dynamic_ready",
+        "push_done",
+        "restore_begin",
+        "restore_done",
+    )
+
+    def __init__(self, capacity, clock=time.perf_counter_ns):
+        if type(capacity) is not int or not 0 < capacity <= 1000000:
+            raise ValueError("invalid Python dispatch probe capacity")
+        self.rows = [[-1] * len(self.points) for _ in range(capacity)]
+        self.indices = {name: i for i, name in enumerate(self.points)}
+        self.clock = clock
+        self.owner = threading.get_ident()
+        self.used = 0
+        self.active = None
+
+    def begin(self):
+        if self.owner != threading.get_ident() or self.active is not None:
+            raise RuntimeError("Python dispatch probe requires non-nested calls on its owner thread")
+        if self.used == len(self.rows):
+            raise RuntimeError("Python dispatch probe capacity exhausted")
+        self.active = self.rows[self.used]
+        self.used += 1
+        self.mark("entry")
+
+    def mark(self, point):
+        self.active[self.indices[point]] = self.clock()
+
+    def finish(self):
+        self.mark("return")
+        self.active = None
+
+    def take(self):
+        if self.owner != threading.get_ident() or self.active is not None:
+            raise RuntimeError("incomplete or wrong-thread Python dispatch probe export")
+        return dict(
+            version=self.version,
+            samples=[
+                dict(ordinal=i + 1, ticks_ns=dict(zip(self.points, row)))
+                for i, row in enumerate(self.rows[: self.used])
+            ],
+        )
+
+
 def _next_identity():
     with _identity_lock:
         return next(_identities)
@@ -238,7 +309,11 @@ class KernelTraceSession:
         self._templates = {}
 
     @contextmanager
-    def call(self, api_name, x, routes, num_experts, handle=None, *, cached=False, expanded=False, capacity=0):
+    def call(
+        self, api_name, x, routes, num_experts, handle=None, *, cached=False, expanded=False, capacity=0, _probe=None
+    ):
+        if _probe is not None:
+            _probe.mark("metadata_begin")
         started = time.perf_counter_ns() if self.diagnostic_timing else 0
         with _identity_lock:
             handle_id = getattr(handle, "_trace_handle_id", None) if handle is not None else None
@@ -247,6 +322,8 @@ class KernelTraceSession:
                 if handle is not None:
                     handle._trace_handle_id = handle_id
         # Cache by scalar shape/context only; never retain user tensors or handles.
+        if _probe is not None:
+            _probe.mark("identity_done")
         key = (
             api_name,
             x.size(1),
@@ -261,6 +338,8 @@ class KernelTraceSession:
             int(capacity),
         )
         template = self._templates.get(key)
+        if _probe is not None:
+            _probe.mark("template_lookup_done")
         if template is None:
             fields = dict(
                 zip(
@@ -285,8 +364,14 @@ class KernelTraceSession:
             if len(self._templates) >= 64:
                 self._templates.clear()  # In-flight native snapshots own their parents independently.
             self._templates[key] = template
+        if _probe is not None:
+            _probe.mark("template_done")
         dynamic = dict(api_call_id=_next_identity(), handle_id=handle_id)
+        if _probe is not None:
+            _probe.mark("dynamic_ready")
         previous = self.native.push_trace_metadata(template[1], dynamic["api_call_id"], handle_id)
+        if _probe is not None:
+            _probe.mark("push_done")
         if self.diagnostic_mode:
             kind = ("cached_dispatch" if cached else "fresh_dispatch") if api_name == "dispatch" else api_name
             stats = self.diagnostic_stats.setdefault(kind, dict(calls=0, enter_ns=0, restore_ns=0))
@@ -296,8 +381,12 @@ class KernelTraceSession:
         try:
             yield ChainMap(dynamic, template[0], self.fields)
         finally:
+            if _probe is not None:
+                _probe.mark("restore_begin")
             started = time.perf_counter_ns() if self.diagnostic_timing else 0
             self.native.restore_trace_metadata(previous)
+            if _probe is not None:
+                _probe.mark("restore_done")
             if self.diagnostic_timing:
                 stats["restore_ns"] += time.perf_counter_ns() - started
 
