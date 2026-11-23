@@ -1,3 +1,4 @@
+#include "kernels/common/kernel_trace.h"
 #include <cstdint>
 
 #include "kernels/common/ub_workspace.h"
@@ -258,11 +259,13 @@ __aicore__ inline void V1CombineUdmaImpl(
 
 } // namespace
 
+// 融合路径共用一次采集，计时覆盖通信和归约，收尾由每个 AIV 发布自己的结果。
 extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -278,6 +281,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_kernel_do(
@@ -291,11 +295,13 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_kernel_do(
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }
 
+// 分阶段路径的通信入口单独计时，归约会用另一个槽位。
 extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_comm_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -311,6 +317,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
@@ -324,11 +331,13 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }
 
+// 归约阶段按本次实际启动的 AIV 数发布结束时间，可与通信阶段使用不同核数。
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_udma_reduce_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -344,6 +353,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_u
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_reduce_kernel_do(
@@ -357,11 +367,13 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_reduce_kernel_do(
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }
 
+// early 的计时覆盖本阶段提交工作，异步 UDMA 的完成等待仍由后续阶段承担。
 extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_early_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -377,6 +389,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_early_kernel_do(
@@ -391,11 +404,13 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_early_kernel_do(
 }
 
 
+// remaining 独立发布完成记录，便于与同一次 API 的 early 阶段关联。
 extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_remaining_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -411,6 +426,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_remaining_kernel_do(
@@ -425,11 +441,13 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_remaining_kernel_do(
 }
 
 
+// pipeline 计时覆盖整个 kernel，不在内部按 chunk 产生单独记录。
 extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_pipeline_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    const uint64_t trace_start = tiling.kernel_trace_slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -443,6 +461,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         ascend_deepep::udma::CombinePipelineImpl<half>(
             x, topk_weights, src_idx, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling);
     }
+    ascend_deepep::trace::Finish(tiling.kernel_trace_slot, tiling.kernel_trace_seq, tiling.block_dim, trace_start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_pipeline_kernel_do(

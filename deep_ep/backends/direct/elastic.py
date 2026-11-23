@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Tuple, Union
 from ._native import get_native_class
 from .buffer import (
     _BOOTSTRAP_LOCK,
+    _bootstrap_all_gather,
     _compact_extra_tensors,
     get_global_comm_stream,
     _get_allocation_stream_id,
@@ -340,6 +341,16 @@ class ElasticBuffer:
         # Match the V2 initialization visibility contract on the communication
         # stream. The native barrier kernel is reused from the V1 resource layer.
         self.barrier(use_comm_stream=True, with_cpu_sync=True)
+        # UDMA Buffer 初始化时为组内各 rank 协商采集配置，再连接本地采集器。
+        self._kernel_trace = None
+        self._trace_session = None
+        if transport == "udma":
+            from ...utils.kernel_trace import attach_trace_session
+            from ._native import load_native_module
+
+            self._kernel_trace, self._trace_session = attach_trace_session(
+                load_native_module(), resolved_group, rank, num_ranks, _bootstrap_all_gather
+            )
 
     @property
     def udma_auto_policy(self):
@@ -523,6 +534,13 @@ class ElasticBuffer:
             if self._destroyed:
                 return
             self.barrier(use_comm_stream=True, with_cpu_sync=True)
+            # 原生资源销毁前注销采集源，最后一个使用者负责同步并写完日志。
+            trace = getattr(self, "_kernel_trace", None)
+            if trace is not None:
+                from ...utils.kernel_trace import KernelTrace
+
+                KernelTrace.detach(trace)
+                self._kernel_trace = None
             self._native.destroy()
             self._destroyed = True
             self.runtime = None
@@ -662,6 +680,10 @@ class ElasticBuffer:
     ) -> Tuple[Any, Optional[Any], Optional[Any], EPHandle, EventOverlap]:
         """Dispatch through the intranode kernel, optionally expanding rows."""
 
+        # Python 分段探针只测 fresh dispatch，已有 handle 的 cached 调用不占样本。
+        probe = getattr(self, "_dispatch_python_probe", None) if handle is None else None
+        if probe is not None:
+            probe.begin()
         self._ensure_alive()
         _validate_dispatch_scope(
             x,
@@ -792,148 +814,195 @@ class ElasticBuffer:
             import torch
 
             allocation_stream = self._communication_stream if allocate_on_comm_stream else _current_npu_stream()
+        # 将准备依赖事件的开销与进入通信流、提交原生算子的开销分开。
+        if probe is not None:
+            probe.mark("dependency_begin")
         dependency = previous_event or _try_record_event(None)
-        with _use_stream_after_event(self._communication_stream, dependency):
-            if cached_mode:
-                dispatch_layout = handle._dispatch_layout
-                rank_prefix_matrix, channel_prefix_matrix, _, _, is_token_in_rank, _ = dispatch_layout
-                num_tokens_per_rank = None
-                num_tokens_per_expert = None
-                kernel_topk_idx = None
-                if topk_weights is not None:
-                    # V1 needs topk_idx to route weights and derives the expert
-                    # count from this tensor's length. Cached notify ignores its
-                    # contents, since the prefix matrices are already available.
-                    import torch
-
-                    kernel_topk_idx = resolved_topk_idx
-                    num_tokens_per_expert = torch.empty(
-                        (resolved_num_experts,), dtype=torch.int32, device=x_tensor.device
-                    )
-            else:
-                kernel_topk_idx = resolved_topk_idx
-                (
-                    num_tokens_per_rank,
-                    _,
-                    num_tokens_per_expert,
-                    is_token_in_rank,
-                ) = self._native.get_dispatch_layout(resolved_topk_idx, resolved_num_experts, allocation_stream_id)
-                rank_prefix_matrix = None
-                channel_prefix_matrix = None
-            config = Config(
-                num_aiv=resolved_num_sms,
-                udma_peers_per_worker=policy.peers_per_worker if policy else self._udma_config.udma_peers_per_worker,
-                udma_wqes_per_visit=policy.wqes_per_visit if policy else self._udma_config.udma_wqes_per_visit,
-            )
-            dispatch_args = (
+        if probe is not None:
+            probe.mark("dependency_end")
+        # 同一次调用的 notify 和通信 kernel 共用 API 元数据，退出作用域时恢复上一份。
+        trace_call = (
+            self._trace_session.call(
+                "dispatch",
                 x_tensor,
-                x_scales,
-                kernel_topk_idx,
-                topk_weights,
-                num_tokens_per_rank,
-                is_token_in_rank,
-                num_tokens_per_expert,
-                handle.num_recv_tokens if cached_mode else 0,
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                resolved_alignment,
-                0 if cached_mode or resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
-                config.num_aiv,
-                config.num_max_nvl_chunked_send_tokens,
-                config.num_max_nvl_chunked_recv_tokens,
-                False,
-                allocation_stream_id,
-                resolved_capacity,
-                config.udma_peers_per_worker,
-                config.udma_wqes_per_visit,
-                handle._dispatch_plan if cached_mode else None,
+                resolved_topk_idx,
+                resolved_num_experts,
+                handle,
+                cached=cached_mode,
+                expanded=do_expand,
+                capacity=resolved_capacity,
+                _probe=probe,
             )
-            if cached_mode:
-                result = self._native.intranode_dispatch_with_plan(
-                    *dispatch_args, policy.native_plan() if policy else []
+            if getattr(self, "_trace_session", None) is not None
+            else nullcontext(None)
+        )
+        if probe is not None:
+            probe.mark("trace_created")
+        with trace_call as trace_metadata:
+            if probe is not None:
+                probe.mark("trace_entered")
+            with _use_stream_after_event(self._communication_stream, dependency):
+                if probe is not None:
+                    probe.mark("stream_entered")
+                # cached 使用 handle 中的布局，fresh 在流依赖就绪后获取新布局。
+                if probe is not None:
+                    probe.mark("layout_begin")
+                if cached_mode:
+                    dispatch_layout = handle._dispatch_layout
+                    rank_prefix_matrix, channel_prefix_matrix, _, _, is_token_in_rank, _ = dispatch_layout
+                    num_tokens_per_rank = None
+                    num_tokens_per_expert = None
+                    kernel_topk_idx = None
+                    if topk_weights is not None:
+                        # V1 needs topk_idx to route weights and derives the expert
+                        # count from this tensor's length. Cached notify ignores its
+                        # contents, since the prefix matrices are already available.
+                        import torch
+
+                        kernel_topk_idx = resolved_topk_idx
+                        num_tokens_per_expert = torch.empty(
+                            (resolved_num_experts,), dtype=torch.int32, device=x_tensor.device
+                        )
+                else:
+                    kernel_topk_idx = resolved_topk_idx
+                    (
+                        num_tokens_per_rank,
+                        _,
+                        num_tokens_per_expert,
+                        is_token_in_rank,
+                    ) = self._native.get_dispatch_layout(resolved_topk_idx, resolved_num_experts, allocation_stream_id)
+                    rank_prefix_matrix = None
+                    channel_prefix_matrix = None
+                if probe is not None:
+                    probe.mark("layout_end")
+                config = Config(
+                    num_aiv=resolved_num_sms,
+                    udma_peers_per_worker=policy.peers_per_worker
+                    if policy
+                    else self._udma_config.udma_peers_per_worker,
+                    udma_wqes_per_visit=policy.wqes_per_visit if policy else self._udma_config.udma_wqes_per_visit,
                 )
-                public_handle = None
-            else:
-                # Expand writes the final expert prefix before this API returns.
-                result, public_handle = self._native.intranode_dispatch_with_handle(
-                    *dispatch_args, do_expand, policy.native_plan() if policy else []
+                dispatch_args = (
+                    x_tensor,
+                    x_scales,
+                    kernel_topk_idx,
+                    topk_weights,
+                    num_tokens_per_rank,
+                    is_token_in_rank,
+                    num_tokens_per_expert,
+                    handle.num_recv_tokens if cached_mode else 0,
+                    rank_prefix_matrix,
+                    channel_prefix_matrix,
+                    resolved_alignment,
+                    0 if cached_mode or resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
+                    config.num_aiv,
+                    config.num_max_nvl_chunked_send_tokens,
+                    config.num_max_nvl_chunked_recv_tokens,
+                    False,
+                    allocation_stream_id,
+                    resolved_capacity,
+                    config.udma_peers_per_worker,
+                    config.udma_wqes_per_visit,
+                    handle._dispatch_plan if cached_mode else None,
                 )
-            (
-                recv_x,
-                recv_x_scales,
-                recv_topk_idx,
-                recv_topk_weights,
-                num_recv_tokens_per_expert_list,
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                recv_channel_prefix_matrix,
-                recv_src_idx,
-                send_head,
-                dispatch_plan,
-            ) = result
-            if not cached_mode:
-                dispatch_layout = (
+                # 从参数准备完成到 native_end 的区间包含 Python 绑定与原生调用。
+                if probe is not None:
+                    probe.mark("args_ready")
+                if cached_mode:
+                    result = self._native.intranode_dispatch_with_plan(
+                        *dispatch_args, policy.native_plan() if policy else []
+                    )
+                    public_handle = None
+                else:
+                    # Expand writes the final expert prefix before this API returns.
+                    result, public_handle = self._native.intranode_dispatch_with_handle(
+                        *dispatch_args, do_expand, policy.native_plan() if policy else []
+                    )
+                if probe is not None:
+                    probe.mark("native_end")
+                # 原生结果的解包、展开和路由复制归到 Python 后处理阶段。
+                (
+                    recv_x,
+                    recv_x_scales,
+                    recv_topk_idx,
+                    recv_topk_weights,
+                    num_recv_tokens_per_expert_list,
                     rank_prefix_matrix,
                     channel_prefix_matrix,
                     recv_channel_prefix_matrix,
                     recv_src_idx,
-                    is_token_in_rank,
                     send_head,
-                )
-            num_recv_tokens = int(recv_x.size(0))
-            if previous_event_before_epilogue is not None:
-                previous_event_before_epilogue.current_stream_wait()
-            if do_expand:
-                if cached_mode:
-                    offsets, actual_counts, mapping, aligned_counts = handle._expand_layout
-                    expand_topk_idx = None
+                    dispatch_plan,
+                ) = result
+                if not cached_mode:
+                    dispatch_layout = (
+                        rank_prefix_matrix,
+                        channel_prefix_matrix,
+                        recv_channel_prefix_matrix,
+                        recv_src_idx,
+                        is_token_in_rank,
+                        send_head,
+                    )
+                num_recv_tokens = int(recv_x.size(0))
+                if previous_event_before_epilogue is not None:
+                    previous_event_before_epilogue.current_stream_wait()
+                if do_expand:
+                    if cached_mode:
+                        offsets, actual_counts, mapping, aligned_counts = handle._expand_layout
+                        expand_topk_idx = None
+                    else:
+                        if not num_recv_tokens_per_expert_list:
+                            raise RuntimeError("expanded dispatch requires per-expert counts")
+                        aligned_counts = list(num_recv_tokens_per_expert_list)
+                        offsets = actual_counts = mapping = None
+                        expand_topk_idx = recv_topk_idx
+                        if make_single_source:
+                            with _use_comm_stream(allocation_stream):
+                                single_source_slots = torch.empty(
+                                    (num_recv_tokens,), dtype=torch.int32, device=recv_x.device
+                                )
+                    (
+                        recv_x,
+                        recv_x_scales,
+                        recv_topk_weights,
+                        offsets,
+                        actual_counts,
+                        mapping,
+                    ) = self._native.expand(
+                        recv_x,
+                        recv_x_scales,
+                        expand_topk_idx,
+                        recv_topk_weights,
+                        [] if cached_mode else aligned_counts,
+                        resolved_alignment,
+                        handle.num_expanded_tokens if cached_mode else 0,
+                        offsets,
+                        actual_counts,
+                        mapping,
+                        resolved_num_sms,
+                        allocation_stream_id,
+                        None if cached_mode else public_handle[1],
+                        None if cached_mode else public_handle[3],
+                        None if cached_mode else single_source_slots,
+                    )
+                    recv_topk_idx = None
+                    num_expanded_tokens = int(recv_x.size(0))
+                    expand_layout = (offsets, actual_counts, mapping, aligned_counts)
                 else:
-                    if not num_recv_tokens_per_expert_list:
-                        raise RuntimeError("expanded dispatch requires per-expert counts")
-                    aligned_counts = list(num_recv_tokens_per_expert_list)
-                    offsets = actual_counts = mapping = None
-                    expand_topk_idx = recv_topk_idx
-                    if make_single_source:
-                        with _use_comm_stream(allocation_stream):
-                            single_source_slots = torch.empty(
-                                (num_recv_tokens,), dtype=torch.int32, device=recv_x.device
-                            )
-                (
-                    recv_x,
-                    recv_x_scales,
-                    recv_topk_weights,
-                    offsets,
-                    actual_counts,
-                    mapping,
-                ) = self._native.expand(
-                    recv_x,
-                    recv_x_scales,
-                    expand_topk_idx,
-                    recv_topk_weights,
-                    [] if cached_mode else aligned_counts,
-                    resolved_alignment,
-                    handle.num_expanded_tokens if cached_mode else 0,
-                    offsets,
-                    actual_counts,
-                    mapping,
-                    resolved_num_sms,
-                    allocation_stream_id,
-                    None if cached_mode else public_handle[1],
-                    None if cached_mode else public_handle[3],
-                    None if cached_mode else single_source_slots,
-                )
-                recv_topk_idx = None
-                num_expanded_tokens = int(recv_x.size(0))
-                expand_layout = (offsets, actual_counts, mapping, aligned_counts)
-            else:
-                num_expanded_tokens = 0
-                expand_layout = None
-            if cached_mode:
-                # The routing indices came from the handle, not this call.
-                recv_topk_idx = None
-            if not cached_mode:
-                handle_topk_idx = resolved_topk_idx.clone() if do_handle_copy else resolved_topk_idx
-
+                    num_expanded_tokens = 0
+                    expand_layout = None
+                if cached_mode:
+                    # The routing indices came from the handle, not this call.
+                    recv_topk_idx = None
+                if not cached_mode:
+                    handle_topk_idx = resolved_topk_idx.clone() if do_handle_copy else resolved_topk_idx
+                if probe is not None:
+                    probe.mark("epilogue_end")
+            if probe is not None:
+                probe.mark("stream_exited")
+        # 退出通信流和采集上下文后，构造 handle、登记输出并准备返回事件。
+        if probe is not None:
+            probe.mark("trace_exited")
         if not cached_mode:
             handle = EPHandle(
                 do_expand,
@@ -954,6 +1023,8 @@ class ElasticBuffer:
                 None,
             )
             _record_recv_outputs_on_current_stream(*public_handle)
+            # 保存 fresh 分配的 handle ID，之后 cached dispatch 和 combine 可关联同一份路由。
+            handle._trace_handle_id = trace_metadata["handle_id"] if trace_metadata is not None else None
             handle._buffer_token = self._handle_token
             handle._buffer_owner = self
             handle._udma_policy = policy
@@ -966,11 +1037,18 @@ class ElasticBuffer:
             if expand_layout is not None:
                 _record_recv_outputs_on_current_stream(*expand_layout[:3])
 
+        if probe is not None:
+            probe.mark("handle_end")
         _record_recv_outputs_on_current_stream(recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, dispatch_plan)
 
+        if probe is not None:
+            probe.mark("outputs_recorded")
         if x_scales is not None:
             recv_x = (recv_x, recv_x_scales)
 
+        # 单独标记返回事件的准备耗时，finish() 封闭这一行探针样本。
+        if probe is not None:
+            probe.mark("finish_event_begin")
         event = self._finish_comm_event(
             async_with_compute_stream,
             (
@@ -984,6 +1062,10 @@ class ElasticBuffer:
                 handle,
             ),
         )
+        if probe is not None:
+            probe.mark("finish_event_end")
+        if probe is not None:
+            probe.finish()
         return recv_x, recv_topk_idx, recv_topk_weights, handle, event
 
     @staticmethod
@@ -1093,7 +1175,21 @@ class ElasticBuffer:
             if self._udma_schedule == "token" and (comm_sms != 32 or self.num_ranks > 8):
                 raise ValueError("self-send aggregate pipeline requires 32 AIV and EP <= 8")
         dependency = previous_event or _try_record_event(None)
-        with _use_stream_after_event(self._communication_stream, dependency):
+        # combine 复用 handle 的路由身份，同时为本次 API 分配独立的调用 ID。
+        trace_call = (
+            self._trace_session.call(
+                "combine",
+                x,
+                handle.topk_idx,
+                handle.num_experts,
+                handle,
+                expanded=handle.do_expand,
+                capacity=handle.num_max_tokens_per_rank,
+            )
+            if getattr(self, "_trace_session", None) is not None
+            else nullcontext(None)
+        )
+        with trace_call, _use_stream_after_event(self._communication_stream, dependency):
             combine_x, combine_topk_weights = x, topk_weights
             single_source_slots = (
                 getattr(handle, "_single_source_slots", None)
@@ -1192,6 +1288,13 @@ class ElasticBuffer:
                     # Finalizers cannot propagate. Fall back to native local
                     # teardown if collective teardown is no longer possible.
                     pass
+            # 析构走本地兜底时仍尝试注销采集源，避免监控线程保留该引用。
+            trace = getattr(self, "_kernel_trace", None)
+            if trace is not None:
+                from ...utils.kernel_trace import KernelTrace
+
+                KernelTrace.detach(trace)
+                self._kernel_trace = None
             self.runtime = None
             self._native = None
             self._communication_stream = None

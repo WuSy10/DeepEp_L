@@ -8,6 +8,10 @@
 #include <torch/extension.h>
 
 class ShmemInstance;
+// 只声明采集器类型，调用方可以传入实例，不必在此引入其实现。
+namespace ascend_deepep::trace {
+class KernelTrace;
+}
 namespace ascend_deepep::runtime {
 class BufferRuntime;
 }
@@ -32,6 +36,7 @@ private:
     bool consumed_{false};
 };
 
+// trace_sink 可为空；有采集器时把当前调用关联到实际启动的 combine kernel。
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> bias_0,
     c10::optional<torch::Tensor> bias_1, torch::Tensor src_idx, torch::Tensor rank_prefix_matrix,
@@ -45,6 +50,6 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     c10::optional<torch::Tensor> single_source_slots = c10::nullopt, std::function<void()> aggregate = {},
     c10::optional<torch::Tensor> pipeline_mapping = c10::nullopt,
     c10::optional<torch::Tensor> pipeline_values = c10::nullopt, int64_t pipeline_chunk_tokens = 0,
-    int64_t reduce_num_aiv = 0, const std::vector<int64_t>& launch_plan = {});
+    int64_t reduce_num_aiv = 0, const std::vector<int64_t>& launch_plan = {}, trace::KernelTrace* trace_sink = nullptr);
 
 }  // namespace ascend_deepep::ops

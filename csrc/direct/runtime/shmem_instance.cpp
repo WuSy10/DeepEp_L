@@ -1,6 +1,8 @@
 #include "shmem_instance.h"
 #include "runtime/instances.hpp"
 #include "runtime/instance_endpoint.hpp"
+// 计数轮询只借用当前线程的可选诊断探针。
+#include "runtime/kernel_trace.h"
 
 #include <algorithm>
 #include <charconv>
@@ -672,6 +674,9 @@ void* ShmemInstance::PrepareNotifyHostCounts(std::size_t count)
 
 std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
 {
+    // 启用探针才记录等待分段，正常计数协议仍由下面的轮询负责。
+    auto* probe = ascend_deepep::trace::CurrentHostDispatchProbe();
+    using ProbePoint = ascend_deepep::trace::DispatchProbePoint;
     TORCH_CHECK(notify_host_pending_ && count <= notify_count_capacity_, "Notify host counts were not prepared");
     const auto start = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::seconds(notify_host_timeout_seconds_);
@@ -679,6 +684,10 @@ std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
     std::vector<int32_t> counts(count);
     for (std::size_t i = 0; i < count; ++i) {
         uint32_t value;
+        // 第一次读到未发布的 0 值时标记等待起点；计数可能在 Host 到达前已经就绪。
+        if (probe && !probe->Has(ProbePoint::FirstPending) &&
+            __atomic_load_n(slots + i, __ATOMIC_ACQUIRE) == 0)
+            probe->Mark(ProbePoint::FirstPending);
         while ((value = __atomic_load_n(slots + i, __ATOMIC_ACQUIRE)) == 0) {
             const auto elapsed = std::chrono::steady_clock::now() - start;
             if (elapsed >= timeout) {
@@ -695,7 +704,11 @@ std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
         }
         TORCH_CHECK(value - 1U <= uint32_t(std::numeric_limits<int32_t>::max()), "invalid Notify host count");
         counts[i] = static_cast<int32_t>(value - 1U);
+        // 第一个计数就绪与全部计数就绪是两个独立测点。
+        if (probe && i == 0) probe->Mark(ProbePoint::FirstCountReady);
     }
+    // 循环结束时，本次所需的计数均已读出。
+    if (probe) probe->Mark(ProbePoint::AllCountsReady);
     notify_host_pending_ = false;
     return counts;
 }

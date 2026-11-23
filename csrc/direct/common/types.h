@@ -106,11 +106,21 @@ struct alignas(8) DispatchTilingData {
     uint64_t packed_scale_ready = 0;
     // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
     uint64_t notify_host_counts = 0;
+    // Diagnostic-only core-0 publication; separate from production trace slots.
+    // 可选诊断仅由 AIV 0 写入，用于拆解 notify 的计数发布时间。
+    uint64_t notify_probe_slot = 0;
+    uint64_t notify_probe_seq = 0;
+    // 普通采集为每个 AIV 分配独立写入位置，槽地址为 0 时关闭采集。
+    uint64_t kernel_trace_slot = 0;
+    uint64_t kernel_trace_seq = 0;
     uint32_t instance_id = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
 };
 
+// combine 各启动阶段通过 tiling 接收自己的采集槽位和完成序号。
 struct alignas(8) CombineTilingData {
+    uint64_t kernel_trace_slot = 0;
+    uint64_t kernel_trace_seq = 0;
     uint32_t rank;
     uint32_t world_size;
     uint32_t num_tokens;

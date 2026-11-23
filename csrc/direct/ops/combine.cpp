@@ -1,4 +1,7 @@
 #include "ops/combine.h"
+// 异步 combine 会带上采集上下文，并根据 NPU Graph 捕获状态决定是否打点。
+#include "runtime/kernel_trace.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -151,7 +154,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     c10::optional<torch::Tensor> expanded_x, c10::optional<torch::Tensor> single_source_slots,
     std::function<void()> aggregate, c10::optional<torch::Tensor> pipeline_mapping,
     c10::optional<torch::Tensor> pipeline_values, int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv,
-    const std::vector<int64_t>& launch_plan)
+    // 运行时可传入采集器，由本次调用向各阶段传递。
+    const std::vector<int64_t>& launch_plan, trace::KernelTrace* trace_sink)
 {
     const auto udma_launch =
         shmem.ResolveLaunch(launch_plan, true, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
@@ -399,9 +403,15 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         tiling.pipeline_topk = static_cast<uint32_t>(pipeline_mapping->size(1));
     }
     const auto ffts_addr = shmem.FftsAddr();
+    // Graph 捕获不分配 trace 槽位，避免把一次性槽位地址写进可重复执行的图。
+    if (c10_npu::currentStreamCaptureStatusMayInitCtx() != c10_npu::CaptureStatus::None) trace_sink = nullptr;
     // Capture the prepared tensors/tiling by value once; no recomputation or
     // allocation between communication and reduction, and no host synchronize.
+    // 保存调用线程的元数据；延迟执行的阶段仍应归到发起它的 combine。
+    const auto trace_metadata = trace_sink ? trace::CurrentTraceMetadata() : trace::TraceMetadataSnapshot{};
     auto launch = [=](CombinePhase phase) {
+        // 启动期间临时安装快照，退出后恢复线程原来的元数据。
+        trace::ScopedTraceMetadata trace_scope(trace_metadata);
         // Explicit odr-use retains GM source owners, not just tiling addresses.
         (void)expanded_x;
         (void)single_source_slots;
@@ -414,7 +424,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         }
         LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
                               send_head, recv_x, recv_topk_weights, phase_tiling, symmetric_buffer, ffts_addr, use_udma,
-                              phase);
+                              // 每个实际启动的阶段由 launcher 单独申请采集票据。
+                              phase, trace_sink);
 
         return CombineResult{recv_x, recv_topk_weights};
     };

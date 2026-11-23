@@ -19,6 +19,14 @@
 #endif
 
 extern "C" {
+// 缓存路径用独立的带采集入口传递槽位地址与序号，原入口仍可用于关闭采集时的启动。
+ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_trace_kernel_do(
+    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence);
+ASCEND_DEEPEP_EXPORT void cached_notify_combine_trace_kernel_do(
+    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence);
+
+// 启动单个 AIV 读取设备 tick，供 Host 估算设备时钟与系统时间的偏移。
+ASCEND_DEEPEP_EXPORT void kernel_trace_clock_do(void* stream, uint8_t* mapped);
 
 ASCEND_DEEPEP_EXPORT void dispatch_layout_kernel_do(
     uint32_t block_dim,

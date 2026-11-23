@@ -8,12 +8,14 @@
 #include "kernels/dispatch/dispatch_recv_copy.h"
 #include "kernels/common/v2_handle.h"
 #include "common/launch.h"
+#include "kernels/common/kernel_trace.h"
 #include "common/types.h"
 #include "kernels/dispatch/udma_dispatch_schedule.h"
 #include "kernels/dispatch/udma_token_dispatch_schedule.h"
 #include "kernels/dispatch/udma_dispatch_metadata.h"
 
 using namespace AscendC;
+using ascend_deepep::trace::PublishTraceTick;
 
 namespace {
 
@@ -37,6 +39,21 @@ __aicore__ inline uint32_t DispatchAlignUp32(uint32_t value)
 
 } // namespace
 
+// 校准 kernel 只采一个设备 tick，通过映射的 Host 地址交回采集器。
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void kernel_trace_clock(GM_ADDR output)
+{
+    const auto tick = GetSystemCycle();
+    TPipe pipe;
+    TBuf<TPosition::VECOUT> scratch;
+    pipe.InitBuffer(scratch, 32);
+    PublishTraceTick(reinterpret_cast<uint64_t>(output), scratch.Get<uint64_t>(), tick);
+}
+
+extern "C" ASCEND_DEEPEP_EXPORT void kernel_trace_clock_do(void* stream, uint8_t* output)
+{
+    kernel_trace_clock<<<1, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(32), stream>>>(output);
+}
+
 __aicore__ inline void V1DispatchUdmaKernelImpl(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
@@ -56,6 +73,11 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
 
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const int32_t core_num = get_block_num() * get_subblockdim();
+    // Slot capacity and Host completion both use the launched AIV count.
+    // 实际核数必须和 Host 预留时一致，每个 AIV 才能按自己的核号计算写入偏移。
+    const bool traced = tiling.kernel_trace_slot && uint32_t(core_num) == tiling.block_dim;
+    const uint64_t trace_start = traced ? AscendC::GetSystemCycle() : 0;
+    const auto trace_line = tiling.kernel_trace_slot + uint64_t(core_idx) * ascend_deepep::trace::kCoreBytes;
     const int32_t rank = static_cast<int32_t>(tiling.rank);
     const int32_t world_size = static_cast<int32_t>(tiling.world_size);
     const int32_t hidden = static_cast<int32_t>(tiling.hidden);
@@ -114,6 +136,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     const uint32_t staging_capacity = kDispatchStageBytes;
     const int32_t staging_buffer_mask = staging_buffer_stride * 2U <= staging_capacity ? 1 : 0;
     ascend_deepep::UbWorkspace resource;
+
     if (overlap_scales)
         ascend_deepep::udma::StorePackedScaleReady(resource, tiling, uint32_t(core_idx), 0U);
     auto staging_pingpong_ub = resource.template GetBufferByByte<uint8_t>(0);
@@ -356,6 +379,13 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+    }
+    if (traced) {
+        // 工作结束后复用 UB 起始区域，先写起止 tick，再写本轮完成序号。
+        // MTE3_S in the helper completes the payload before publishing done_seq.
+        PublishTraceTick(trace_line, resource.GetBufferByByte<uint64_t>(0), trace_start, GetSystemCycle());
+        PublishTraceTick(trace_line + ascend_deepep::trace::kLineBytes,
+                         resource.GetBufferByByte<uint64_t>(0), tiling.kernel_trace_seq);
     }
 }
 

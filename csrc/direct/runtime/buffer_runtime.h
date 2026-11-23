@@ -20,6 +20,8 @@
 #include <torch/extension.h>
 
 #include "runtime/shmem_instance.h"
+// BufferRuntime 持有采集器引用，并向 Python 暴露原生采集源。
+#include "runtime/kernel_trace.h"
 #include "ops/combine.h"
 
 namespace ascend_deepep::runtime {
@@ -173,6 +175,8 @@ private:
     bool symmetric_workspace_active_{false};
 
     std::shared_ptr<ShmemInstance> shmem_;
+    // 多个 Buffer 可共享同一个 ACL context 上的采集器。
+    std::shared_ptr<trace::KernelTrace> kernel_trace_;
     void* comm_meta_ptr_{nullptr};
     void* workspace_ptr_{nullptr};
     void* dispatch_output_control_{nullptr};

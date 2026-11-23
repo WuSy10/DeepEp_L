@@ -15,6 +15,7 @@
 #include "ops/stream_allocator.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "runtime/shmem_instance.h"
+#include "runtime/kernel_trace.h"
 
 namespace {
 
@@ -270,8 +271,12 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            bool use_udma, ShmemInstance& shmem, void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
            c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
            c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
-           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan)
+           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan,
+           trace::KernelTrace* trace_sink)
 {
+    // Host 分段诊断独立于 kernel trace；只有当前线程显式配置探针才采样。
+    trace::HostDispatchProbe probe(rank, cached_rank_prefix_matrix.has_value() || cached_channel_prefix_matrix.has_value());
+    using ProbePoint = trace::DispatchProbePoint;
     const auto udma_launch =
         shmem.ResolveLaunch(launch_plan, false, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
     udma_peers_per_worker = udma_launch.peers;
@@ -633,21 +638,32 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         (!host_poll || std::strcmp(host_poll, "1") == 0)) {
         tiling.notify_host_counts = reinterpret_cast<uint64_t>(shmem.PrepareNotifyHostCounts(1 + num_local_experts));
     }
+    // 设备探针只覆盖 eager fresh notify 直接向 Host 映射区发布计数的路径。
+    if (tiling.notify_host_counts && !cached_mode && !capturing) {
+        tiling.notify_probe_slot = probe.NotifyAddress();
+        tiling.notify_probe_seq = probe.NotifySequence();
+    }
+    // 普通 trace 只记录 eager UDMA notify；Graph 捕获不能保存一次性的槽位地址。
+    probe.Mark(ProbePoint::NotifyBegin);
     if (cached_mode) {
-        LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());
+        LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr(), !capturing && use_udma ? trace_sink : nullptr);
         if (rebuild_cached_plan)
             LaunchCachedDispatchPlanKernel(is_token_in_rank, *dispatch_plan, send_head, tiling, shmem.FftsAddr());
     } else {
         LaunchNotifyDispatchKernel(*num_tokens_per_rank, *num_tokens_per_expert, is_token_in_rank, rank_prefix_matrix,
                                    channel_prefix_matrix, recv_channel_prefix_matrix, notify_num_recv_tokens,
                                    notify_num_recv_tokens_per_expert, dispatch_plan, send_head, tiling,
-                                   symmetric_buffer, shmem.FftsAddr());
+                                   symmetric_buffer, shmem.FftsAddr(), !capturing && use_udma ? trace_sink : nullptr);
     }
+    probe.Mark(ProbePoint::NotifyEnd);
     int64_t num_recv_tokens = 0;
     std::vector<int64_t> num_recv_tokens_per_expert_list;
     if (cached_mode) {
+        // 4 走缓存计数，3 走固定容量，两条路径都不必等 notify 的计数。
+        probe.SetWaitPath(4);
         num_recv_tokens = cached_num_recv_tokens;
     } else if (num_worst_tokens > 0) {
+        probe.SetWaitPath(3);
         num_recv_tokens = num_worst_tokens;
     } else {
         // Mapped publication waits for counts only; the fallback copies both
@@ -655,6 +671,9 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         torch::Tensor recv_counts_cpu;
         std::vector<int32_t> published_counts;
         const int32_t* recv_counts;
+        // 1 在 Host 轮询映射区，2 通过 Tensor.cpu() 取数；分别记录等待区间。
+        probe.SetWaitPath(tiling.notify_host_counts ? 1 : 2);
+        probe.Mark(ProbePoint::WaitBegin);
         if (tiling.notify_host_counts) {
             published_counts = shmem.WaitNotifyHostCounts(1 + num_local_experts);
             recv_counts = published_counts.data();
@@ -662,6 +681,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
             recv_counts_cpu = notify_counts.cpu();
             recv_counts = recv_counts_cpu.data_ptr<int32_t>();
         }
+        probe.Mark(ProbePoint::WaitEnd);
         num_recv_tokens = static_cast<int64_t>(recv_counts[0]);
         TORCH_CHECK(num_recv_tokens >= 0, "notify_dispatch returned a negative receive count");
 
@@ -682,6 +702,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                 " token slots, but the symmetric workspace reserves ", recv_buffer_tokens);
     tiling.num_output_tokens = static_cast<uint32_t>(num_recv_tokens);
 
+    // 将输出分配与通信 kernel 提交拆开计时，便于定位 Host 侧开销。
+    probe.Mark(ProbePoint::OutputsBegin);
     if (public_handle != nullptr) {
         (*public_handle)[3] = allocator.Empty({num_recv_tokens, num_topk + 2}, int_options);
         tiling.v2_src_metadata = reinterpret_cast<uint64_t>((*public_handle)[3].data_ptr());
@@ -713,10 +735,16 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // Dispatch writes every valid source index. Fixed-capacity tails are
     // unspecified; consumers select valid rows by rank/channel prefixes.
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
+    probe.Mark(ProbePoint::OutputsEnd);
+    probe.Mark(ProbePoint::DispatchBegin);
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
                            num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
                            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
-                           send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+                           send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma,
+                           !capturing ? trace_sink : nullptr);
+    probe.Mark(ProbePoint::DispatchEnd);
+    // 只在本次 Host 调用走到正常返回时标记成功，样本由探针析构统一保存。
+    probe.Finish();
     return {recv_x,
             recv_x_scales,
             recv_topk_idx,

@@ -1,3 +1,4 @@
+#include "kernels/common/kernel_trace.h"
 #include <cstdint>
 
 #include "kernels/common/ub_workspace.h"
@@ -103,6 +104,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
+    // 可选的 notify 诊断只在 AIV 0 上记录既有同步的等待耗时和次数。
+    const bool notify_probe = tiling.notify_probe_slot != 0 && core_idx == 0;
+    const uint64_t trace_start = (tiling.kernel_trace_slot || notify_probe) ? AscendC::GetSystemCycle() : 0;
+    // 8 个位置与 pybind 的 sync_names 顺序一致，同一位置可以累加多次同步。
+    uint64_t probe_sync_ns[8] = {}, probe_sync_calls[8] = {};
+    uint64_t probe_sync_begin = 0;
     const int32_t core_num = get_block_num() * get_subblockdim();
     const int32_t rank = static_cast<int32_t>(tiling.rank);
     const int32_t world_size = static_cast<int32_t>(tiling.world_size);
@@ -163,7 +170,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     // still be read by a slower rank's previous combine reduction. Skip this
     // only for the Buffer's first workspace use.
     if (tiling.needs_notify_entry_barrier != 0) {
+        // 0：进入 notify 前等待其他 rank 结束对上轮共享区的访问。
+        if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
         aclshmemx_sync_vec_all();
+        if (notify_probe) {
+            probe_sync_ns[0] += AscendC::GetSystemCycle() - probe_sync_begin;
+            ++probe_sync_calls[0];
+        }
     }
 
     // One AIV owns one logical channel and accumulates complete rank vectors.
@@ -197,7 +210,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     AscendC::DataCopyExtParams channel_count_store_params(
         1, static_cast<uint32_t>(rank_stride * kNotifyInt32Bytes), 0, 0, 0);
     AscendC::DataCopyPad(channel_values_gm[core_idx * rank_stride], accumulator_ub, channel_count_store_params);
+    // 1：各 AIV 写完自己的 channel 计数后才开始计算前缀。
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     AscendC::SyncAll<true>();
+    if (notify_probe) {
+        probe_sync_ns[1] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[1];
+    }
 
     // Prefix channel counts as aligned rank-vector tiles in place.
     const int32_t rank_block_count = rank_stride / kNotifyInt32AlignElems;
@@ -244,7 +263,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
+    // 2：等待 channel 前缀就绪，后续再转置和发布。
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     AscendC::SyncAll<true>();
+    if (notify_probe) {
+        probe_sync_ns[2] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[2];
+    }
 
     // Transpose [channel, rank] into [rank, channel] and publish a padded copy.
     for (int32_t dst_rank = channel_matrix_elems <= kMaxVectorTileElems ? world_size : core_idx; dst_rank < world_size;
@@ -339,7 +364,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         expert_current += len;
         expert_remaining -= len;
     }
+    // 3：跨 rank 等待各方发布计数，之后才从来源 rank 读取。
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     aclshmemx_sync_vec_all();
+    if (notify_probe) {
+        probe_sync_ns[3] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[3];
+    }
 
     // Source owners gather complete rank rows once. rank_prefix_matrix holds
     // raw counts until each column tile is snapshotted before overwriting it.
@@ -379,7 +410,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
             }
         }
+        // 4：等待所有来源行收集完成，AIV 0 才能计算 rank 前缀。
+        if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
         AscendC::SyncAll<true>();
+        if (notify_probe) {
+            probe_sync_ns[4] += AscendC::GetSystemCycle() - probe_sync_begin;
+            ++probe_sync_calls[4];
+        }
         if (core_idx == 0) {
             for (uint32_t begin = 0; begin < uint32_t(world_size); begin += rank_tile) {
                 const uint32_t columns = NotifyIntMin(rank_tile, world_size - begin);
@@ -410,7 +447,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             if (begin != 0) {
                 // Finish consumers before scratch reuse. Empty-work AIVs
                 // participate in both joins, just like source owners.
+                // 5：下一块 expert 计数复用暂存区之前，等待上一块的读取结束。
+                if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
                 AscendC::SyncAll<true>();
+                if (notify_probe) {
+                    probe_sync_ns[5] += AscendC::GetSystemCycle() - probe_sync_begin;
+                    ++probe_sync_calls[5];
+                }
                 const AscendC::DataCopyExtParams copy(1, columns * kNotifyInt32Bytes, 0, 0, 0);
                 for (uint32_t source = core_idx; source < uint32_t(world_size); source += core_num) {
                     auto* remote_base = static_cast<__gm__ int32_t*>(aclshmem_ptr(shmem_base, source));
@@ -424,7 +467,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
                 }
+                // 6：等待新一块 expert 计数收集完成，再交给 AIV 0 处理。
+                if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
                 AscendC::SyncAll<true>();
+                if (notify_probe) {
+                    probe_sync_ns[6] += AscendC::GetSystemCycle() - probe_sync_begin;
+                    ++probe_sync_calls[6];
+                }
             }
             if (core_idx == 0) {
                 const AscendC::DataCopyExtParams copy(1, world_size * expert_tile * kNotifyInt32Bytes, 0, 0, 0);
@@ -519,9 +568,17 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             local_expert_remaining -= len;
         }
     }
+    // 7：等待本地计数工作收尾，AIV 0 随后把结果发布给 Host。
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     AscendC::SyncAll<true>();
+    if (notify_probe) {
+        probe_sync_ns[7] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[7];
+    }
 
     if (tiling.notify_host_counts != 0 && core_idx == 0) {
+        const uint64_t counts_ready = notify_probe ? AscendC::GetSystemCycle() : 0;
+        uint64_t publish_begin = 0, publish_end = 0;
         // The mapped host address is only accessed by MTE3. Core 0 owns all
         // slots and reuses its aligned accumulator after the local barrier.
         AscendC::GlobalTensor<uint32_t> host_counts_gm;
@@ -539,10 +596,28 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
             AscendC::DataCopyExtParams copy(1, length * kNotifyInt32Bytes, 0, 0, 0);
+            // 只量第一批计数的 MTE3 拷贝区间，Host 可能在后续批次完成前看到首批。
+            if (notify_probe && offset == 0) publish_begin = AscendC::GetSystemCycle();
             AscendC::DataCopyPad(host_counts_gm[offset], packed_ub, copy);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+            if (notify_probe && offset == 0) publish_end = AscendC::GetSystemCycle();
             offset += length;
+        }
+        if (notify_probe) {
+            // counts 已写完，由 AIV 0 复用对齐的 UB，先发布采样值，最后发布完成序号。
+            auto scratch = packed_ub.ReinterpretCast<uint64_t>();
+            ascend_deepep::trace::PublishTraceTick(tiling.notify_probe_slot, scratch, trace_start,
+                                                  counts_ready, publish_begin, publish_end);
+            for (uint32_t group = 0; group < 2; ++group) {
+                const uint32_t i = group * 4;
+                ascend_deepep::trace::PublishTraceTick(tiling.notify_probe_slot + 32 + group * 32, scratch,
+                    probe_sync_ns[i], probe_sync_ns[i + 1], probe_sync_ns[i + 2], probe_sync_ns[i + 3]);
+                ascend_deepep::trace::PublishTraceTick(tiling.notify_probe_slot + 96 + group * 32, scratch,
+                    probe_sync_calls[i], probe_sync_calls[i + 1], probe_sync_calls[i + 2], probe_sync_calls[i + 3]);
+            }
+            ascend_deepep::trace::PublishTraceTick(
+                tiling.notify_probe_slot + ascend_deepep::trace::kNotifyProbeDoneOffset, scratch, tiling.notify_probe_seq);
         }
     }
     if (tiling.v2_rank_prefix != 0 && core_idx == 0) {
@@ -572,6 +647,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
     }
+    // 普通采集仍由所有 AIV 分别写入，和 AIV 0 的诊断槽位独立。
+    if (tiling.kernel_trace_slot && uint32_t(core_num) == tiling.block_dim) {
+        const auto line = tiling.kernel_trace_slot + uint64_t(core_idx) * ascend_deepep::trace::kCoreBytes;
+        auto scratch = accumulator_ub.ReinterpretCast<uint64_t>();
+        ascend_deepep::trace::PublishTraceTick(line, scratch, trace_start, AscendC::GetSystemCycle());
+        ascend_deepep::trace::PublishTraceTick(line + ascend_deepep::trace::kLineBytes, scratch, tiling.kernel_trace_seq);
+    }
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
@@ -587,17 +669,22 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
         dispatch_plan, send_head, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr, uint32_t instance_id)
+// cached notify 复用已有路由计划，这条记录覆盖原有的通知同步。
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(
+    uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence, uint32_t cores)
 {
+    const uint64_t start = slot ? AscendC::GetSystemCycle() : 0;
     aclshmemx_instance_ctx_set(instance_id);
     util_set_ffts_config(ffts_addr);
     aclshmemx_sync_vec_all();
+    ascend_deepep::trace::Finish(slot, sequence, cores, start);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
     uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id)
 {
-    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, instance_id);
+    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(32), stream>>>(
+        ffts_addr, instance_id, 0, 0, block_dim);
 }
 
 // Legacy six-tensor handles have no private plan. Rebuild locally on the same
@@ -617,4 +704,12 @@ extern "C" ASCEND_DEEPEP_EXPORT void cached_dispatch_plan_kernel_do(
     auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
     cached_dispatch_plan_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kNotifyDispatchUbBytes), stream>>>(
         routes, plan, head, *td, ffts_addr);
+}
+
+// 带采集的入口把本次票据传给同一个 cached notify kernel。
+extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_trace_kernel_do(
+    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id, uint64_t slot, uint64_t sequence)
+{
+    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(32), stream>>>(
+        ffts_addr, instance_id, slot, sequence, block_dim);
 }

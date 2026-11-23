@@ -169,6 +169,8 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
     try {
         AllocateCommMeta();
         AllocateWorkspace();
+        // 仅为 UDMA 尝试打开采集器，采集开关与 ACL context 复用由 Open 处理。
+        if (transport_ == "udma") kernel_trace_ = trace::KernelTrace::Open();
     } catch (...) {
         DestroyNoThrow();
         throw;
@@ -240,6 +242,8 @@ void BufferRuntime::ReleaseResources(bool synchronize)
     if (synchronize && shmem_ != nullptr) {
         shmem_->Barrier();
     }
+    // 先释放本 Buffer 持有的采集器引用，再清理运行时资源。
+    kernel_trace_.reset();
     FreeResources();
     initialized_ = false;
     shmem_.reset();
@@ -361,7 +365,8 @@ BufferRuntime::IntranodeDispatchWithPlan(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan);
+        // cached dispatch 同样传递采集器，便于关联缓存 notify 和数据搬运。
+        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan, kernel_trace_.get());
     symmetric_workspace_active_ = true;
     return result;
 }
@@ -392,7 +397,9 @@ BufferRuntime::IntranodeDispatchWithHandle(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan);
+        // 带公开 handle 的入口也使用同一采集器，保持两条 dispatch 入口的采集行为一致。
+        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan,
+        kernel_trace_.get());
     symmetric_workspace_active_ = true;
     return {result, public_handle};
 }
@@ -413,7 +420,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> BufferRuntime::Intranode
         static_cast<int>(num_ranks_), static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes),
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, nullptr,
-        c10::nullopt, c10::nullopt, {}, c10::nullopt, c10::nullopt, 0, 0, launch_plan);
+        // 普通 combine 借用 Buffer 持有的采集器。
+        c10::nullopt, c10::nullopt, {}, c10::nullopt, c10::nullopt, 0, 0, launch_plan, kernel_trace_.get());
     symmetric_workspace_active_ = true;
     return result;
 }
@@ -462,7 +470,9 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, &epilogue,
         expanded_x, single_source_slots, aggregate, pipeline_chunk_tokens ? early_aggregate_map : c10::nullopt,
-        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv, launch_plan);
+        // 分阶段 combine 也传递同一采集器，由各阶段单独登记启动。
+        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv, launch_plan,
+        kernel_trace_.get());
     symmetric_workspace_active_ = true;
     epilogue->SetOwner(c10::intrusive_ptr<BufferRuntime>::reclaim_copy(this));
     return epilogue;
