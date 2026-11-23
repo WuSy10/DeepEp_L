@@ -28,7 +28,7 @@ int ProbePythonGil()
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.attr("kernel_trace_diagnostic_version") = 4;
-    m.attr("host_dispatch_probe_version") = 2;
+    m.attr("host_dispatch_probe_version") = 3;
     m.def("check_host_dispatch_gil_probe", []() {
         const int held = ProbePythonGil();
         int released;
@@ -62,6 +62,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             device["done_seq"] = row.notify_done;
             static constexpr const char* device_names[] = {"entry", "counts_ready", "publish_begin", "publish_end"};
             for (unsigned i = 0; i < 4; ++i) device[device_names[i]] = row.notify_ticks[i];
+            static constexpr const char* sync_names[] = {"entry_collective", "channel_counts_join", "channel_prefix_join",
+                "counts_collective", "gather_join", "expert_reuse_join", "expert_ready_join", "final_join"};
+            pybind11::dict sync_ns, sync_calls;
+            for (unsigned i = 0; i < 8; ++i) {
+                sync_ns[sync_names[i]] = row.notify_ticks[4 + i];
+                sync_calls[sync_names[i]] = row.notify_ticks[12 + i];
+            }
+            device["sync_ns"] = sync_ns;
+            device["sync_calls"] = sync_calls;
             item["notify_device"] = device;
             for (unsigned i = 0; i < ascend_deepep::trace::kDispatchProbePoints; ++i) {
                 ticks[names[i]] = row.ticks[i];

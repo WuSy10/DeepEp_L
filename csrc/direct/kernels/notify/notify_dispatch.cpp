@@ -106,6 +106,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const bool notify_probe = tiling.notify_probe_slot != 0 && core_idx == 0;
     const uint64_t trace_start = (tiling.kernel_trace_slot || notify_probe) ? AscendC::GetSystemCycle() : 0;
+    uint64_t probe_sync_ns[8] = {}, probe_sync_calls[8] = {};
+    uint64_t probe_sync_begin = 0;
     const int32_t core_num = get_block_num() * get_subblockdim();
     const int32_t rank = static_cast<int32_t>(tiling.rank);
     const int32_t world_size = static_cast<int32_t>(tiling.world_size);
@@ -166,7 +168,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     // still be read by a slower rank's previous combine reduction. Skip this
     // only for the Buffer's first workspace use.
     if (tiling.needs_notify_entry_barrier != 0) {
+        if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
         aclshmemx_sync_vec_all();
+        if (notify_probe) {
+            probe_sync_ns[0] += AscendC::GetSystemCycle() - probe_sync_begin;
+            ++probe_sync_calls[0];
+        }
     }
 
     // One AIV owns one logical channel and accumulates complete rank vectors.
@@ -200,7 +207,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     AscendC::DataCopyExtParams channel_count_store_params(
         1, static_cast<uint32_t>(rank_stride * kNotifyInt32Bytes), 0, 0, 0);
     AscendC::DataCopyPad(channel_values_gm[core_idx * rank_stride], accumulator_ub, channel_count_store_params);
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     AscendC::SyncAll<true>();
+    if (notify_probe) {
+        probe_sync_ns[1] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[1];
+    }
 
     // Prefix channel counts as aligned rank-vector tiles in place.
     const int32_t rank_block_count = rank_stride / kNotifyInt32AlignElems;
@@ -247,7 +259,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     AscendC::SyncAll<true>();
+    if (notify_probe) {
+        probe_sync_ns[2] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[2];
+    }
 
     // Transpose [channel, rank] into [rank, channel] and publish a padded copy.
     for (int32_t dst_rank = channel_matrix_elems <= kMaxVectorTileElems ? world_size : core_idx; dst_rank < world_size;
@@ -342,7 +359,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         expert_current += len;
         expert_remaining -= len;
     }
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     aclshmemx_sync_vec_all();
+    if (notify_probe) {
+        probe_sync_ns[3] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[3];
+    }
 
     // Source owners gather complete rank rows once. rank_prefix_matrix holds
     // raw counts until each column tile is snapshotted before overwriting it.
@@ -382,7 +404,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
             }
         }
+        if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
         AscendC::SyncAll<true>();
+        if (notify_probe) {
+            probe_sync_ns[4] += AscendC::GetSystemCycle() - probe_sync_begin;
+            ++probe_sync_calls[4];
+        }
         if (core_idx == 0) {
             for (uint32_t begin = 0; begin < uint32_t(world_size); begin += rank_tile) {
                 const uint32_t columns = NotifyIntMin(rank_tile, world_size - begin);
@@ -413,7 +440,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             if (begin != 0) {
                 // Finish consumers before scratch reuse. Empty-work AIVs
                 // participate in both joins, just like source owners.
+                if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
                 AscendC::SyncAll<true>();
+                if (notify_probe) {
+                    probe_sync_ns[5] += AscendC::GetSystemCycle() - probe_sync_begin;
+                    ++probe_sync_calls[5];
+                }
                 const AscendC::DataCopyExtParams copy(1, columns * kNotifyInt32Bytes, 0, 0, 0);
                 for (uint32_t source = core_idx; source < uint32_t(world_size); source += core_num) {
                     auto* remote_base = static_cast<__gm__ int32_t*>(aclshmem_ptr(shmem_base, source));
@@ -427,7 +459,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
                 }
+                if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
                 AscendC::SyncAll<true>();
+                if (notify_probe) {
+                    probe_sync_ns[6] += AscendC::GetSystemCycle() - probe_sync_begin;
+                    ++probe_sync_calls[6];
+                }
             }
             if (core_idx == 0) {
                 const AscendC::DataCopyExtParams copy(1, world_size * expert_tile * kNotifyInt32Bytes, 0, 0, 0);
@@ -522,7 +559,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             local_expert_remaining -= len;
         }
     }
+    if (notify_probe) probe_sync_begin = AscendC::GetSystemCycle();
     AscendC::SyncAll<true>();
+    if (notify_probe) {
+        probe_sync_ns[7] += AscendC::GetSystemCycle() - probe_sync_begin;
+        ++probe_sync_calls[7];
+    }
 
     if (tiling.notify_host_counts != 0 && core_idx == 0) {
         const uint64_t counts_ready = notify_probe ? AscendC::GetSystemCycle() : 0;
@@ -557,8 +599,15 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
             auto scratch = packed_ub.ReinterpretCast<uint64_t>();
             ascend_deepep::trace::PublishTraceTick(tiling.notify_probe_slot, scratch, trace_start,
                                                   counts_ready, publish_begin, publish_end);
+            for (uint32_t group = 0; group < 2; ++group) {
+                const uint32_t i = group * 4;
+                ascend_deepep::trace::PublishTraceTick(tiling.notify_probe_slot + 32 + group * 32, scratch,
+                    probe_sync_ns[i], probe_sync_ns[i + 1], probe_sync_ns[i + 2], probe_sync_ns[i + 3]);
+                ascend_deepep::trace::PublishTraceTick(tiling.notify_probe_slot + 96 + group * 32, scratch,
+                    probe_sync_calls[i], probe_sync_calls[i + 1], probe_sync_calls[i + 2], probe_sync_calls[i + 3]);
+            }
             ascend_deepep::trace::PublishTraceTick(
-                tiling.notify_probe_slot + ascend_deepep::trace::kLineBytes, scratch, tiling.notify_probe_seq);
+                tiling.notify_probe_slot + ascend_deepep::trace::kNotifyProbeDoneOffset, scratch, tiling.notify_probe_seq);
         }
     }
     if (tiling.v2_rank_prefix != 0 && core_idx == 0) {

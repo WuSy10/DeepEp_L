@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <acl/acl.h>
+#include "common/kernel_trace_layout.h"
 
 namespace ascend_deepep::trace {
 struct TraceMetadata {
@@ -46,7 +47,7 @@ struct HostDispatchSample {
     bool success;
     std::array<int64_t, kDispatchProbePoints> ticks, gil;
     uint64_t notify_address = 0, notify_sequence = 0, notify_done = 0;
-    std::array<uint64_t, 4> notify_ticks{};
+    std::array<uint64_t, kNotifyProbeWords> notify_ticks{};
 };
 struct HostDispatchReport {
     std::vector<HostDispatchSample> samples;

@@ -196,7 +196,8 @@ int main(){
         else assert(address-first_address==kCoreBytes);
         auto* ticks=reinterpret_cast<uint64_t*>(address);
         ticks[0]=10; ticks[1]=20; ticks[2]=30; ticks[3]=40;
-        ticks[kLineBytes/sizeof(uint64_t)]=p.NotifySequence();
+        ticks[4]=7; ticks[12]=1;
+        ticks[kNotifyProbeDoneOffset/sizeof(uint64_t)]=p.NotifySequence();
         p.Finish();
     }
     auto device_report=TakeHostDispatchProbe();
@@ -205,9 +206,13 @@ int main(){
         assert(device_report.samples[i].notify_sequence==uint64_t(i+1));
         assert(device_report.samples[i].notify_done==uint64_t(i+1));
         assert(device_report.samples[i].notify_ticks[3]==40);
+        assert(device_report.samples[i].notify_ticks[4]==7 && device_report.samples[i].notify_ticks[12]==1);
     }
     ConfigureHostDispatchProbe(1, &fake_gil, true);
-    {HostDispatchProbe p(0,false); (void)p.NotifyAddress(); p.Finish();}
+    {HostDispatchProbe p(0,false);
+     auto* old_layout=reinterpret_cast<uint64_t*>(p.NotifyAddress());
+     old_layout[kLineBytes/sizeof(uint64_t)]=p.NotifySequence(); // Old completion offset must not be accepted.
+     p.Finish();}
     auto missing=TakeHostDispatchProbe();
     assert(missing.samples[0].notify_done==0 && missing.samples[0].notify_ticks[0]==0);
     setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata", 1);
@@ -765,6 +770,16 @@ HOST_DISPATCH_INTERVALS = {
     "native_scope": ("native_entry", "native_exit"),
 }
 NOTIFY_DEVICE_POINTS = ("entry", "counts_ready", "publish_begin", "publish_end")
+NOTIFY_SYNC_NAMES = (
+    "entry_collective",
+    "channel_counts_join",
+    "channel_prefix_join",
+    "counts_collective",
+    "gather_join",
+    "expert_reuse_join",
+    "expert_ready_join",
+    "final_join",
+)
 NOTIFY_DEVICE_INTERVALS = {
     "device_entry_to_counts_ready": ("entry", "counts_ready"),
     "device_count_pack": ("counts_ready", "publish_begin"),
@@ -842,6 +857,30 @@ def validate_host_dispatch_report(report, args, rank):
             row["durations_ns"].update(
                 {name: device[b] - device[a] for name, (a, b) in NOTIFY_DEVICE_INTERVALS.items()}
             )
+            sync_ns, sync_calls = device.get("sync_ns", {}), device.get("sync_calls", {})
+            if set(sync_ns) != set(NOTIFY_SYNC_NAMES) or set(sync_calls) != set(NOTIFY_SYNC_NAMES):
+                raise ValueError("missing notify synchronization evidence")
+            for name in NOTIFY_SYNC_NAMES:
+                if any(type(v) is not int or v < 0 for v in (sync_ns[name], sync_calls[name])):
+                    raise ValueError("invalid notify synchronization value")
+                if sync_calls[name] == 0 and sync_ns[name] != 0:
+                    raise ValueError("notify synchronization duration without a call")
+            if any(
+                sync_calls[name] != 1
+                for name in ("channel_counts_join", "channel_prefix_join", "counts_collective", "final_join")
+            ):
+                raise ValueError("missing mandatory notify synchronization")
+            if sync_calls["entry_collective"] not in (0, 1) or sync_calls["gather_join"] not in (0, 1):
+                raise ValueError("invalid conditional notify synchronization count")
+            if sync_calls["expert_reuse_join"] != sync_calls["expert_ready_join"]:
+                raise ValueError("unpaired expert tile joins")
+            sync_total = sum(sync_ns.values())
+            ready = device["counts_ready"] - device["entry"]
+            if sync_total > ready:
+                raise ValueError("notify synchronization exceeds enclosing interval")
+            row["durations_ns"].update({"device_sync_" + name: sync_ns[name] for name in NOTIFY_SYNC_NAMES})
+            row["durations_ns"]["device_sync_total"] = sync_total
+            row["durations_ns"]["device_ready_other"] = ready - sync_total
         elif device.get("sequence", 0) or device.get("done_seq", 0):
             raise ValueError("unexpected notify device probe")
     if seen != [per_kind, per_kind]:
@@ -850,7 +889,7 @@ def validate_host_dispatch_report(report, args, rank):
     for kind in PERF_OPS[:2]:
         steady = [r for r in rows if r["kind"] == kind and r["phase"] == "steady"]
         durations = {}
-        for name in (*HOST_DISPATCH_INTERVALS, *NOTIFY_DEVICE_INTERVALS):
+        for name in sorted({name for r in steady for name in r["durations_ns"]}):
             values = sorted(r["durations_ns"][name] for r in steady if name in r["durations_ns"])
             if values:
                 durations[name] = dict(
@@ -904,6 +943,11 @@ def make_host_probe_report(args, rank=0, path=1, gil_state=1):
                     sequence=ordinal,
                     done_seq=ordinal,
                     **{p: ordinal * 100 + i * 10 for i, p in enumerate(NOTIFY_DEVICE_POINTS)},
+                    sync_ns={p: 0 for p in NOTIFY_SYNC_NAMES},
+                    sync_calls={
+                        p: int(p in ("channel_counts_join", "channel_prefix_join", "counts_collective", "final_join"))
+                        for p in NOTIFY_SYNC_NAMES
+                    },
                 )
     return dict(
         version=1,
@@ -1217,7 +1261,9 @@ def record_slot_requirement(args):
     return 8 * (1 + args.warmup + args.windows * args.iterations)
 
 
-def measure_api_windows(args, operations, consume, synchronize, barrier, collect=None, clock=time.perf_counter_ns):
+def measure_api_windows(
+    args, operations, consume, synchronize, barrier, collect=None, clock=time.perf_counter_ns, fresh_timing=None
+):
     """Keep synchronization/collection at matched boundaries, never within the measured API window."""
     boundaries, timings = [], {}
 
@@ -1239,10 +1285,36 @@ def measure_api_windows(args, operations, consume, synchronize, barrier, collect
             synchronize()
             barrier()
             started = clock()
-            for _ in range(args.iterations):
-                consume(operation())
+            calls = []
+            for iteration in range(args.iterations):
+                if fresh_timing is not None and name == "fresh_dispatch":
+                    begin = clock()
+                    result = operation()
+                    returned = clock()
+                    consume(result)
+                    del result  # Match consume(operation()): do not retain outputs across calls.
+                    consumed = clock()
+                    calls.append(
+                        dict(iteration=iteration, api_host_ns=returned - begin, consume_ns=consumed - returned)
+                    )
+                else:
+                    consume(operation())
+            sync_begin = clock() if fresh_timing is not None and name == "fresh_dispatch" else None
             synchronize()
-            timings[name].append((clock() - started) / args.iterations)
+            finished = clock()
+            timings[name].append((finished - started) / args.iterations)
+            if sync_begin is not None:
+                fresh_timing.append(
+                    dict(
+                        window=window,
+                        calls=calls,
+                        elapsed_ns=finished - started,
+                        final_sync_ns=finished - sync_begin,
+                        loop_bookkeeping_ns=sync_begin
+                        - started
+                        - sum(c["api_host_ns"] + c["consume_ns"] for c in calls),
+                    )
+                )
             boundary(f"{name}/window{window}")
     return timings, boundaries
 
@@ -1279,14 +1351,42 @@ def test_window_collection_is_outside_timing_and_fits_128_slots():
         pending = 0
         elapsed += 100000  # A deliberately expensive collector must not affect API timings.
 
+    fresh = []
     timings, boundaries = measure_api_windows(
-        args, [operation] * 4, consume, synchronize, barrier, collect, lambda: elapsed
+        args, [operation] * 4, consume, synchronize, barrier, collect, lambda: elapsed, fresh_timing=fresh
     )
     assert labels == boundary_labels(args)
     assert occupancies == [8] + [v for _ in PERF_OPS for v in [20, 120, 120, 120, 120, 120]]
     assert pending == 0 and len(boundaries) == 25
     assert all(b["collect_ns"] == 100000 for b in boundaries)
     assert all(values == pytest.approx([12.05] * 5) for values in timings.values())
+    assert len(fresh) == 5
+    assert all(w["final_sync_ns"] == 3 and w["loop_bookkeeping_ns"] == 0 for w in fresh)
+    assert all(c["api_host_ns"] == 10 and c["consume_ns"] == 2 for w in fresh for c in w["calls"])
+
+
+@pytest.mark.parametrize("aligned", [False, True])
+def test_fresh_timing_does_not_retain_outputs_between_calls(aligned):
+    args = npu_parser().parse_args(["--output", "unused", "--warmup", "1", "--windows", "1", "--iterations", "32"])
+    alive = 0
+
+    class Output:
+        def __init__(self):
+            nonlocal alive
+            alive += 1
+
+        def __del__(self):
+            nonlocal alive
+            alive -= 1
+
+    def operation():
+        assert alive == 0
+        return Output()
+
+    measure_api_windows(
+        args, [operation] * 4, lambda value: value, lambda: None, lambda: None, fresh_timing=[] if aligned else None
+    )
+    assert alive == 0
 
 
 @pytest.mark.parametrize(
@@ -1357,7 +1457,7 @@ def npu_worker(args):
         from deep_ep.backends.direct._native import load_native_module
 
         host_probe_native = load_native_module()
-        if getattr(host_probe_native, "host_dispatch_probe_version", 0) != 2:
+        if getattr(host_probe_native, "host_dispatch_probe_version", 0) != 3:
             raise RuntimeError("Host dispatch timing requires the matching rebuilt native extension")
         gil_control = host_probe_native.check_host_dispatch_gil_probe()
         if gil_control not in (dict(held_control=1, released_control=0), dict(held_control=-1, released_control=-1)):
@@ -1430,6 +1530,7 @@ def npu_worker(args):
         if deferred:
             assert trace_entry["deferred_drains"] == boundary_count
 
+    fresh_timing = [] if args.align_fresh_timing else None
     timings, boundaries = measure_api_windows(
         args,
         (dispatch, lambda: dispatch(handle), lambda: combine(False), lambda: combine(True)),
@@ -1437,6 +1538,7 @@ def npu_worker(args):
         torch.npu.synchronize,
         dist.barrier,
         collect if args.windowed_collection else None,
+        fresh_timing=fresh_timing,
     )
     if host_probe_native is not None:
         host_report = host_probe_native.take_host_dispatch_probe()  # Disable and export only after all timed windows.
@@ -1453,6 +1555,7 @@ def npu_worker(args):
         wheel=deep_ep.__file__,
         init_ns=init_ns,
         timings_ns=timings,
+        fresh_timing=fresh_timing,
         recv_rows=owned.size(0),
         handle_id=getattr(handle, "_trace_handle_id", None),
         precision_passed=True,
@@ -1465,6 +1568,7 @@ def npu_worker(args):
         windowed_collection=args.windowed_collection,
         collection_boundaries=boundaries,
         host_dispatch_timing=args.host_dispatch_timing,
+        align_fresh_timing=args.align_fresh_timing,
         notify_device_timing=args.notify_device_timing,
     )
     if deferred:
@@ -1488,6 +1592,7 @@ def npu_parser():
     parser.add_argument("--npu", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--diagnostic", action="store_true", help="layered attribution, not performance acceptance")
+    parser.add_argument("--align-fresh-timing", action="store_true", help="align fresh window total with native phases")
     parser.add_argument("--diagnostic-timing", action="store_true", help="separate instrumented run only")
     parser.add_argument(
         "--notify-device-timing", action="store_true", help="diagnostic core-0 notify publication ticks"
@@ -1578,6 +1683,8 @@ def run_npu_acceptance(args):
             raise ValueError("--notify-device-timing requires --host-dispatch-timing")
         if args.diagnostic and args.diagnostic_timing and any(m in args.modes for m in ("production", "record_only")):
             raise ValueError("production control and record_only must run without --diagnostic-timing")
+        if args.align_fresh_timing and not args.host_dispatch_timing:
+            raise ValueError("--align-fresh-timing requires --host-dispatch-timing")
         required_slots = record_slot_requirement(args)
         deferred = args.diagnostic and "record_only" in args.modes
         if args.trace_slots == 0:
@@ -1634,6 +1741,8 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
         command.append("--host-dispatch-timing")
     if args.notify_device_timing:
         command.append("--notify-device-timing")
+    if args.align_fresh_timing:
+        command.append("--align-fresh-timing")
     print(f"RUN {destination.name}", flush=True)
     with (destination / "run.log").open("w") as log:
         run_npu_process(command, destination, env, log, args.timeout)
@@ -1665,6 +1774,8 @@ def validate_diagnostic_trial(destination, manifests, args, mode):
             raise ValueError("Host dispatch timing option was not applied")
         if manifest.get("notify_device_timing", False) != args.notify_device_timing:
             raise ValueError("notify device timing option was not applied")
+        if manifest.get("align_fresh_timing", False) != args.align_fresh_timing:
+            raise ValueError("fresh timing alignment option was not applied")
         if args.host_dispatch_timing:
             validate_host_dispatch_report(
                 json.loads((destination / f"host_dispatch_rank{rank}.json").read_text()), args, rank
@@ -1748,6 +1859,240 @@ def diagnostic_schedule(args):
                 yield dict(round=round_id, pair=pair, mode=trial, directory=name)
 
 
+def align_fresh_rank(manifest, host, args):
+    """Reconcile window wall time without summing overlapping Host/device intervals."""
+    windows = manifest.get("fresh_timing")
+    if not isinstance(windows, list) or len(windows) != args.windows:
+        raise ValueError("missing fresh timing windows")
+    samples = [r for r in host["samples"] if r["kind"] == "fresh_dispatch" and r["phase"] == "steady"]
+    indexed = {(r["window"], r["iteration"]): r for r in samples}
+    if len(indexed) != args.windows * args.iterations or len(samples) != len(indexed):
+        raise ValueError("fresh Host sample association mismatch")
+    points = (
+        "native_entry",
+        "notify_begin",
+        "notify_end",
+        "wait_begin",
+        "wait_end",
+        "outputs_begin",
+        "outputs_end",
+        "dispatch_begin",
+        "dispatch_end",
+        "native_exit",
+    )
+    names = (
+        "native_prepare",
+        "notify_launch_call",
+        "notify_to_wait",
+        "counts_wait",
+        "counts_postprocess",
+        "outputs_prepare",
+        "outputs_to_launch",
+        "dispatch_launch_call",
+        "native_return",
+    )
+    result = []
+    for w, window in enumerate(windows):
+        calls = window["calls"]
+        if window["window"] != w or len(calls) != args.iterations:
+            raise ValueError("fresh timing window identity mismatch")
+        for key in ("elapsed_ns", "final_sync_ns", "loop_bookkeeping_ns"):
+            if type(window[key]) is not int or window[key] < 0:
+                raise ValueError("invalid fresh window timing")
+        elapsed = window["final_sync_ns"] + window["loop_bookkeeping_ns"]
+        ledger = {
+            name: 0 for name in (*names, "python_and_native_boundary", "consume", "loop_bookkeeping", "final_sync")
+        }
+        matched, device_rows = [], []
+        for i, call in enumerate(calls):
+            if call["iteration"] != i or any(
+                type(call[k]) is not int or call[k] < 0 for k in ("api_host_ns", "consume_ns")
+            ):
+                raise ValueError("invalid fresh call timing")
+            row = indexed[w, i]
+            tick = row["steady_ns"]
+            phase = {name: tick[b] - tick[a] for name, a, b in zip(names, points, points[1:])}
+            if any(v < 0 for v in phase.values()):
+                raise ValueError("unordered fresh native phases")
+            native = sum(phase.values())
+            # Difference of durations only, never a subtraction of Python/C++ absolute timestamps.
+            phase["python_and_native_boundary"] = call["api_host_ns"] - native
+            phase["consume"] = call["consume_ns"]
+            for name, value in phase.items():
+                ledger[name] += value
+            elapsed += call["api_host_ns"] + call["consume_ns"]
+            device = {k: v for k, v in row["durations_ns"].items() if k.startswith("device_")}
+            device_rows.append(device)
+            matched.append(
+                dict(
+                    iteration=i,
+                    host_ordinal=row["ordinal"],
+                    api_call_id=row["api_call_id"],
+                    api_host_ns=call["api_host_ns"],
+                    native_ns=native,
+                    ledger_ns=phase,
+                    device_intervals_ns=device,
+                    sync_calls=row.get("notify_device", {}).get("sync_calls", {}),
+                )
+            )
+        ledger["loop_bookkeeping"] = window["loop_bookkeeping_ns"]
+        ledger["final_sync"] = window["final_sync_ns"]
+        total = elapsed / args.iterations
+        if elapsed != window["elapsed_ns"] or abs(total - manifest["timings_ns"]["fresh_dispatch"][w]) > 1e-6:
+            raise ValueError("fresh window total does not reconcile")
+        result.append(
+            dict(
+                window=w,
+                ns_per_api=total,
+                ledger_ns_per_api={k: v / args.iterations for k, v in ledger.items()},
+                calls=matched,
+                device_mean_ns={k: statistics.mean(r[k] for r in device_rows) for k in device_rows[0]},
+            )
+        )
+    return result
+
+
+def compare_fresh_windows(off, on):
+    """Select each trial's actual slowest rank; also preserve every fixed-rank comparison."""
+    result = []
+    for w in range(len(off[0])):
+        off_max = max(range(len(off)), key=lambda r: off[r][w]["ns_per_api"])
+        on_max = max(range(len(on)), key=lambda r: on[r][w]["ns_per_api"])
+        a, b = off[off_max][w], on[on_max][w]
+
+        def delta(x, y, key):
+            return {k: y[key][k] - x[key][k] for k in x[key]}
+
+        result.append(
+            dict(
+                window=w,
+                off_max_rank=off_max,
+                on_max_rank=on_max,
+                off_ns=a["ns_per_api"],
+                on_ns=b["ns_per_api"],
+                delta_ns=b["ns_per_api"] - a["ns_per_api"],
+                critical_ledger_delta_ns=delta(a, b, "ledger_ns_per_api"),
+                rank_deltas=[
+                    dict(
+                        rank=r,
+                        total_ns=on[r][w]["ns_per_api"] - off[r][w]["ns_per_api"],
+                        ledger_ns=delta(off[r][w], on[r][w], "ledger_ns_per_api"),
+                        device_ns=delta(off[r][w], on[r][w], "device_mean_ns"),
+                    )
+                    for r in range(len(off))
+                ],
+            )
+        )
+    return result
+
+
+def make_fresh_window(args, window=0):
+    return dict(
+        window=window,
+        elapsed_ns=240 * args.iterations,
+        final_sync_ns=20 * args.iterations,
+        loop_bookkeeping_ns=0,
+        calls=[dict(iteration=i, api_host_ns=200, consume_ns=20) for i in range(args.iterations)],
+    )
+
+
+@pytest.mark.parametrize("corruption", [None, "total", "missing", "iteration", "native_order"])
+def test_fresh_ledger_reconciles_and_rejects_invalid_associations(corruption):
+    args = npu_parser().parse_args(["--output", "unused", "--windows", "1", "--iterations", "32"])
+    host = validate_host_dispatch_report(make_host_probe_report(args), args, 0)
+    manifest = dict(fresh_timing=[make_fresh_window(args)], timings_ns=dict(fresh_dispatch=[240]))
+    if corruption == "total":
+        manifest["timings_ns"]["fresh_dispatch"][0] += 1
+    elif corruption == "missing":
+        host["samples"].pop(1 + args.warmup)
+    elif corruption == "iteration":
+        manifest["fresh_timing"][0]["calls"][0]["iteration"] = 1
+    elif corruption == "native_order":
+        host["samples"][1 + args.warmup]["steady_ns"]["wait_end"] = 0
+    if corruption:
+        with pytest.raises(ValueError):
+            align_fresh_rank(manifest, host, args)
+    else:
+        result = align_fresh_rank(manifest, host, args)[0]
+        assert sum(result["ledger_ns_per_api"].values()) == 240
+        assert result["ledger_ns_per_api"]["python_and_native_boundary"] == 80
+        assert result["calls"][0]["host_ordinal"] == 2 + args.warmup
+
+
+def test_fresh_comparison_handles_slowest_rank_switch():
+    def row(total):
+        return [dict(ns_per_api=total, ledger_ns_per_api=dict(a=total), device_mean_ns=dict(d=10))]
+
+    compared = compare_fresh_windows([row(300), row(400)], [row(450), row(420)])[0]
+    assert (compared["off_max_rank"], compared["on_max_rank"]) == (1, 0)
+    assert compared["delta_ns"] == 50
+    assert sum(compared["critical_ledger_delta_ns"].values()) == 50
+    assert [r["total_ns"] for r in compared["rank_deltas"]] == [150, 20]
+
+
+@pytest.mark.parametrize("corruption", ["missing", "negative", "unexecuted", "overflow"])
+def test_notify_sync_validation(corruption):
+    args = npu_parser().parse_args(["--output", "unused", "--notify-device-timing"])
+    report = make_host_probe_report(args)
+    device = report["samples"][0]["notify_device"]
+    if corruption == "missing":
+        device.pop("sync_ns")
+    elif corruption == "negative":
+        device["sync_calls"]["final_join"] = -1
+    elif corruption == "unexecuted":
+        device["sync_ns"]["expert_reuse_join"] = 1
+    else:
+        device["sync_calls"]["final_join"] = 1
+        device["sync_ns"]["final_join"] = 1000
+    with pytest.raises(ValueError):
+        validate_host_dispatch_report(report, args, 0)
+
+
+def write_fresh_alignment(args, runs):
+    trials = {}
+    for run in runs:
+        directory = args.output / run["directory"]
+        ranks = []
+        for rank in range(args.ep_size):
+            manifest = json.loads((directory / f"rank{rank}.json").read_text())
+            host = validate_host_dispatch_report(
+                json.loads((directory / f"host_dispatch_rank{rank}.json").read_text()), args, rank
+            )
+            ranks.append(align_fresh_rank(manifest, host, args))
+        original = statistics.median(max(r[w]["ns_per_api"] for r in ranks) for w in range(args.windows))
+        if abs(original - run["ns_per_api"]["fresh_dispatch"]) > 1e-6:
+            raise ValueError("fresh aggregate differs from performance metric")
+        trials[run["directory"]] = dict(ranks=ranks, median_window_max_ns=original)
+    baseline = {(r["round"], r["pair"]): r for r in runs if r["mode"] == "off"}
+    comparisons = []
+    for run in runs:
+        if run["mode"] == "off":
+            continue
+        off = baseline[run["round"], run["pair"]]
+        a, b = trials[off["directory"]], trials[run["directory"]]
+        comparisons.append(
+            dict(
+                round=run["round"],
+                mode=run["mode"],
+                pair=run["pair"],
+                off_directory=off["directory"],
+                on_directory=run["directory"],
+                aggregate_delta_ns=b["median_window_max_ns"] - a["median_window_max_ns"],
+                aggregate_percent=100 * (b["median_window_max_ns"] / a["median_window_max_ns"] - 1),
+                windows=compare_fresh_windows(a["ranks"], b["ranks"]),
+            )
+        )
+    report = dict(
+        trials=trials,
+        comparisons=comparisons,
+        note="Window total includes final device synchronization. Per-call API time is Host return time, not device completion. "
+        "Host ledger closes per window; device intervals overlap Host waits and must not be added. "
+        "Critical ledger compares potentially different winning ranks; fixed-rank deltas are separate. "
+        "Medians of component deltas need not sum to the aggregate median difference.",
+    )
+    (args.output / "fresh_alignment.json").write_text(json.dumps(report, indent=2))
+
+
 def diagnostic_layer_increments(runs):
     """Report both raw differences and own-baseline-adjusted differences; neither is exclusive cost."""
     baseline = {(r["round"], r["pair"]): r["ns_per_api"] for r in runs if r["mode"] == "off"}
@@ -1821,6 +2166,7 @@ def _run_npu_diagnostic(args):
         performance_acceptance=False,
         instrumented=args.diagnostic_timing or args.host_dispatch_timing,
         host_dispatch_timing=args.host_dispatch_timing,
+        align_fresh_timing=args.align_fresh_timing,
         notify_device_timing=args.notify_device_timing,
         paired_baselines=args.paired_baselines,
         layer_increments=diagnostic_layer_increments(runs),
@@ -1828,6 +2174,8 @@ def _run_npu_diagnostic(args):
         comparisons=comparisons,
     )
     (args.output / "diagnosis.json").write_text(json.dumps(report, indent=2))
+    if args.align_fresh_timing:
+        write_fresh_alignment(args, runs)
     print(json.dumps(report, indent=2), flush=True)
     return True  # Diagnostic success means valid evidence, never a <1% claim.
 
@@ -2023,7 +2371,8 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
 
 
 @pytest.mark.parametrize("device_timing", [False, True])
-def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkeypatch, device_timing):
+@pytest.mark.parametrize("align", [False, True])
+def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkeypatch, device_timing, align):
     args = npu_parser().parse_args(
         [
             "--npu",
@@ -2047,10 +2396,12 @@ def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkey
         ]
     )
     args.notify_device_timing = device_timing
+    args.align_fresh_timing = align
 
     def launch(command, destination, env, log, timeout):
         assert "--host-dispatch-timing" in command and "--windowed-collection" in command
         assert ("--notify-device-timing" in command) == device_timing
+        assert ("--align-fresh-timing" in command) == align
         mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if "DEEPEP_TRACE_DIR" in env else "off")
         count = len(boundary_labels(args))
         for rank in range(args.ep_size):
@@ -2062,10 +2413,12 @@ def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkey
                 metadata_statistics={},
                 host_dispatch_timing=True,
                 notify_device_timing=device_timing,
+                align_fresh_timing=align,
                 windowed_collection=True,
                 collection_boundaries=[dict(label=label, collect_ns=1) for label in boundary_labels(args)],
                 deferred_evidence=dict(thread_absent=True, drains_before_destroy=count, drains_after_destroy=count + 1),
-                timings_ns={op: [100] for op in PERF_OPS},
+                timings_ns={op: [240] for op in PERF_OPS},
+                fresh_timing=[make_fresh_window(args)] if align else None,
             )
             (destination / f"rank{rank}.json").write_text(json.dumps(manifest))
             (destination / f"host_dispatch_rank{rank}.json").write_text(json.dumps(make_host_probe_report(args, rank)))
@@ -2076,6 +2429,10 @@ def test_host_dispatch_controller_exports_instrumented_evidence(tmp_path, monkey
     report = json.loads((args.output / "diagnosis.json").read_text())
     assert report["instrumented"] and report["host_dispatch_timing"] and not report["performance_acceptance"]
     assert len(list(args.output.glob("round*/host_dispatch_rank*.json"))) == 3 * args.ep_size
+    if align:
+        alignment = json.loads((args.output / "fresh_alignment.json").read_text())
+        assert len(alignment["comparisons"]) == 2
+        assert all(c["aggregate_delta_ns"] == 0 for c in alignment["comparisons"])
 
 
 def test_diagnostic_paired_schedule_and_production_guard(tmp_path):

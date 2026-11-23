@@ -7,4 +7,9 @@ namespace ascend_deepep::trace {
 constexpr uint32_t kLineBytes = 128;
 constexpr uint32_t kCoreBytes = 2 * kLineBytes;
 constexpr uint32_t kTickHz = 1000000000;  // Ascend950
+// Independent notify diagnostic slots: 20 uint64 payload words, then an isolated completion block.
+constexpr uint32_t kNotifyProbeWords = 20;
+constexpr uint32_t kNotifyProbeDoneOffset = 224;
+static_assert(kNotifyProbeWords * sizeof(uint64_t) <= kNotifyProbeDoneOffset);
+static_assert(kNotifyProbeDoneOffset + 32 <= kCoreBytes);
 }  // namespace ascend_deepep::trace

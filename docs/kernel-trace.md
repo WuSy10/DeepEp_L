@@ -315,7 +315,7 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselin
     --output "$PWD/trace_host_counts_$(date +%Y%m%d_%H%M%S)"
 ```
 
-六轮共 24 次进程组初始化，每个模式（包括 off）均启用相同探针，保留相邻独立 off 和交替顺序。需要重新编译 Host 扩展：`host_dispatch_probe_version=2`；采集诊断接口版本仍为 4。每 rank 导出 622 次原生 dispatch 调用，fresh/cached 各 311 次，分别标记精度、预热、稳态窗口及窗口内序号。每种 API 的 300 次稳态样本用于分段汇总，不把同一进程内的样本当作 300 次独立实验。
+六轮共 24 次进程组初始化，每个模式（包括 off）均启用相同探针，保留相邻独立 off 和交替顺序。需要重新编译 Host 扩展：`host_dispatch_probe_version=3`；采集诊断接口版本仍为 4。每 rank 导出 622 次原生 dispatch 调用，fresh/cached 各 311 次，分别标记精度、预热、稳态窗口及窗口内序号。每种 API 的 300 次稳态样本用于分段汇总，不把同一进程内的样本当作 300 次独立实验。
 
 | 分段 | 含义 |
 | --- | --- |
@@ -362,14 +362,60 @@ GIL 状态通过当前线程的 `PyGILState_Check()` 获取，不使用 heartbea
 内存与同步约定：
 
 - 初始化时分配独立 Host 映射区，每个原生调用保留 256 字节，当前 622 条共 159232 字节/rank。它不改变普通 trace 的 128 槽容量。
-- 只有 core 0 写本次调用的独占地址：偏移 0 写四个 uint64 tick（32 字节），偏移 128 写本轮 `done_seq`（32 字节）。不在诊断运行内复用地址，序号为该 Host 样本的 ordinal。
-- 四个时间戳先保存在标量中。原有计数发布循环全部完成后，才复用已排空、32 字节对齐的 accumulator UB 前 32 字节；沿用 S_MTE3/MTE3_S 发布 payload，再发布 done_seq。不增加全卡或全核同步。
+- 只有 core 0 写本次调用的独占地址：偏移 0 写四个 uint64 tick（32 字节），偏移 32～95 写八类同步耗时、96～159 写八类同步次数，偏移 224 写本轮 `done_seq`（32 字节）。不在诊断运行内复用地址，序号为该 Host 样本的 ordinal。
+- 四个时间戳及同步累计量先保存在局部变量中。原有计数发布循环全部完成后，才复用已排空、32 字节对齐的 accumulator UB 前 32 字节；沿用 S_MTE3/MTE3_S 发布 payload，再发布 done_seq。不增加全卡或全核同步。
 - 普通采集线程不扫描这个诊断区，CPU 业务不等待诊断 done_seq。所有计时窗口结束后显式导出，设备同步后核对序号、读取并释放映射区；异常清理同样先确保设备不再写入。
 - 新增 tick 和两次 32 字节诊断写入仍可能扰动 notify 尾部及后续调用，只能用于定位。不能以“异步”宣称零开销。
 
 分析优先逐 rank、逐轮、逐窗口比较 Host `native_prepare`、`notify_launch_call`、`counts_wait` 和设备上述区间。若设备 `entry→publish_begin` 也明显增长，继续定位 notify 内部及对端到达；若设备区间不增长而 Host 等待增长，仍需区分 kernel 入队/启动、CPU 进入等待时刻变化和 CPU 观察调度，不能直接断言是 CPU 调度。
 
 CPU 测试覆盖序号不匹配、漏报、时间倒序、cached 意外报告及回读路径误用；Linux 原生协议测试模拟独立槽写入、完成标志和重新配置后的清零。模拟不替代真实设备的编译、精度和内存可见性验证。
+
+### Fresh 总耗时对齐与 notify 同步分解
+
+为避免拿平均 rank 分段解释最慢 rank 总耗时，增加 `--align-fresh-timing`。必须配合 `--host-dispatch-timing`，所有模式包括 off 都使用相同插桩。当前原生探针版本为 3，Host/device 都须重新构建；采集接口版本仍为 4。
+
+```bash
+python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
+    --host-dispatch-timing --notify-device-timing --align-fresh-timing \
+    --windowed-collection --trace-slots 128 \
+    --modes off record_only production --rounds 6 \
+    --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
+    --num-topk 8 --experts-per-rank 32 --aiv 32 --reduce-aiv 32 \
+    --windows 5 --iterations 60 --warmup 10 \
+    --output "$PWD/trace_fresh_aligned_$(date +%Y%m%d_%H%M%S)"
+```
+
+原性能指标保持为每个窗口内“连续调用、消费流依赖提交、窗口末尾设备同步”的总墙钟除以调用次数；每窗口取最大 rank，再对窗口取中位数。没有逐次增加设备同步。新增逐次 `api_host_ns` 只测 Python dispatch 调用到返回，不表示该次设备通信已完成；`consume_ns` 测原有消费流依赖提交和本次返回对象释放；不会额外持有输出跨到下次调用。
+
+`rankN.json.fresh_timing` 保存逐次 Host 调用、消费依赖提交、循环记账和末尾同步耗时。控制器按 rank/窗口/iteration 将其与 Host 原生样本一一关联，输出 `fresh_alignment.json`：
+
+- `trials` 保存每个 rank 的窗口总耗时、逐次关联的 ordinal/API ID、Host 分段和设备分段。
+- Host ledger 使用互不重叠的原生区间；加上 Python/原生边界残差、consume、循环记账、窗口末尾同步后，必须与该 rank 窗口总耗时一致。边界残差为 Host 调用时长减原生作用域时长，包含 Python layout、包装及探针边界等工作，不能称为纯 Python 或 GIL 成本。两种 Host 计时器只比较时长，不直接相减绝对时间戳；残差原样保留。
+- `comparisons` 使用本模式相邻独立 off。每窗口记录 `off_max_rank`、`on_max_rank` 和实际最大值之差；`critical_ledger_delta_ns` 比较这两个实际获选 rank 的 ledger，允许最慢 rank 变化。
+- `rank_deltas` 同时保留所有固定 rank 的总耗时、Host 分段和设备区间增量。不要把“不同获选 rank 的分段差”误称为“某个固定 rank 的变化”。
+- 每轮 `aggregate_percent` 严格沿用原先的中位数窗口最大值口径。各分段中位差不保证能加成总指标中位差；逐窗口 ledger 才用于核对加和。
+
+窗口末尾同步单列，不平均摊成某次 kernel 的执行时长。设备区间与 Host 等待重叠，仅作为旁证，不参与 Host ledger 加和。新增 Python 时钟读取和记账有开销，该运行依然不是 <1% 验收，也不能直接套用历史未插桩的劣化百分比。
+
+notify 的 core 0 在原有八处同步调用前后读取 tick，循环内的调用累计耗时和次数：
+
+| 分类 | 原有同步位置 |
+| --- | --- |
+| `entry_collective` | 条件性的 workspace 复用入口跨 rank 同步 |
+| `channel_counts_join` | 本地 channel 计数写入后的全核同步 |
+| `channel_prefix_join` | channel 前缀处理后的全核同步 |
+| `counts_collective` | rank/expert 计数发布后的跨 rank 同步 |
+| `gather_join` | 批量收集远端计数后的全核同步，取决于算法路径 |
+| `expert_reuse_join` | 后续 expert tile 复用 scratch 前的全核同步，累计 |
+| `expert_ready_join` | 后续 expert tile 装入后的全核同步，累计 |
+| `final_join` | Host 计数发布之前原有的全核同步 |
+
+`notify_device.sync_ns/sync_calls` 保存八类累计量；未执行的条件分支为 0 次。每个参与 core 仍执行原来的同步，只有 core 0 读取诊断时钟，不新增同步点。`device_sync_total` 为这些区间之和，`device_ready_other` 为 `entry→counts_ready` 扣除这些区间后的剩余量。后者仍包含计算、访存、流水事件等待和诊断指令，不能称为纯计算时间；同步区间包含同步实现自身执行成本，不能称为纯对端等待。core 0 的同步耗时也不代表所有 core 的最大耗时。
+
+同步统计沿用前述独占诊断槽，payload 共 160 字节，done_seq 块位于 224～255；各 32 字节写入互不重叠，全部 payload 排空后才发布 done_seq。复用原有 accumulator 前 32 字节，逐块写出，不扩大 UB、不更改生产 trace 环容量。数据仍在业务计数发布后写出，测试结束后读取；额外诊断写入可能扰动后续推进，需结合对照解释。
+
+分析顺序：先报告本轮 fresh 总耗时劣化及获选 rank，再展示对应窗口闭合的 Host 增量，最后用该 rank 的设备同步分类解释等待变化。如果只能定位到 `device_ready_other`，或条件同步次数变化，应保留这一不确定性，不按平均占比分摊。
 
 ## 元数据缓存与原生批量编码的验证
 

@@ -222,7 +222,7 @@ HostDispatchReport TakeHostDispatchProbe()
             if (!sample.notify_sequence) continue;
             const auto* line = reinterpret_cast<const uint64_t*>(
                 static_cast<const uint8_t*>(host_probe.device->host) + (sample.ordinal - 1) * kCoreBytes);
-            sample.notify_done = __atomic_load_n(line + kLineBytes / sizeof(uint64_t), __ATOMIC_ACQUIRE);
+            sample.notify_done = __atomic_load_n(line + kNotifyProbeDoneOffset / sizeof(uint64_t), __ATOMIC_ACQUIRE);
             if (sample.notify_done == sample.notify_sequence)
                 std::copy_n(line, sample.notify_ticks.size(), sample.notify_ticks.begin());
         }
