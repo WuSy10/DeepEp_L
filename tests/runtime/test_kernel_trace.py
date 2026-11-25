@@ -17,16 +17,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def load_monitor():
+def load_monitor(directory):
     spec = importlib.util.spec_from_file_location("trace_monitor_test", ROOT / "deep_ep/utils/kernel_trace.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module.KernelTrace._benchmark_directory = directory
     return module.KernelTrace
 
 
 def test_python_monitor_shared_source_and_shutdown(tmp_path, monkeypatch):
-    monitor = load_monitor()
-    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
+    monitor = load_monitor(tmp_path)
+    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
 
     class Source:
         identity = 123
@@ -84,8 +85,8 @@ def test_python_monitor_shared_source_and_shutdown(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("windowed", [False, True])
 def test_record_only_defers_all_collection_until_detach(tmp_path, monkeypatch, windowed):
-    monitor = load_monitor()
-    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
+    monitor = load_monitor(tmp_path)
+    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "record_only")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "0")
 
@@ -160,6 +161,7 @@ inline int aclrtSynchronizeDevice(){return 0;}
 #include "runtime/kernel_trace.h"
 #include "common/kernel_trace_layout.h"
 #include <cassert>
+#include <chrono>
 #include <thread>
 #include <iostream>
 #include <stdexcept>
@@ -168,6 +170,12 @@ int gil_calls=0;
 int fake_gil(){++gil_calls; return 1;}
 extern "C" void kernel_trace_clock_do(void*,uint8_t* p){*reinterpret_cast<uint64_t*>(p)=100;}
 int main(){
+    unsetenv("DEEPEP_TRACE_RECORDER_ENABLE");
+    setenv("DEEPEP_TRACE_DIR", "/unused", 1);
+    assert(!KernelTrace::Open());
+    setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1", 1);
+    unsetenv("DEEPEP_TRACE_POLL_INTERVAL_MS");
+    unsetenv("DEEPEP_TRACE_TIMEOUT_MS");
     using P=DispatchProbePoint;
     ConfigureHostDispatchProbe(0, &fake_gil);
     {HostDispatchProbe p(0,false); p.Mark(P::WaitBegin); p.Finish();}
@@ -215,9 +223,64 @@ int main(){
      p.Finish();}
     auto missing=TakeHostDispatchProbe();
     assert(missing.samples[0].notify_done==0 && missing.samples[0].notify_ticks[0]==0);
-    setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata", 1);
+    {
+        auto recorder_source = KernelTrace::Open();
+        assert(recorder_source && recorder_source->PollIntervalMs() == 2);
+        assert(!recorder_source->Reserve(0, 1, 2, "dispatch", "v1_dispatch_udma_kernel").address);
+        auto root = std::make_shared<TraceMetadata>();
+        root->labels["comm_id"] = "0123456789abcdef0123456789abcdef";
+        root->op_counters = std::make_shared<KernelOpCounters>();
+        auto meta = MakeCallMetadata(root, 12, 13, 4);
+        ScopedTraceMetadata scope(meta);
+        auto ticket = recorder_source->Reserve(0, 1, 2, "dispatch", "v1_dispatch_udma_kernel");
+        assert(ticket.address);
+        auto* first = reinterpret_cast<uint64_t*>(ticket.address);
+        auto* second = reinterpret_cast<uint64_t*>(ticket.address + kCoreBytes);
+        first[0] = 100; first[1] = 200; first[kLineBytes/sizeof(uint64_t)] = ticket.sequence;
+        second[0] = 50; second[1] = 300; second[kLineBytes/sizeof(uint64_t)] = ticket.sequence + 1;
+        recorder_source->Submit(ticket, 1000, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        auto pending = recorder_source->Drain(false, true);
+        assert(pending.size() == 1 && pending[0].event == "timeout");
+        assert(pending[0].values.at("gid") == static_cast<int64_t>(ticket.sequence));
+        assert(pending[0].values.at("op") == 2 && pending[0].values.at("op_count") == 0);
+        assert(pending[0].values.at("dispatch_count") == 4 && !pending[0].values.count("start_tick"));
+        assert(recorder_source->Drain(false, true).empty());
+        second[kLineBytes/sizeof(uint64_t)] = ticket.sequence;
+        auto done = recorder_source->Drain(false, true);
+        assert(done.size() == 1 && done[0].event == "end");
+        assert(done[0].values.at("gid") == pending[0].values.at("gid"));
+        assert(done[0].values.at("start_tick") == 50 && done[0].values.at("end_tick") == 300);
+    }
+    setenv("DEEPEP_TRACE_POLL_INTERVAL_MS", "0", 1);
+    assert(!KernelTrace::Open());
+    setenv("DEEPEP_TRACE_POLL_INTERVAL_MS", "8", 1);
+    setenv("DEEPEP_TRACE_TIMEOUT_MS", "1.5", 1);
+    assert(!KernelTrace::Open());
+    setenv("DEEPEP_TRACE_TIMEOUT_MS", "60000", 1);
+    {
+        auto recorder_source = KernelTrace::Open();
+        assert(recorder_source && recorder_source->PollIntervalMs() == 8);
+        setenv("DEEPEP_TRACE_TIMEOUT_MS", "1", 1);
+        auto root = std::make_shared<TraceMetadata>();
+        root->labels["comm_id"] = "0123456789abcdef0123456789abcdef";
+        root->op_counters = std::make_shared<KernelOpCounters>();
+        ScopedTraceMetadata scope(root);
+        auto ticket = recorder_source->Reserve(0, 1, 1, "dispatch", "v1_dispatch_udma_kernel");
+        assert(ticket.address);
+        recorder_source->Submit(ticket, 1000, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        assert(recorder_source->Drain(false, true).empty());
+        auto* ticks = reinterpret_cast<uint64_t*>(ticket.address);
+        ticks[0] = 100; ticks[1] = 200; ticks[kLineBytes/sizeof(uint64_t)] = ticket.sequence;
+        auto done = recorder_source->Drain(false, true);
+        assert(done.size() == 1 && done[0].event == "end");
+    }
+    unsetenv("DEEPEP_TRACE_POLL_INTERVAL_MS");
+    unsetenv("DEEPEP_TRACE_TIMEOUT_MS");
+    ConfigureTraceTestMode(true);
     assert(!KernelTrace::Open()); // No collector/calibration for Host-only metadata.
-    unsetenv("DEEPEP_TRACE_DIAGNOSTIC_MODE");
+    ConfigureTraceTestMode(false);
     auto sink=KernelTrace::Open(); assert(sink);
     TraceMetadata outer;
     outer.values["api_call_id"] = 999;
@@ -345,7 +408,6 @@ int main(){
         ],
         check=True,
     )
-    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
     monkeypatch.delenv("DEEPEP_TRACE_SLOTS", raising=False)
     result = subprocess.run([str(binary)], check=True, timeout=20, capture_output=True, text=True)
     encoded = json.loads(result.stdout)
@@ -389,8 +451,8 @@ def mixed_trace(tmp_path):
 
 def test_python_monitor_mixed_kernels_and_checker(mixed_trace, monkeypatch):
     checker, path, rows = mixed_trace
-    monitor = load_monitor()
-    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(path.parent))
+    monitor = load_monitor(path.parent)
+    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
     written = threading.Event()
 
     class Source:
@@ -480,18 +542,21 @@ class MetadataTensor:
 class MetadataNative:
     kernel_trace_diagnostic_version = 4
     kernel_trace_metadata_version = 2
+    trace_recorder_version = 3
 
     def __init__(self):
         self.context = threading.local()
         self.templates = 0
 
-    def make_trace_metadata(self, fields, parent=None):
+    def make_trace_metadata(self, fields, parent=None, recorder=False):
         self.templates += 1
         return dict(parent or {}, **fields)
 
-    def push_trace_metadata(self, template, api, handle):
+    def push_trace_metadata(self, template, api, handle, dispatch_count=-1):
         previous = getattr(self.context, "fields", {})
         self.context.fields = dict(template, api_call_id=api, handle_id=handle)
+        if dispatch_count >= 0:
+            self.context.fields["dispatch_count"] = dispatch_count
         return previous
 
     def restore_trace_metadata(self, previous):
@@ -631,8 +696,8 @@ def test_metadata_rejects_old_native_extension():
 def test_trace_group_initialization(monkeypatch):
     module = load_trace_module()
     native = MetadataNative()
-    monkeypatch.setenv("DEEPEP_TRACE_DIR", "test")
-    monkeypatch.setattr(module.KernelTrace, "attach", lambda native: 456)
+    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
+    monkeypatch.setattr(module.KernelTrace, "attach", lambda native, comm_id: 456)
     monkeypatch.setattr(module, "_global_rank", lambda: 9)
     proposals = []
 
@@ -645,7 +710,7 @@ def test_trace_group_initialization(monkeypatch):
     assert first.fields["comm_id"] == second.fields["comm_id"] == "rank0-uuid"
     assert first.fields["buffer_id"] != second.fields["buffer_id"]
     assert proposals[0][1] and proposals[1][1] is None
-    monkeypatch.delenv("DEEPEP_TRACE_DIR")
+    monkeypatch.delenv("DEEPEP_TRACE_RECORDER_ENABLE")
     with pytest.raises(ValueError, match="all EP ranks"):
         module.attach_trace_session(native, None, 1, 2, gather)
     assert module.attach_trace_session(native, None, 0, 2, lambda *args: [(False, None, "", False)] * 2) == (None, None)
@@ -655,7 +720,8 @@ def test_metadata_only_and_mode_consensus(monkeypatch):
     module = load_trace_module()
     native = MetadataNative()
     native.kernel_trace_diagnostic_version = 4
-    monkeypatch.setenv("DEEPEP_TRACE_DIR", "unused")
+    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
+    monkeypatch.setattr(module.KernelTrace, "_benchmark_directory", Path("unused"))
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "1")
     monkeypatch.setattr(module, "_global_rank", lambda: 0)
@@ -685,8 +751,8 @@ def test_reject_invalid_diagnostic_settings(monkeypatch, mode, timing):
 @pytest.mark.parametrize("mode", ["native", "json_discard", "json", "full"])
 @pytest.mark.parametrize("timing", [False, True])
 def test_diagnostic_monitor_recycling_and_output(tmp_path, monkeypatch, mode, timing):
-    monitor = load_monitor()
-    monkeypatch.setenv("DEEPEP_TRACE_DIR", str(tmp_path))
+    monitor = load_monitor(tmp_path)
+    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", mode)
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", str(int(timing)))
 
@@ -1301,6 +1367,300 @@ def test_npu_metadata_acceptance(tmp_path, corruption):
         validate_npu_metadata(tmp_path, manifests, args)
 
 
+def validate_production_trace(directory, manifests, args):
+    """Validate file ownership, schema, timing, and per-rank completeness of production trace logs."""
+    from collections import defaultdict
+    from datetime import datetime, timedelta
+    import re
+
+    ranks = set(range(args.ep_size))
+    if len(manifests) != args.ep_size or {m.get("rank") for m in manifests} != ranks:
+        raise ValueError("invalid production trace manifest ranks")
+    comm_id = manifests[0].get("trace_comm_id")
+    if not isinstance(comm_id, str) or not re.fullmatch(r"[0-9a-f]{32}", comm_id):
+        raise ValueError("invalid production trace communication UUID")
+    by_rank = {m["rank"]: m for m in manifests}
+    for manifest in manifests:
+        if (
+            manifest.get("trace_comm_id") != comm_id
+            or manifest.get("precision_passed") is not True
+            or manifest.get("trace_mode") != "production"
+            or manifest.get("trace_ring_active") is not True
+            or manifest.get("trace_slots") != 128
+            or type(manifest.get("pid")) is not int
+            or manifest["pid"] <= 0
+        ):
+            raise ValueError(f"rank {manifest['rank']}: invalid production trace manifest")
+
+    file_pattern = re.compile(rf"trmt-deepep-trace-{comm_id}-(0|[1-9][0-9]*)-([0-7])\.txt")
+    files = {}
+    for path in directory.glob("trmt-deepep-trace-*.txt"):
+        match = file_pattern.fullmatch(path.name)
+        if not match or not path.is_file() or path.is_symlink() or path.stat().st_size > 1_000_000_000:
+            raise ValueError(f"invalid production trace file: {path.name}")
+        bus_id, index = map(int, match.groups())
+        if bus_id >= 1 << 32:
+            raise ValueError(f"invalid production trace bus ID: {path.name}")
+        files.setdefault(bus_id, {})[index] = path
+    if len(files) != args.ep_size or any(set(ring) != set(range(8)) for ring in files.values()):
+        raise ValueError("production trace must contain eight files per rank")
+
+    wall_time_format = "%Y-%m-%d %H:%M:%S.%f"
+    wall_time_pattern = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}")
+
+    def wall_time(value, location):
+        if isinstance(value, str) and wall_time_pattern.fullmatch(value):
+            try:
+                return datetime.strptime(value, wall_time_format)
+            except ValueError:
+                pass
+        raise ValueError(f"{location}: invalid production trace wall time")
+
+    microsecond = timedelta(microseconds=1)
+    local_epoch = datetime(1970, 1, 1, 8)
+    device_fields = {"start_time", "end_time", "elapsed_ns", "start_tick", "end_tick"}
+    metadata_fields = {
+        "gid", "op", "op_count", "dispatch_count", "bus_id", "rank", "nvl_rank", "num_sms",
+        "pid", "stream", "comm_id", "launch_time",
+    }
+    common_fields = metadata_fields | device_fields | {"type"}
+    expected_shape = dict(
+        ep_size=args.ep_size, hidden_size=args.hidden, num_experts=args.ep_size * args.experts_per_rank,
+        num_tokens=args.num_tokens, topk=args.num_topk,
+    )
+    short_ops = {0, 1, 3, 6}
+    effective_aiv = args.aiv or 32
+    reduce_aiv = args.reduce_aiv or effective_aiv
+    by_bus = {}
+    bus_by_rank = {}
+    seen = {}
+    clock_offsets = {}
+    completed = {rank: defaultdict(list) for rank in ranks}
+    for bus_id, ring in files.items():
+        for index in range(8):
+            path = ring[index]
+            with path.open(encoding="utf-8") as log:
+                for number, line in enumerate(log, 1):
+                    location = f"{path.name}:{number}"
+                    try:
+                        row = json.loads(line)
+                    except ValueError as error:
+                        raise ValueError(f"{location}: invalid production trace JSON") from error
+                    if not isinstance(row, dict):
+                        raise ValueError(f"{location}: invalid production trace schema")
+                    op, kind = row.get("op"), row.get("type")
+                    if type(op) is not int or op not in range(10) or type(kind) is not int or kind not in (1, 2):
+                        raise ValueError(f"{location}: invalid production trace op or type")
+                    shape_fields = expected_shape.keys() if op not in short_ops else set()
+                    if set(row) != common_fields | shape_fields:
+                        raise ValueError(f"{location}: invalid production trace schema for op {op}")
+                    if any(type(row[key]) is not int or row[key] != expected_shape[key] for key in shape_fields):
+                        raise ValueError(f"{location}: invalid production trace shape metadata")
+
+                    limits = {
+                        "gid": (1, (1 << 63) - 1), "rank": (0, args.ep_size - 1),
+                        "bus_id": (bus_id, bus_id), "pid": (1, (1 << 63) - 1), "nvl_rank": (0, 15),
+                        "num_sms": (1, 64), "stream": (0, (1 << 64) - 1),
+                        "op_count": (0, (1 << 63) - 1), "dispatch_count": (0, (1 << 63) - 1),
+                    }
+                    for key, (low, high) in limits.items():
+                        if type(row[key]) is not int or not low <= row[key] <= high:
+                            raise ValueError(f"{location}: invalid production trace {key}")
+                    expected_aiv = reduce_aiv if op == 6 else effective_aiv
+                    if row["num_sms"] != expected_aiv:
+                        raise ValueError(f"{location}: op {op} num_sms={row['num_sms']}, expected {expected_aiv}")
+                    rank, gid = row["rank"], row["gid"]
+                    if row["comm_id"] != comm_id or row["pid"] != by_rank[rank]["pid"] or row["nvl_rank"] != rank % 16:
+                        raise ValueError(f"{location}: production trace identity mismatch")
+                    if by_bus.setdefault(bus_id, rank) != rank or bus_by_rank.setdefault(rank, bus_id) != bus_id:
+                        raise ValueError(f"{location}: production trace bus/rank mismatch")
+                    wall_time(row["launch_time"], location)
+                    if kind == 1:
+                        if any(row[key] is not None for key in device_fields):
+                            raise ValueError(f"{location}: production trace timeout has device timing")
+                    else:
+                        start, end, elapsed = (row[k] for k in ("start_tick", "end_tick", "elapsed_ns"))
+                        if (
+                            any(type(value) is not int for value in (start, end, elapsed))
+                            or not 0 <= start <= end
+                            or elapsed != end - start
+                        ):
+                            raise ValueError(f"{location}: invalid production trace device ticks")
+                        start_wall = wall_time(row["start_time"], location)
+                        end_wall = wall_time(row["end_time"], location)
+                        wall_elapsed = (end_wall - start_wall) // microsecond
+                        if wall_elapsed not in {elapsed // 1000, (elapsed + 999) // 1000}:
+                            raise ValueError(f"{location}: inconsistent production trace device wall time")
+                        start_offset = ((start_wall - local_epoch) // microsecond) * 1000 - start
+                        end_offset = ((end_wall - local_epoch) // microsecond) * 1000 - end
+                        low, high = max(start_offset, end_offset), min(start_offset, end_offset) + 999
+                        if rank in clock_offsets:
+                            previous_low, previous_high = clock_offsets[rank]
+                            low, high = max(low, previous_low), min(high, previous_high)
+                        if low > high:
+                            raise ValueError(
+                                f"{location}: inconsistent production trace calibration offset for rank {rank}"
+                            )
+                        clock_offsets[rank] = (low, high)
+                        completed[rank][op].append((row["op_count"], row["dispatch_count"]))
+
+                    metadata = {key: row[key] for key in metadata_fields | shape_fields}
+                    first, kinds = seen.setdefault((rank, gid), (metadata, set()))
+                    if first != metadata or kind in kinds:
+                        raise ValueError(f"{location}: mismatched or duplicate production trace record")
+                    kinds.add(kind)
+
+    if any(2 not in kinds for _, kinds in seen.values()):
+        raise ValueError("production trace timeout without completion")
+    per_kind = 1 + args.warmup + args.windows * args.iterations
+    dispatch_ids = {
+        0: [0, *range(2, per_kind + 1)],
+        1: [1, *range(per_kind + 1, 2 * per_kind)],
+        2: list(range(2 * per_kind)),
+        5: [0] * (2 * per_kind),
+        6: [0] * (2 * per_kind),
+    }
+    expected = {op: len(ids) for op, ids in dispatch_ids.items()}
+    for rank, operations in completed.items():
+        counts = {op: len(records) for op, records in operations.items()}
+        if counts != expected:
+            raise ValueError(f"rank {rank}: production trace completion counts {counts}, expected {expected}")
+        for op, records in operations.items():
+            for ordinal, (op_count, dispatch_count) in enumerate(sorted(records)):
+                if op_count != ordinal:
+                    raise ValueError(f"rank {rank} op {op}: op_count={op_count}, expected {ordinal}")
+                expected_dispatch_count = dispatch_ids[op][ordinal]
+                if dispatch_count != expected_dispatch_count:
+                    raise ValueError(
+                        f"rank {rank} op {op} op_count={ordinal}: dispatch_count={dispatch_count}, "
+                        f"expected {expected_dispatch_count}"
+                    )
+
+    summary = re.compile(r"DeepEP trace recorder device [0-9]+: incomplete=([0-9]+) dropped=([0-9]+)")
+    with (directory.parent / "run.log").open(encoding="utf-8", errors="replace") as log:
+        for line in log:
+            match = summary.search(line)
+            if (match and any(int(value) for value in match.groups())) or any(
+                message in line for message in (
+                    "KernelTrace logging unavailable:", "KernelTrace logging failed:",
+                    "DeepEP trace recorder unavailable:", "DeepEP kernel trace disabled:",
+                )
+            ):
+                raise ValueError(f"production trace logger reported failure: {line.strip()}")
+
+
+@pytest.mark.parametrize(
+    "corruption, message",
+    [
+        (None, None), ("no_timeout", None), ("default_reduce", None), ("default_both_aiv", None),
+        ("sub_microsecond", None), ("wall_offset", "calibration offset"),
+        ("missing_completion", "completion counts"),
+        ("short_schema", "schema"), ("long_schema", "schema"), ("ticks", "device ticks"),
+        ("unpaired", "without completion"), ("mismatched_timeout", "mismatched"),
+        ("zero_counts", "op_count"), ("zero_dispatch_counts", "dispatch_count"),
+        ("wrong_dispatch_association", "dispatch_count"), ("wrong_reduce_aiv", "op 6 num_sms"),
+        ("dropped", "logger reported failure"),
+    ],
+)
+def test_validate_production_trace(tmp_path, corruption, message):
+    from types import SimpleNamespace
+
+    logged_aiv = 48 if corruption == "default_reduce" else 32
+    if corruption in ("default_reduce", "default_both_aiv"):
+        reduce_aiv, logged_reduce_aiv = 0, logged_aiv
+    else:
+        reduce_aiv = logged_reduce_aiv = 64
+    args = SimpleNamespace(
+        ep_size=2, num_tokens=128, hidden=6144, num_topk=8, experts_per_rank=32, warmup=1, windows=2, iterations=1,
+        aiv=0 if corruption == "default_both_aiv" else logged_aiv, reduce_aiv=reduce_aiv,
+    )
+    directory = tmp_path / "trace"
+    directory.mkdir()
+    comm_id = "0123456789abcdef" * 2
+    manifests = [
+        dict(rank=rank, pid=100 + rank, precision_passed=True, trace_mode="production",
+             trace_ring_active=True, trace_slots=128, trace_comm_id=comm_id)
+        for rank in range(args.ep_size)
+    ]
+    per_kind = 1 + args.warmup + args.windows * args.iterations
+    for rank, manifest in enumerate(manifests):
+        bus_id = 500 + rank
+        stem = f"trmt-deepep-trace-{comm_id}-{bus_id}-"
+        for index in range(8):
+            (directory / f"{stem}{index}.txt").touch()
+        rows, op_counts = [], {}
+
+        def record(op, dispatch_count):
+            count = op_counts.get(op, 0)
+            op_counts[op] = count + 1
+            row = dict(
+                type=2, gid=2 * len(rows) + 1, op=op, op_count=count, dispatch_count=dispatch_count,
+                bus_id=bus_id, rank=rank, nvl_rank=rank % 16, num_sms=logged_reduce_aiv if op == 6 else logged_aiv,
+                pid=manifest["pid"], stream=1 << 63, comm_id=comm_id, launch_time="2026-11-12 15:29:04.967346",
+                start_time="2026-11-12 15:29:04.967558" if rank == 0 else "2026-11-12 15:29:04.967560",
+                end_time="2026-11-12 15:29:04.967564" if rank == 0 else "2026-11-12 15:29:04.967566",
+                elapsed_ns=6000, start_tick=120000, end_tick=126000,
+            )
+            if op in (2, 5):
+                row.update(ep_size=2, hidden_size=6144, num_experts=64, num_tokens=128, topk=8)
+            rows.append(row)
+
+        notify_ops = [0, 1] + [0] * (per_kind - 1) + [1] * (per_kind - 1)
+        for dispatch_count, notify in enumerate(notify_ops):
+            record(notify, dispatch_count)
+            record(2, dispatch_count)
+        for _ in range(2 * per_kind):
+            record(5, 0)
+            record(6, 0)
+        timeout = dict(rows[0], type=1, start_time=None, end_time=None, elapsed_ns=None, start_tick=None, end_tick=None)
+        if rank == 0:
+            if corruption == "missing_completion":
+                rows.pop()
+            elif corruption == "unpaired":
+                rows.pop(0)
+            elif corruption == "short_schema":
+                rows[0]["ep_size"] = 2
+            elif corruption == "long_schema":
+                next(row for row in rows if row["op"] == 2).pop("topk")
+            elif corruption == "ticks":
+                rows[0]["end_tick"] += 1
+            elif corruption == "sub_microsecond":
+                next(row for row in rows if row["op"] == 6).update(
+                    start_tick=120800, end_tick=121050, elapsed_ns=250, end_time="2026-11-12 15:29:04.967559"
+                )
+            elif corruption == "wall_offset":
+                next(row for row in rows if row["op"] == 6).update(
+                    start_time="2026-11-13 15:29:04.967558", end_time="2026-11-13 15:29:04.967564"
+                )
+            elif corruption == "mismatched_timeout":
+                timeout["stream"] += 1
+            elif corruption in ("zero_counts", "zero_dispatch_counts"):
+                for row in rows:
+                    row["dispatch_count"] = 0
+                    if corruption == "zero_counts":
+                        row["op_count"] = 0
+            elif corruption == "wrong_dispatch_association":
+                first, second = [row for row in rows if row["op"] == 2][:2]
+                first["dispatch_count"], second["dispatch_count"] = second["dispatch_count"], first["dispatch_count"]
+            elif corruption == "wrong_reduce_aiv":
+                next(row for row in rows if row["op"] == 6)["num_sms"] = logged_aiv
+        (directory / f"{stem}0.txt").write_text(
+            "".join(json.dumps(row) + "\n" for row in reversed(rows)), encoding="utf-8"
+        )
+        if corruption != "no_timeout":
+            (directory / f"{stem}7.txt").write_text(json.dumps(timeout) + "\n", encoding="utf-8")
+
+    (tmp_path / "run.log").write_text(
+        "DeepEP trace recorder device 1: incomplete=0 dropped=1\n" if corruption == "dropped" else "",
+        encoding="utf-8",
+    )
+    if message is None:
+        validate_production_trace(directory, list(reversed(manifests)), args)
+    else:
+        with pytest.raises(ValueError, match=message):
+            validate_production_trace(directory, manifests, args)
+
+
 def boundary_labels(args):
     return ["precision"] + [
         label for name in PERF_OPS for label in [f"{name}/warmup", *[f"{name}/window{w}" for w in range(args.windows)]]
@@ -1473,7 +1833,7 @@ def npu_worker(args):
     import torch_npu  # noqa: F401
     import deep_ep
     from deep_ep.backends.global_clos import ElasticBuffer
-    from deep_ep.utils.kernel_trace import KernelTrace
+    from deep_ep.utils.kernel_trace import KernelTrace, _recorder_enabled, diagnostic_config
 
     sys.path.insert(0, str(ROOT / "tests/clos"))
     import common as golden
@@ -1489,6 +1849,14 @@ def npu_worker(args):
     source = golden._make_dispatch_x(rank, args)
     weights_cpu = golden._make_weights(rank, args)
     x, idx, weights = source.to("npu"), routes[rank].to("npu"), weights_cpu.to("npu")
+    trace_enabled = _recorder_enabled()
+    trace_mode = "production" if trace_enabled else "off"
+    if trace_enabled and args.diagnostic:
+        from deep_ep.backends.direct._native import load_native_module
+
+        trace_mode = diagnostic_config()[0] or "production"
+        KernelTrace._benchmark_directory = args.output / "trace"
+        load_native_module()._configure_trace_test_mode(metadata_only=trace_mode == "metadata")
     started = time.perf_counter_ns()
     buffer = ElasticBuffer(
         dist.group.WORLD,
@@ -1626,9 +1994,8 @@ def npu_worker(args):
         recv_rows=owned.size(0),
         handle_id=getattr(handle, "_trace_handle_id", None),
         precision_passed=True,
-        trace_mode=os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production")
-        if os.environ.get("DEEPEP_TRACE_DIR")
-        else "off",
+        trace_mode=trace_mode,
+        trace_comm_id=buffer._trace_session.fields["comm_id"] if buffer._trace_session is not None else None,
         trace_ring_active=buffer._kernel_trace is not None,
         metadata_statistics=getattr(buffer._trace_session, "diagnostic_stats", {}),
         trace_slots=trace_entry["slots"] if trace_entry else 0,
@@ -1756,6 +2123,8 @@ def run_npu_acceptance(args):
             raise ValueError("--align-fresh-timing requires --host-dispatch-timing")
         if args.python_dispatch_timing and not args.align_fresh_timing:
             raise ValueError("--python-dispatch-timing requires --align-fresh-timing")
+        if not args.diagnostic and args.trace_slots not in (0, 128):
+            raise ValueError("production uses 128 trace slots; other capacities require --diagnostic")
         required_slots = record_slot_requirement(args)
         deferred = args.diagnostic and "record_only" in args.modes
         if args.trace_slots == 0:
@@ -1778,7 +2147,9 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
     env = os.environ.copy()
     for key in (
         "PYTHONPATH",
+        "DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY",
         "DEEPEP_TRACE_DIR",
+        "DEEPEP_TRACE_RECORDER_ENABLE",
         "DEEPEP_TRACE_DIAGNOSTIC_MODE",
         "DEEPEP_TRACE_DIAGNOSTIC_TIMING",
         "DEEPEP_TRACE_SLOTS",
@@ -1786,11 +2157,14 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
         env.pop(key, None)
     env.update(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     if mode != "off":
-        env["DEEPEP_TRACE_DIR"] = str(destination / "trace")
-        env["DEEPEP_TRACE_SLOTS"] = str(args.trace_slots)
-        if diagnostic and mode != "production":
-            env["DEEPEP_TRACE_DIAGNOSTIC_MODE"] = mode
-            env["DEEPEP_TRACE_DIAGNOSTIC_TIMING"] = "1" if args.diagnostic_timing else "0"
+        env["DEEPEP_TRACE_RECORDER_ENABLE"] = "1"
+        if diagnostic:
+            env["DEEPEP_TRACE_SLOTS"] = str(args.trace_slots)
+            if mode != "production":
+                env["DEEPEP_TRACE_DIAGNOSTIC_MODE"] = mode
+                env["DEEPEP_TRACE_DIAGNOSTIC_TIMING"] = "1" if args.diagnostic_timing else "0"
+        else:
+            env["DEEPEP_TRACE_DIR"] = str(destination / "trace")
     command = [
         sys.executable,
         "-m",
@@ -1806,6 +2180,8 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
     for key, value in vars(args).items():
         if type(value) is int and not key.startswith("_"):
             command += ["--" + key.replace("_", "-"), str(value)]
+    if diagnostic:
+        command.append("--diagnostic")
     if args.windowed_collection:
         command.append("--windowed-collection")
     if args.host_dispatch_timing:
@@ -2493,17 +2869,24 @@ def _run_npu_acceptance(args):
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     args._created_output = True
-    (args.output / "config.json").write_text(json.dumps(vars(args), default=str, indent=2))
+    trace_timing_env = {
+        name: os.environ.get(name)
+        for name in ("DEEPEP_TRACE_POLL_INTERVAL_MS", "DEEPEP_TRACE_TIMEOUT_MS")
+    }
+    config = dict(vars(args), trace_timing_env=trace_timing_env)
+    (args.output / "config.json").write_text(json.dumps(config, default=str, indent=2))
     runs = []
     for pair in range(args.pairs):
         # Fresh processes avoid inherited native singleton/env state; counterbalance thermal/order effects.
         for enabled in (False, True) if pair % 2 == 0 else (True, False):
             destination = args.output / f"pair{pair:02d}_{'on' if enabled else 'off'}"
-            manifests, values = npu_run_trial(args, destination, "full" if enabled else "off")
+            manifests, values = npu_run_trial(args, destination, "production" if enabled else "off")
+            if any(destination.rglob("kernel-*.jsonl")):
+                raise AssertionError("production acceptance unexpectedly produced developer logs")
             if enabled:
-                validate_npu_metadata(destination / "trace", manifests, args)
-            elif list(destination.rglob("kernel-*.jsonl")):
-                raise AssertionError("trace-off run unexpectedly produced logs")
+                validate_production_trace(destination / "trace", manifests, args)
+            elif any(m["trace_ring_active"] for m in manifests) or any(destination.rglob("trmt-deepep-trace-*.txt")):
+                raise AssertionError("trace-off run unexpectedly enabled collection")
             runs.append(dict(pair=pair, enabled=enabled, ns_per_api=values))
             (args.output / "runs.json").write_text(json.dumps(runs, indent=2))
     results = {
@@ -2528,24 +2911,35 @@ def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONPATH", "must-not-leak")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_MODE", "metadata")
     monkeypatch.setenv("DEEPEP_TRACE_DIAGNOSTIC_TIMING", "1")
+    monkeypatch.setenv("DEEPEP_TRACE_POLL_INTERVAL_MS", "5")
+    monkeypatch.delenv("DEEPEP_TRACE_TIMEOUT_MS", raising=False)
 
     def launch(command, destination, env, log, timeout):
-        enabled = "DEEPEP_TRACE_DIR" in env
+        enabled = env.get("DEEPEP_TRACE_RECORDER_ENABLE") == "1"
         order.append(enabled)
         assert "PYTHONPATH" not in env
         assert "DEEPEP_TRACE_DIAGNOSTIC_MODE" not in env and "DEEPEP_TRACE_DIAGNOSTIC_TIMING" not in env
         assert "--worker" in command and "--standalone" in command
-        if enabled:
-            assert env["DEEPEP_TRACE_DIR"] == str(destination / "trace")
+        assert "--diagnostic" not in command and "DEEPEP_TRACE_SLOTS" not in env
+        assert env.get("DEEPEP_TRACE_DIR") == (str(destination / "trace") if enabled else None)
+        assert env["DEEPEP_TRACE_POLL_INTERVAL_MS"] == "5" and "DEEPEP_TRACE_TIMEOUT_MS" not in env
         for rank in range(args.ep_size):
-            manifest = dict(timings_ns={op: [99 if enabled else 100] * args.windows for op in PERF_OPS})
+            manifest = dict(
+                trace_ring_active=enabled,
+                timings_ns={op: [99 if enabled else 100] * args.windows for op in PERF_OPS},
+            )
             (destination / f"rank{rank}.json").write_text(json.dumps(manifest))
 
     monkeypatch.setattr(sys.modules[__name__], "run_npu_process", launch)
-    monkeypatch.setattr(sys.modules[__name__], "validate_npu_metadata", lambda *items: checked.append(items[0]))
+    monkeypatch.setattr(sys.modules[__name__], "validate_production_trace", lambda *items: checked.append(items[0]))
     assert run_npu_acceptance(args)
     assert order == [False, True, True, False] * 3
     assert len(checked) == 6
+    config = json.loads((args.output / "config.json").read_text())
+    assert config["trace_timing_env"] == {
+        "DEEPEP_TRACE_POLL_INTERVAL_MS": "5",
+        "DEEPEP_TRACE_TIMEOUT_MS": None,
+    }
     report = json.loads((args.output / "acceptance.json").read_text())
     assert report["passed"] and set(report["operations"]) == set(PERF_OPS)
     for result in report["operations"].values():
@@ -2580,8 +2974,10 @@ def test_diagnostic_controller_and_incomplete_rejection(tmp_path, monkeypatch, c
     per_kind = 1 + args.warmup + args.windows * args.iterations
 
     def launch(command, destination, env, log, timeout):
+        assert "--diagnostic" in command and "DEEPEP_TRACE_DIR" not in env
         assert ("--windowed-collection" in command) == windowed
-        mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if "DEEPEP_TRACE_DIR" in env else "off")
+        enabled = env.get("DEEPEP_TRACE_RECORDER_ENABLE") == "1"
+        mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if enabled else "off")
         order.append(mode)
         if mode in ("off", "production"):
             assert "DEEPEP_TRACE_DIAGNOSTIC_MODE" not in env and "DEEPEP_TRACE_DIAGNOSTIC_TIMING" not in env
@@ -2713,7 +3109,8 @@ def test_host_dispatch_controller_exports_instrumented_evidence(
         assert ("--notify-device-timing" in command) == device_timing
         assert ("--align-fresh-timing" in command) == align
         assert ("--python-dispatch-timing" in command) == python_timing
-        mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if "DEEPEP_TRACE_DIR" in env else "off")
+        enabled = env.get("DEEPEP_TRACE_RECORDER_ENABLE") == "1"
+        mode = env.get("DEEPEP_TRACE_DIAGNOSTIC_MODE", "production" if enabled else "off")
         count = len(boundary_labels(args))
         for rank in range(args.ep_size):
             manifest = dict(

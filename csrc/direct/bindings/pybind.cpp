@@ -13,6 +13,7 @@
 #include "common/types.h"
 #include "runtime/kernel_trace.h"
 #include "runtime/shmem_instance.h"
+#include "runtime/trace_recorder.h"
 
 namespace {
 int ProbePythonGil()
@@ -30,6 +31,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("kernel_trace_diagnostic_version") = 4;
     m.attr("host_dispatch_probe_version") = 3;
     m.attr("kernel_trace_metadata_version") = 2;
+    m.attr("trace_recorder_version") = 3;
+    m.def("_configure_trace_test_mode", &ascend_deepep::trace::ConfigureTraceTestMode,
+          pybind11::arg("metadata_only") = false);
     m.def("check_host_dispatch_gil_probe", []() {
         const int held = ProbePythonGil();
         int released;
@@ -89,22 +93,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     });
     using ascend_deepep::trace::KernelTrace;
     using ascend_deepep::trace::TraceRecord;
+    using ascend_deepep::trace::TraceRecorder;
     struct Snapshot { ascend_deepep::trace::TraceMetadataSnapshot value; };
     pybind11::class_<Snapshot>(m, "TraceMetadataSnapshot");
-    m.def("make_trace_metadata", [](pybind11::dict fields, const Snapshot& parent) {
+    m.def("make_trace_metadata", [](pybind11::dict fields, const Snapshot& parent, bool recorder) {
         auto value = std::make_shared<ascend_deepep::trace::TraceMetadata>();
         value->parent = parent.value;
+        if (recorder && !parent.value)
+            value->op_counters = std::make_shared<ascend_deepep::trace::KernelOpCounters>();
         for (const auto& item : fields) {
             auto key = pybind11::cast<std::string>(item.first);
             if (pybind11::isinstance<pybind11::str>(item.second)) value->labels[key] = pybind11::cast<std::string>(item.second);
             else value->values[key] = pybind11::cast<int64_t>(item.second);
         }
         return Snapshot{value};
-    }, pybind11::arg("fields"), pybind11::arg("parent") = Snapshot{});
-    m.def("push_trace_metadata", [](const Snapshot& base, int64_t api, int64_t handle) {
-        auto value = ascend_deepep::trace::MakeCallMetadata(base.value, api, handle);
+    }, pybind11::arg("fields"), pybind11::arg("parent") = Snapshot{}, pybind11::arg("recorder") = false);
+    m.def("push_trace_metadata", [](const Snapshot& base, int64_t api, int64_t handle, int64_t dispatch_count) {
+        auto value = ascend_deepep::trace::MakeCallMetadata(base.value, api, handle, dispatch_count);
         return Snapshot{ascend_deepep::trace::ExchangeTraceMetadata(value)};
-    });
+    }, pybind11::arg("base"), pybind11::arg("api"), pybind11::arg("handle"), pybind11::arg("dispatch_count") = -1);
     m.def("restore_trace_metadata", [](const Snapshot& previous) {
         ascend_deepep::trace::ExchangeTraceMetadata(previous.value);
     });
@@ -121,6 +128,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def_property_readonly("identity", [](const KernelTrace& trace) {
             return reinterpret_cast<uintptr_t>(&trace);
         })
+        .def_property_readonly("poll_interval_ms", &KernelTrace::PollIntervalMs)
         .def("calibration", [to_dict](const KernelTrace& trace) { return to_dict(trace.Calibration()); })
         .def("drain_trace_json", [](KernelTrace& trace, bool closing) {
             std::string text;
@@ -196,6 +204,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             return result;
         }, pybind11::arg("include_records"), pybind11::arg("timing") = false, pybind11::arg("closing") = false,
            pybind11::arg("return_text") = true);
+    pybind11::class_<TraceRecorder, std::shared_ptr<TraceRecorder>>(m, "TraceRecorder")
+        .def("attach", &TraceRecorder::Attach, pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def("detach", &TraceRecorder::Detach, pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def("drain", [](TraceRecorder& recorder, KernelTrace& source, bool closing) {
+            recorder.Write(source.Drain(closing, true));
+        }, pybind11::arg("source"), pybind11::arg("closing") = false,
+           pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("open_trace_recorder", [](const KernelTrace& source) {
+        return TraceRecorder::Open(source.Device());
+    }, pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("get_kernel_trace", &KernelTrace::Open);
     m.def("get_shmem_unique_id" , &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
