@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -11,6 +12,16 @@
 #include "common/kernel_trace_layout.h"
 
 namespace ascend_deepep::trace {
+// 每个通信组的本 rank 按 kernel 名维护独立计数器，起始值均为 0。
+struct KernelOpCounters {
+    static constexpr std::size_t kCount = 10;
+    KernelOpCounters()
+    {
+        for (auto& count : next) count.store(0, std::memory_order_relaxed);
+    }
+    std::array<std::atomic<int64_t>, kCount> next;
+};
+
 // 元数据分为 Buffer 固定字段、形状模板和调用 ID，各层通过父节点共享。
 struct TraceMetadata {
     std::shared_ptr<const TraceMetadata> parent;
@@ -18,9 +29,12 @@ struct TraceMetadata {
     std::map<std::string, std::string> labels;
     bool has_call_ids = false;
     int64_t api_call_id = 0, handle_id = 0;
+    int64_t dispatch_count = -1;  // 无关联的 dispatch 时保留空值。
+    std::shared_ptr<KernelOpCounters> op_counters;
 };
 using TraceMetadataSnapshot = std::shared_ptr<const TraceMetadata>;
-TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle);
+TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle,
+                                      int64_t dispatch_count = -1);
 TraceMetadataSnapshot CurrentTraceMetadata();
 TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata);
 // 临时替换当前线程的元数据，离开作用域时恢复前一份。
@@ -40,6 +54,8 @@ struct TraceRecord {
     std::map<std::string, std::string> labels;
 };
 std::string EncodeTraceRecords(const std::vector<TraceRecord>& records);
+// 专用于测试进程，必须在创建 Buffer 前调用。
+void ConfigureTraceTestMode(bool metadata_only);
 // Opt-in Host diagnostics. Fixed-size samples are reserved before the workload and read afterwards.
 // 这些是 Host 诊断的时间点，记录在预分配样本中，测量结束后才导出。
 enum class DispatchProbePoint : unsigned {
@@ -100,7 +116,9 @@ public:
                    const char* op_name, const char* kernel_name, uint64_t stream = 0, uint32_t ep_size = 0,
                    int64_t input_rows = -1, int64_t output_rows = -1);
     void Submit(Ticket ticket, int64_t launch_ns, int status);
-    std::vector<TraceRecord> Drain(bool closing = false);
+    std::vector<TraceRecord> Drain(bool closing = false, bool recorder = false);
+    int Device() const { return device_; }
+    int PollIntervalMs() const { return poll_interval_ms_; }
     TraceRecord Calibration() const;
     void Synchronize();
 private:
@@ -110,7 +128,10 @@ private:
         std::atomic<State> state{State::Free};
         uint64_t sequence{};
         int64_t launch_ns{};
+        int64_t submit_steady_ns{};  // 提交成功时的单调时间，用于判断超时。
         int rank{}, status{};
+        int op = -1;
+        int64_t op_count = -1;
         uint32_t instance{}, cores{};
         std::string op_name, kernel_name;
         TraceMetadataSnapshot metadata;
@@ -118,9 +139,15 @@ private:
         uint32_t ep_size{};
         int64_t input_rows{-1}, output_rows{-1};
         bool logged_launch{};
+        bool logged_timeout{};
     };
+    TraceRecord DescribeSlot(const Slot& slot) const;
     KernelTrace() = default;
     void Init(int device);
+    bool recorder_mode_ = true;
+    // 正式采集初始化时读入，开发基准仍使用默认时间。
+    int poll_interval_ms_ = 2;
+    int timeout_ms_ = 10;
     unsigned slot_count_ = 128;
     std::unique_ptr<Slot[]> slots_;
     std::mutex drain_mutex_;

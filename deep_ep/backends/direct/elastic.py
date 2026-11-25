@@ -534,18 +534,28 @@ class ElasticBuffer:
             if self._destroyed:
                 return
             self.barrier(use_comm_stream=True, with_cpu_sync=True)
-            # 原生资源销毁前注销采集源，最后一个使用者负责同步并写完日志。
-            trace = getattr(self, "_kernel_trace", None)
-            if trace is not None:
-                from ...utils.kernel_trace import KernelTrace
+            try:
+                self._detach_trace(synchronized=True)
+            finally:
+                # 日志收尾失败也要执行原生 Buffer 的释放逻辑。
+                self._native.destroy()
+                self._destroyed = True
+                self.runtime = None
+                self._native = None
+                self._communication_stream = None
 
-                KernelTrace.detach(trace)
-                self._kernel_trace = None
-            self._native.destroy()
-            self._destroyed = True
-            self.runtime = None
-            self._native = None
-            self._communication_stream = None
+    def _detach_trace(self, *, synchronized=False) -> None:
+        trace = getattr(self, "_kernel_trace", None)
+        if trace is None:
+            return
+        from ...utils.kernel_trace import KernelTrace
+
+        # 采集源可以服务多个通信组，退出时只归还该 Buffer 的引用。
+        session = getattr(self, "_trace_session", None)
+        comm_id = session.fields["comm_id"] if session is not None else None
+        self._kernel_trace = None
+        self._trace_session = None
+        KernelTrace.detach(trace, comm_id, synchronized=synchronized)
 
     def barrier(
         self,
@@ -1025,6 +1035,9 @@ class ElasticBuffer:
             _record_recv_outputs_on_current_stream(*public_handle)
             # 保存 fresh 分配的 handle ID，之后 cached dispatch 和 combine 可关联同一份路由。
             handle._trace_handle_id = trace_metadata["handle_id"] if trace_metadata is not None else None
+            # 记录创建这个 handle 的 dispatch 次数，供后续 combine 关联原始路由。
+            if trace_metadata is not None and "dispatch_count" in trace_metadata:
+                handle._trace_dispatch_count = trace_metadata["dispatch_count"]
             handle._buffer_token = self._handle_token
             handle._buffer_owner = self
             handle._udma_policy = policy
@@ -1289,12 +1302,7 @@ class ElasticBuffer:
                     # teardown if collective teardown is no longer possible.
                     pass
             # 析构走本地兜底时仍尝试注销采集源，避免监控线程保留该引用。
-            trace = getattr(self, "_kernel_trace", None)
-            if trace is not None:
-                from ...utils.kernel_trace import KernelTrace
-
-                KernelTrace.detach(trace)
-                self._kernel_trace = None
+            self._detach_trace()
             self.runtime = None
             self._native = None
             self._communication_stream = None

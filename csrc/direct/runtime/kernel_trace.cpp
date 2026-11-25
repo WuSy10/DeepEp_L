@@ -1,6 +1,7 @@
 #include "runtime/kernel_trace.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <unistd.h>
 
 #include "common/kernel_trace_layout.h"
@@ -20,6 +22,16 @@
 namespace ascend_deepep::trace {
 namespace {
 constexpr size_t kSlotBytes = platform::kMaxNumAiv * kCoreBytes;
+constexpr int64_t kNsPerMs = 1'000'000;
+// 数组下标就是日志协议中的 op，避免通信方式或启动顺序改变编号。
+constexpr std::array<std::string_view, KernelOpCounters::kCount> kRecorderKernelNames{
+    "notify_dispatch_kernel", "cached_notify_dispatch_kernel", "v1_dispatch_udma_kernel",
+    "cached_notify_combine_kernel", "v1_combine_udma_kernel", "v1_combine_udma_comm_kernel",
+    "v1_combine_udma_reduce_kernel", "v1_combine_udma_early_kernel", "v1_combine_udma_remaining_kernel",
+    "v1_combine_udma_pipeline_kernel",
+};
+enum class TraceMode { Recorder, Test, TestMetadataOnly };
+std::atomic<TraceMode> trace_mode{TraceMode::Recorder};
 // 进程内的 kernel 序号从 1 开始，各 ACL context 共用这个计数器。
 std::atomic<uint64_t> next_sequence{1};
 thread_local TraceMetadataSnapshot active_metadata;
@@ -62,6 +74,19 @@ int64_t NowNs()
 void Check(aclError status, const char* op)
 {
     if (status != ACL_SUCCESS) throw std::runtime_error(std::string(op) + ": " + std::to_string(status));
+}
+
+// 只接受完整的十进制正整数，避免错误配置让后台忙等或让超时失效。
+int ReadRecorderMilliseconds(const char* name, int fallback)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    const char* end = value + std::strlen(value);
+    int milliseconds = 0;
+    const auto parsed = std::from_chars(value, end, milliseconds);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || milliseconds <= 0)
+        throw std::invalid_argument(std::string(name) + " must be a positive integer in milliseconds");
+    return milliseconds;
 }
 }  // namespace
 
@@ -113,14 +138,15 @@ TraceMetadataSnapshot CurrentTraceMetadata()
 {
     return active_metadata;
 }
-// 每调用只创建带两个 ID 的小节点，形状和 Buffer 字段沿父链接读取。
-TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle)
+// 每次调用只创建带 ID 和 dispatch 序号的小节点，形状和 Buffer 字段沿父链接读取。
+TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle, int64_t dispatch_count)
 {
     auto value = std::make_shared<TraceMetadata>();
     value->parent = std::move(parent);
     value->has_call_ids = true;
     value->api_call_id = api;
     value->handle_id = handle;
+    value->dispatch_count = dispatch_count;
     return value;
 }
 TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata)
@@ -137,14 +163,19 @@ ScopedTraceMetadata::~ScopedTraceMetadata()
     ExchangeTraceMetadata(std::move(previous_));
 }
 
+void ConfigureTraceTestMode(bool metadata_only)
+{
+    // 测试工具通过原生绑定显式启用独立模式，旧诊断环境变量不改变正式记录器。
+    trace_mode.store(metadata_only ? TraceMode::TestMetadataOnly : TraceMode::Test, std::memory_order_relaxed);
+}
+
 std::shared_ptr<KernelTrace> KernelTrace::Open()
 {
-    const char* directory = std::getenv("DEEPEP_TRACE_DIR");
-    if (!directory || !*directory) return {};
-    // metadata 诊断只测上下文准备开销，因此不会进入分配和校准路径。
-    // Diagnostic metadata-only mode must not allocate a ring or launch calibration/device probes.
-    const char* diagnostic = std::getenv("DEEPEP_TRACE_DIAGNOSTIC_MODE");
-    if (diagnostic && std::strcmp(diagnostic, "metadata") == 0) return {};
+    const char* enable = std::getenv("DEEPEP_TRACE_RECORDER_ENABLE");
+    if (!enable || std::strcmp(enable, "1") != 0) return {};
+    const auto mode = trace_mode.load(std::memory_order_relaxed);
+    // metadata 测试只准备上下文，不分配采集环，也不校准设备时钟。
+    if (mode == TraceMode::TestMetadataOnly) return {};
     try {
         static std::mutex mutex;
         // 以 ACL context 为键，弱引用允许最后一个使用者退出后释放采集器。
@@ -157,6 +188,7 @@ std::shared_ptr<KernelTrace> KernelTrace::Open()
         if (auto alive = sinks[context].lock()) return alive;
         auto sink = std::shared_ptr<KernelTrace>(new KernelTrace);
         sink->context_ = context;
+        sink->recorder_mode_ = mode == TraceMode::Recorder;
         sink->Init(device);
         sinks[context] = sink;
         return sink;
@@ -169,7 +201,14 @@ std::shared_ptr<KernelTrace> KernelTrace::Open()
 void KernelTrace::Init(int device)
 {
     device_ = device;
-    if (const char* value = std::getenv("DEEPEP_TRACE_SLOTS")) {
+    if (recorder_mode_) {
+        // 初始化时一次性读取，后续扫描和计时不重新访问环境变量。
+        poll_interval_ms_ = ReadRecorderMilliseconds("DEEPEP_TRACE_POLL_INTERVAL_MS", poll_interval_ms_);
+        timeout_ms_ = ReadRecorderMilliseconds("DEEPEP_TRACE_TIMEOUT_MS", timeout_ms_);
+    }
+    // 正式采集使用固定槽数；开发测试才允许改变内存环容量。
+    const char* value = recorder_mode_ ? nullptr : std::getenv("DEEPEP_TRACE_SLOTS");
+    if (value) {
         char* end{};
         const auto count = std::strtoul(value, &end, 10);
         if (!*value || *value < '0' || *value > '9' || *end || count < 128 || count > 16384)
@@ -313,6 +352,22 @@ KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t c
                                        const char* kernel_name, uint64_t stream, uint32_t ep_size,
                                        int64_t input_rows, int64_t output_rows)
 {
+    const auto& metadata = active_metadata;
+    int op = -1;
+    int64_t op_count = -1;
+    if (recorder_mode_) {
+        // 只有成功关联到写盘会话的调用才占用采集槽位。
+        const auto* scope = metadata.get();
+        while (scope && !scope->op_counters) scope = scope->parent.get();
+        if (!scope) return {};
+        const auto comm_id = scope->labels.find("comm_id");
+        if (comm_id == scope->labels.end() || comm_id->second.empty()) return {};
+        const auto kernel = std::find(kRecorderKernelNames.begin(), kRecorderKernelNames.end(), std::string_view(kernel_name));
+        if (kernel == kRecorderKernelNames.end()) return {};
+        op = static_cast<int>(kernel - kRecorderKernelNames.begin());
+        // 计数早于槽位申请。即使采集环已满，业务 kernel 仍会启动并消耗一次编号。
+        op_count = scope->op_counters->next[op].fetch_add(1, std::memory_order_relaxed);
+    }
     // 环形缓冲区的目标槽位被占用时跳过本次采集，让 kernel 继续启动。
     const auto index = cursor_.fetch_add(1, std::memory_order_relaxed) % slot_count_;
     auto& slot = slots_[index];
@@ -334,13 +389,16 @@ KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t c
     slot.rank = rank;
     slot.instance = instance;
     slot.cores = cores;
+    slot.op = op;
+    slot.op_count = op_count;
     // 持有当前调用的不可变快照，让后台采集仍能关联到发起 kernel 的 API 和 handle。
-    slot.metadata = CurrentTraceMetadata();
+    slot.metadata = metadata;
     slot.stream = stream;
     slot.ep_size = ep_size;
     slot.input_rows = input_rows;
     slot.output_rows = output_rows;
     slot.logged_launch = false;
+    slot.logged_timeout = false;
     return {reinterpret_cast<uint64_t>(mapped_) + index * kSlotBytes, index, slot.sequence};
 }
 
@@ -349,6 +407,8 @@ void KernelTrace::Submit(Ticket ticket, int64_t launch_ns, int status)
     auto& slot = slots_[ticket.index];
     slot.launch_ns = launch_ns;
     slot.status = status;
+    // 用单调时钟记录 Host 提交成功的时刻，不把排队前的时间或墙钟跳变算作超时。
+    if (recorder_mode_ && status == ACL_SUCCESS) slot.submit_steady_ns = NowNs<std::chrono::steady_clock>();
     // 发布 Host 侧提交状态，后台线程看到 Submitted 后就可读取本槽的元数据。
     slot.state.store(State::Submitted, std::memory_order_release);
 }
@@ -372,41 +432,55 @@ void KernelTrace::Synchronize()
     Check(restored, "restore trace context");
 }
 
-std::vector<TraceRecord> KernelTrace::Drain(bool closing)
+TraceRecord KernelTrace::DescribeSlot(const Slot& slot) const
+{
+    TraceRecord record{"", slot.op_name, slot.kernel_name,
+        {{"gid", static_cast<int64_t>(slot.sequence)}, {"rank", slot.rank},
+         {"local_instance", slot.instance}, {"launch_ns", slot.launch_ns}, {"aiv", slot.cores},
+         {"pid", getpid()}, {"device", device_}}};
+    if (slot.op >= 0) record.values["op"] = slot.op;
+    if (slot.op_count >= 0) record.values["op_count"] = slot.op_count;
+    if (slot.ep_size) record.values["ep_size"] = slot.ep_size;
+    if (slot.input_rows >= 0) record.values["kernel_input_rows"] = slot.input_rows;
+    if (slot.output_rows >= 0) record.values["kernel_output_rows"] = slot.output_rows;
+    // 从调用层往 Buffer 层展开，已写入的 kernel 字段与更近的字段优先。
+    for (auto metadata = slot.metadata; metadata; metadata = metadata->parent) {
+        if (metadata->has_call_ids) {
+            record.values.emplace("api_call_id", metadata->api_call_id);
+            record.values.emplace("handle_id", metadata->handle_id);
+            if (metadata->dispatch_count >= 0) record.values.emplace("dispatch_count", metadata->dispatch_count);
+        }
+        record.values.insert(metadata->values.begin(), metadata->values.end());
+        record.labels.insert(metadata->labels.begin(), metadata->labels.end());
+    }
+    record.labels["stream"] = std::to_string(slot.stream);
+    return record;
+}
+
+std::vector<TraceRecord> KernelTrace::Drain(bool closing, bool recorder)
 {
     std::lock_guard<std::mutex> lock(drain_mutex_);
     std::vector<TraceRecord> records;
+    const auto poll_ns = recorder ? NowNs<std::chrono::steady_clock>() : 0;
+    const auto timeout_ns = static_cast<int64_t>(timeout_ms_) * kNsPerMs;
     for (unsigned index = 0; index < slot_count_; ++index) {
         auto& slot = slots_[index];
         if (slot.state.load(std::memory_order_acquire) != State::Submitted) continue;
-        TraceRecord record{"", slot.op_name, slot.kernel_name,
-            {{"gid", static_cast<int64_t>(slot.sequence)}, {"rank", slot.rank},
-             {"local_instance", slot.instance}, {"launch_ns", slot.launch_ns}, {"aiv", slot.cores},
-             {"pid", getpid()}, {"device", device_}}};
-        if (slot.ep_size) record.values["ep_size"] = slot.ep_size;
-        if (slot.input_rows >= 0) record.values["kernel_input_rows"] = slot.input_rows;
-        if (slot.output_rows >= 0) record.values["kernel_output_rows"] = slot.output_rows;
-        // 从调用层往 Buffer 层展开，已写入的 kernel 字段与更近的字段优先。
-        for (auto metadata = slot.metadata; metadata; metadata = metadata->parent) {
-            if (metadata->has_call_ids) {
-                record.values.emplace("api_call_id", metadata->api_call_id);
-                record.values.emplace("handle_id", metadata->handle_id);
-            }
-            record.values.insert(metadata->values.begin(), metadata->values.end());
-            record.labels.insert(metadata->labels.begin(), metadata->labels.end());
-        }
-        record.labels["stream"] = std::to_string(slot.stream);
+        TraceRecord record;
+        // 测试路径保留 launch/summary 格式。正式路径只为实际输出的事件展开元数据。
+        if (!recorder) record = DescribeSlot(slot);
         // 设备可能还没完成，launch 先记一次，下一次轮询继续等完成标记。
-        if (!slot.logged_launch) {
+        if (!recorder && !slot.logged_launch) {
             record.event = slot.status ? "launch_error" : "launch";
             record.values["status"] = slot.status;
             records.push_back(record);
             slot.logged_launch = true;
-            if (slot.status) {
-                slot.state.store(State::Quarantined, std::memory_order_release);
-                ++incomplete_;
-                continue;
-            }
+        }
+        if (slot.status != ACL_SUCCESS) {
+            // 提交失败和已提交但未完成是两种状态，失败不能写成 type=1。
+            slot.state.store(State::Quarantined, std::memory_order_release);
+            ++incomplete_;
+            continue;
         }
         auto* base = static_cast<uint8_t*>(host_) + index * kSlotBytes;
         uint64_t first = std::numeric_limits<uint64_t>::max(), last = 0;
@@ -426,16 +500,27 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
             last = std::max(last, end);
         }
         if (!ready) {
+            if (recorder && recorder_mode_ && !slot.logged_timeout &&
+                poll_ns - slot.submit_steady_ns >= timeout_ns) {
+                // 超时只报告一次，继续保留此槽；后续收齐标记时用相同 gid 输出 end。
+                record = DescribeSlot(slot);
+                record.event = "timeout";
+                records.push_back(std::move(record));
+                slot.logged_timeout = true;
+            }
             if (closing) {
-                // 关闭仍未收齐则记为 incomplete，并隔离该槽位。
-                record.event = "incomplete";
-                records.push_back(record);
+                // 关闭仍未收齐则隔离槽位；只有测试日志单独输出 incomplete。
+                if (!recorder) {
+                    record.event = "incomplete";
+                    records.push_back(std::move(record));
+                }
                 slot.state.store(State::Quarantined, std::memory_order_release);
                 ++incomplete_;
             }
             continue;
         }
         // 以各 AIV 的最早开始与最晚结束表示本 rank 的执行区间。
+        if (recorder) record = DescribeSlot(slot);
         record.event = "end";
         record.values.insert({{"start_tick", first}, {"end_tick", last},
             {"start_ns", offset_ns_ + static_cast<int64_t>(first)},
@@ -445,9 +530,18 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
         // 全部 AIV 完成本轮写入后归还槽位。下次靠新序号区分旧数据，无需清零。
         slot.state.store(State::Free, std::memory_order_release);
     }
-    // 关闭批次最后输出累计完成、未完成和丢样数，供离线校验。
-    if (closing) records.push_back({"summary", "", "", {{"completed", completed_},
-        {"incomplete", incomplete_}, {"dropped", dropped_.load()}}});
+    if (closing) {
+        const auto dropped = dropped_.load();
+        if (!recorder) {
+            // 测试日志在关闭批次末尾输出汇总，供原有校验器使用。
+            records.push_back({"summary", "", "", {{"completed", completed_},
+                {"incomplete", incomplete_}, {"dropped", dropped}}});
+        } else if (incomplete_ || dropped) {
+            // 正式文件只包含约定的 type=1/2 行。丢样和关闭时的未完成数另报到 stderr。
+            std::fprintf(stderr, "DeepEP trace recorder device %d: incomplete=%llu dropped=%llu\n", device_,
+                static_cast<unsigned long long>(incomplete_), static_cast<unsigned long long>(dropped));
+        }
+    }
     return records;
 }
 

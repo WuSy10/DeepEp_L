@@ -22,6 +22,8 @@ pybind11_add_module(_clos_C NO_EXTRAS
     "${_direct_root}/ops/launcher.cpp" "${_direct_root}/runtime/shmem_instance.cpp"
     # 把 Host 侧的槽位管理和采集逻辑编进 _clos_C，供 BufferRuntime 与 Python 绑定共用。
     "${_direct_root}/runtime/buffer_runtime.cpp" "${_direct_root}/runtime/kernel_trace.cpp"
+    # 正式日志在 Host 后台按通信组和设备独立轮转。
+    "${_direct_root}/runtime/trace_recorder.cpp"
     "${_direct_root}/ops/aggregate.cpp" "${_direct_root}/ops/combine.cpp"
     "${_direct_root}/ops/dispatch.cpp" "${_direct_root}/ops/expand.cpp")
 target_include_directories(_clos_C PRIVATE "${_direct_root}" "${CMAKE_SOURCE_DIR}/csrc"
