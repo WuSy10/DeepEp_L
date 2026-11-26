@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <utility>
 
@@ -129,6 +130,36 @@ uint32_t PciBusId(int device)
     throw std::runtime_error("PCI BDF unavailable for ACL device " + std::to_string(device));
 }
 
+uint32_t PhysicalDeviceId(int device)
+{
+    using Query = aclError (*)(int32_t, int32_t*);
+    auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByUserDevId"));
+    if (!query) query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByLogicDevId"));
+    int32_t physical_device_id = -1;
+    if (!query || query(device, &physical_device_id) != ACL_SUCCESS || physical_device_id < 0)
+        throw std::runtime_error("physical device ID unavailable for ACL device " + std::to_string(device));
+    return static_cast<uint32_t>(physical_device_id);
+}
+
+uint32_t TraceBusId(int device, uint32_t physical_device_id)
+{
+    using Query = aclError (*)(uint32_t, aclrtDevAttr, int64_t*);
+    const auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetDeviceInfo"));
+    if (!query) return PciBusId(device);
+
+    // Older CANN headers may omit ACL_DEV_ATTR_HD_CONNECT_TYPE.
+    constexpr auto kConnectionType = static_cast<aclrtDevAttr>(408);
+    constexpr int64_t kPcie = 0;
+    constexpr int64_t kUnifiedBus = 2;
+    constexpr uint32_t kUbBusIdBase = 0x80000000u;
+    int64_t connection = -1;
+    if (query(device, kConnectionType, &connection) != ACL_SUCCESS)
+        throw std::runtime_error("connection type unavailable for ACL device " + std::to_string(device));
+    if (connection == kPcie) return PciBusId(device);
+    if (connection == kUnifiedBus) return kUbBusIdBase + physical_device_id;
+    throw std::runtime_error("unsupported trace connection type " + std::to_string(connection));
+}
+
 std::string DeviceUuid(int device)
 {
     using Query = aclError (*)(int32_t, aclrtUuid*);
@@ -187,13 +218,13 @@ int Flock(int fd, int operation) noexcept
     return result;
 }
 
-FileDescriptor LockDevice(int directory, const std::string& device_uuid)
+FileDescriptor LockDevice(int directory, const std::string& device_key)
 {
-    const auto name = ".trmt-deepep-trace-device-" + device_uuid + ".lock";
+    const auto name = ".trmt-deepep-trace-device-" + device_key + ".lock";
     FileDescriptor lock(openat(directory, name.c_str(), O_RDONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0644));
     if (lock.Get() < 0) IoError("open trace lock " + name);
     CheckPrivateRegularFile(lock.Get(), name);
-    if (Flock(lock.Get(), LOCK_EX | LOCK_NB) < 0) IoError("lock trace recorder for device " + device_uuid);
+    if (Flock(lock.Get(), LOCK_EX | LOCK_NB) < 0) IoError("lock trace recorder for device " + device_key);
     return lock;
 }
 
@@ -437,14 +468,16 @@ TraceRecorder::~TraceRecorder()
 }
 
 std::shared_ptr<TraceRecorder> TraceRecorder::OpenAt(const std::string& directory, uint32_t bus_id,
-                                                     const std::string& device_uuid, uint64_t file_limit)
+                                                    const std::string& device_uuid, uint64_t file_limit,
+                                                    uint32_t physical_device_id)
 {
     if (!file_limit || file_limit > static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
         throw std::invalid_argument("invalid trace file size limit");
     if (!ValidCommId(device_uuid)) throw std::invalid_argument("invalid trace device UUID");
     auto dir = OpenDirectory(directory);
-    auto lock = LockDevice(dir.Get(), device_uuid);
-    auto prefix = ".trmt-deepep-trace-owner-" + device_uuid + "-" + std::to_string(bus_id) + "-";
+    const auto device_key = device_uuid + "-" + std::to_string(physical_device_id);
+    auto lock = LockDevice(dir.Get(), device_key);
+    auto prefix = ".trmt-deepep-trace-owner-v2-" + device_key + "-" + std::to_string(bus_id) + "-";
     CleanHistory(dir.Get(), bus_id, prefix);
     return std::shared_ptr<TraceRecorder>(
         new TraceRecorder(std::make_unique<Impl>(std::move(dir), std::move(lock), bus_id, std::move(prefix), file_limit)));
@@ -454,19 +487,22 @@ std::shared_ptr<TraceRecorder> TraceRecorder::Open(int device)
 {
     static std::mutex mutex;
     static std::map<int, std::weak_ptr<TraceRecorder>> devices;
-    static std::map<std::pair<uint32_t, std::string>, std::weak_ptr<TraceRecorder>> writers;
+    using WriterKey = std::tuple<uint32_t, std::string, uint32_t>;
+    static std::map<WriterKey, std::weak_ptr<TraceRecorder>> writers;
     std::lock_guard<std::mutex> lock(mutex);
     if (auto old = devices[device].lock()) {
         if (old->impl_->owner != getpid()) throw std::runtime_error("cannot use inherited trace recorder");
         return old;
     }
-    const auto bus_id = PciBusId(device);
+    const auto physical_device_id = PhysicalDeviceId(device);
+    const auto bus_id = TraceBusId(device, physical_device_id);
     const auto device_uuid = DeviceUuid(device);
-    auto& cached = writers[{bus_id, device_uuid}];
+    auto& cached = writers[{bus_id, device_uuid, physical_device_id}];
     auto recorder = cached.lock();
     if (!recorder) {
         const char* directory = std::getenv("DEEPEP_TRACE_DIR");
-        recorder = OpenAt(directory && *directory ? directory : kDefaultDirectory, bus_id, device_uuid, kFileLimit);
+        recorder = OpenAt(directory && *directory ? directory : kDefaultDirectory, bus_id, device_uuid, kFileLimit,
+                          physical_device_id);
         cached = recorder;
     }
     if (recorder->impl_->owner != getpid()) throw std::runtime_error("cannot use inherited trace recorder");
