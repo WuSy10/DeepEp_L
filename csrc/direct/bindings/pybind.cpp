@@ -31,7 +31,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("kernel_trace_diagnostic_version") = 4;
     m.attr("host_dispatch_probe_version") = 3;
     m.attr("kernel_trace_metadata_version") = 2;
-    m.attr("trace_recorder_version") = 3;
     m.def("_configure_trace_test_mode", &ascend_deepep::trace::ConfigureTraceTestMode,
           pybind11::arg("metadata_only") = false);
     m.def("check_host_dispatch_gil_probe", []() {
@@ -211,9 +210,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             recorder.Write(source.Drain(closing, true));
         }, pybind11::arg("source"), pybind11::arg("closing") = false,
            pybind11::call_guard<pybind11::gil_scoped_release>());
-    m.def("open_trace_recorder", [](const KernelTrace& source) {
-        return TraceRecorder::Open(source.Device());
-    }, pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("open_trace_recorder", [](const KernelTrace& source, const std::string& comm_id) {
+        return TraceRecorder::Open(source.Device(), comm_id);
+    }, pybind11::arg("source"), pybind11::arg("comm_id"), pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("get_kernel_trace", &KernelTrace::Open);
     m.def("get_shmem_unique_id" , &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);

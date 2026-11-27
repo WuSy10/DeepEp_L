@@ -9,6 +9,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import threading
 import time
@@ -80,7 +81,7 @@ class KernelTrace:
                 poll_interval_ms = source.poll_interval_ms if production else 2
                 diagnostic_path = None
                 if production:
-                    recorder = native_module.open_trace_recorder(source)
+                    recorder = native_module.open_trace_recorder(source, comm_id)
                     recorder.attach(comm_id)
                     recorder_attached = True
                 else:
@@ -524,14 +525,13 @@ def attach_trace_session(native, group, rank, ep_size, all_gather):
     enabled = _recorder_enabled()
     production = KernelTrace._benchmark_directory is None
     mode, timing = ("", False) if production else diagnostic_config()
-    proposal = uuid.uuid4().hex if enabled and rank == 0 else None
+    # Keep the uint64 as decimal text in the native metadata labels.
+    proposal = str(secrets.randbits(64)) if enabled and rank == 0 else None
     peers = all_gather(group, None, ep_size, (enabled, proposal, mode, timing))
     if any((peer[0], peer[2], peer[3]) != (enabled, mode, timing) for peer in peers):
         raise ValueError("all EP ranks must agree on DEEPEP_TRACE_RECORDER_ENABLE and diagnostic settings")
     if not enabled:
         return None, None
-    if production and getattr(native, "trace_recorder_version", 0) != 3:
-        raise RuntimeError("DeepEP trace recorder requires the matching rebuilt native extension (version 3)")
     if not production and getattr(native, "kernel_trace_diagnostic_version", 0) != 4:
         raise RuntimeError("KernelTrace requires the matching rebuilt native extension")
     try:

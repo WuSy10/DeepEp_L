@@ -223,12 +223,13 @@ int main(){
      p.Finish();}
     auto missing=TakeHostDispatchProbe();
     assert(missing.samples[0].notify_done==0 && missing.samples[0].notify_ticks[0]==0);
-    {
+    for (bool override_timeout : {false, true}) {
+        if (override_timeout) setenv("DEEPEP_TRACE_TIMEOUT_MS", "10", 1);
         auto recorder_source = KernelTrace::Open();
         assert(recorder_source && recorder_source->PollIntervalMs() == 2);
         assert(!recorder_source->Reserve(0, 1, 2, "dispatch", "v1_dispatch_udma_kernel").address);
         auto root = std::make_shared<TraceMetadata>();
-        root->labels["comm_id"] = "0123456789abcdef0123456789abcdef";
+        root->labels["comm_id"] = "18446744073709551615";
         root->op_counters = std::make_shared<KernelOpCounters>();
         auto meta = MakeCallMetadata(root, 12, 13, 4);
         ScopedTraceMetadata scope(meta);
@@ -241,15 +242,19 @@ int main(){
         recorder_source->Submit(ticket, 1000, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
         auto pending = recorder_source->Drain(false, true);
-        assert(pending.size() == 1 && pending[0].event == "timeout");
-        assert(pending[0].values.at("gid") == static_cast<int64_t>(ticket.sequence));
-        assert(pending[0].values.at("op") == 2 && pending[0].values.at("op_count") == 0);
-        assert(pending[0].values.at("dispatch_count") == 4 && !pending[0].values.count("start_tick"));
+        if (override_timeout) {
+            assert(pending.size() == 1 && pending[0].event == "timeout");
+            assert(pending[0].values.at("gid") == static_cast<int64_t>(ticket.sequence));
+            assert(pending[0].values.at("op") == 2 && pending[0].values.at("op_count") == 0);
+            assert(pending[0].values.at("dispatch_count") == 4 && !pending[0].values.count("start_tick"));
+        } else {
+            assert(pending.empty());
+        }
         assert(recorder_source->Drain(false, true).empty());
         second[kLineBytes/sizeof(uint64_t)] = ticket.sequence;
         auto done = recorder_source->Drain(false, true);
         assert(done.size() == 1 && done[0].event == "end");
-        assert(done[0].values.at("gid") == pending[0].values.at("gid"));
+        assert(done[0].values.at("gid") == static_cast<int64_t>(ticket.sequence));
         assert(done[0].values.at("start_tick") == 50 && done[0].values.at("end_tick") == 300);
     }
     setenv("DEEPEP_TRACE_POLL_INTERVAL_MS", "0", 1);
@@ -263,7 +268,7 @@ int main(){
         assert(recorder_source && recorder_source->PollIntervalMs() == 8);
         setenv("DEEPEP_TRACE_TIMEOUT_MS", "1", 1);
         auto root = std::make_shared<TraceMetadata>();
-        root->labels["comm_id"] = "0123456789abcdef0123456789abcdef";
+        root->labels["comm_id"] = "18446744073709551615";
         root->op_counters = std::make_shared<KernelOpCounters>();
         ScopedTraceMetadata scope(root);
         auto ticket = recorder_source->Reserve(0, 1, 1, "dispatch", "v1_dispatch_udma_kernel");
@@ -542,7 +547,6 @@ class MetadataTensor:
 class MetadataNative:
     kernel_trace_diagnostic_version = 4
     kernel_trace_metadata_version = 2
-    trace_recorder_version = 3
 
     def __init__(self):
         self.context = threading.local()
@@ -700,16 +704,25 @@ def test_trace_group_initialization(monkeypatch):
     monkeypatch.setattr(module.KernelTrace, "attach", lambda native, comm_id: 456)
     monkeypatch.setattr(module, "_global_rank", lambda: 9)
     proposals = []
+    bit_counts = []
+    comm_id = str((1 << 64) - 1)
+
+    def randbits(bits):
+        bit_counts.append(bits)
+        return (1 << 64) - 1
+
+    monkeypatch.setattr(module.secrets, "randbits", randbits)
 
     def gather(group, comm, size, value):
         proposals.append(value)
-        return [(True, "rank0-uuid", "", False), (True, None, "", False)]
+        return [proposals[0], (True, None, "", False)]
 
     first = module.attach_trace_session(native, None, 0, 2, gather)[1]
     second = module.attach_trace_session(native, None, 1, 2, gather)[1]
-    assert first.fields["comm_id"] == second.fields["comm_id"] == "rank0-uuid"
+    assert first.fields["comm_id"] == second.fields["comm_id"] == comm_id
     assert first.fields["buffer_id"] != second.fields["buffer_id"]
-    assert proposals[0][1] and proposals[1][1] is None
+    assert proposals[0][1] == comm_id and proposals[1][1] is None
+    assert bit_counts == [64]
     monkeypatch.delenv("DEEPEP_TRACE_RECORDER_ENABLE")
     with pytest.raises(ValueError, match="all EP ranks"):
         module.attach_trace_session(native, None, 1, 2, gather)
@@ -1376,13 +1389,18 @@ def validate_production_trace(directory, manifests, args):
     ranks = set(range(args.ep_size))
     if len(manifests) != args.ep_size or {m.get("rank") for m in manifests} != ranks:
         raise ValueError("invalid production trace manifest ranks")
-    comm_id = manifests[0].get("trace_comm_id")
-    if not isinstance(comm_id, str) or not re.fullmatch(r"[0-9a-f]{32}", comm_id):
-        raise ValueError("invalid production trace communication UUID")
+    comm_text = manifests[0].get("trace_comm_id")
+    if (
+        not isinstance(comm_text, str)
+        or not re.fullmatch(r"0|[1-9][0-9]{0,19}", comm_text)
+        or int(comm_text) >= 1 << 64
+    ):
+        raise ValueError("invalid production trace communication ID")
+    comm_id = int(comm_text)
     by_rank = {m["rank"]: m for m in manifests}
     for manifest in manifests:
         if (
-            manifest.get("trace_comm_id") != comm_id
+            manifest.get("trace_comm_id") != comm_text
             or manifest.get("precision_passed") is not True
             or manifest.get("trace_mode") != "production"
             or manifest.get("trace_ring_active") is not True
@@ -1399,7 +1417,7 @@ def validate_production_trace(directory, manifests, args):
         if not match or not path.is_file() or path.is_symlink() or path.stat().st_size > 1_000_000_000:
             raise ValueError(f"invalid production trace file: {path.name}")
         bus_id, index = map(int, match.groups())
-        if bus_id >= 1 << 32:
+        if bus_id >= 1 << 31:
             raise ValueError(f"invalid production trace bus ID: {path.name}")
         files.setdefault(bus_id, {})[index] = path
     if len(files) != args.ep_size or any(set(ring) != set(range(8)) for ring in files.values()):
@@ -1459,6 +1477,7 @@ def validate_production_trace(directory, manifests, args):
 
                     limits = {
                         "gid": (1, (1 << 63) - 1), "rank": (0, args.ep_size - 1),
+                        "comm_id": (comm_id, comm_id),
                         "bus_id": (bus_id, bus_id), "pid": (1, (1 << 63) - 1), "nvl_rank": (0, 15),
                         "num_sms": (1, 64), "stream": (0, (1 << 64) - 1),
                         "op_count": (0, (1 << 63) - 1), "dispatch_count": (0, (1 << 63) - 1),
@@ -1470,7 +1489,7 @@ def validate_production_trace(directory, manifests, args):
                     if row["num_sms"] != expected_aiv:
                         raise ValueError(f"{location}: op {op} num_sms={row['num_sms']}, expected {expected_aiv}")
                     rank, gid = row["rank"], row["gid"]
-                    if row["comm_id"] != comm_id or row["pid"] != by_rank[rank]["pid"] or row["nvl_rank"] != rank % 16:
+                    if row["pid"] != by_rank[rank]["pid"] or row["nvl_rank"] != rank % 16:
                         raise ValueError(f"{location}: production trace identity mismatch")
                     if by_bus.setdefault(bus_id, rank) != rank or bus_by_rank.setdefault(rank, bus_id) != bus_id:
                         raise ValueError(f"{location}: production trace bus/rank mismatch")
@@ -1559,6 +1578,7 @@ def validate_production_trace(directory, manifests, args):
         ("unpaired", "without completion"), ("mismatched_timeout", "mismatched"),
         ("zero_counts", "op_count"), ("zero_dispatch_counts", "dispatch_count"),
         ("wrong_dispatch_association", "dispatch_count"), ("wrong_reduce_aiv", "op 6 num_sms"),
+        ("string_comm_id", "comm_id"), ("encoded_bus_id", "bus ID"),
         ("dropped", "logger reported failure"),
     ],
 )
@@ -1576,15 +1596,17 @@ def test_validate_production_trace(tmp_path, corruption, message):
     )
     directory = tmp_path / "trace"
     directory.mkdir()
-    comm_id = "0123456789abcdef" * 2
+    comm_id = (1 << 64) - 1
     manifests = [
         dict(rank=rank, pid=100 + rank, precision_passed=True, trace_mode="production",
-             trace_ring_active=True, trace_slots=128, trace_comm_id=comm_id)
+             trace_ring_active=True, trace_slots=128, trace_comm_id=str(comm_id))
         for rank in range(args.ep_size)
     ]
     per_kind = 1 + args.warmup + args.windows * args.iterations
     for rank, manifest in enumerate(manifests):
-        bus_id = 500 + rank
+        bus_id = 4 + rank
+        if corruption == "encoded_bus_id":
+            bus_id += 1 << 31
         stem = f"trmt-deepep-trace-{comm_id}-{bus_id}-"
         for index in range(8):
             (directory / f"{stem}{index}.txt").touch()
@@ -1644,6 +1666,8 @@ def test_validate_production_trace(tmp_path, corruption, message):
                 first["dispatch_count"], second["dispatch_count"] = second["dispatch_count"], first["dispatch_count"]
             elif corruption == "wrong_reduce_aiv":
                 next(row for row in rows if row["op"] == 6)["num_sms"] = logged_aiv
+            elif corruption == "string_comm_id":
+                rows[0]["comm_id"] = str(comm_id)
         (directory / f"{stem}0.txt").write_text(
             "".join(json.dumps(row) + "\n" for row in reversed(rows)), encoding="utf-8"
         )

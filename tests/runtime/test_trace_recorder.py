@@ -16,11 +16,11 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-GROUP_A = "1" * 32
-GROUP_B = "2" * 32
-OLD_GROUP = "3" * 32
-BUS = 8413184
+GROUP_A = str(2**64 - 1)
+GROUP_B = "0"
+OLD_GROUP = "34567"
 PHYSICAL_DEVICE_ID = 3
+BUS = PHYSICAL_DEVICE_ID
 
 
 def _load_monitor():
@@ -91,9 +91,9 @@ def test_production_monitor_enablement_and_shared_source(monkeypatch):
             return active_source
 
         @staticmethod
-        def open_trace_recorder(source):
+        def open_trace_recorder(source, comm_id):
             assert source is active_source
-            calls.append(("open", None))
+            calls.append(("open", comm_id))
             return recorder
 
     try:
@@ -110,7 +110,7 @@ def test_production_monitor_enablement_and_shared_source(monkeypatch):
         first = monitor.attach(Native, comm_id=GROUP_A)
         second = monitor.attach(Native, comm_id=GROUP_B)
         assert first is not None
-        assert calls.count(("open", None)) == 1
+        assert [row for row in calls if row[0] == "open"] == [("open", GROUP_A)]
         assert [row for row in calls if row[0] == "attach"] == [("attach", GROUP_A), ("attach", GROUP_B)]
         assert polled.wait(2)
         assert waits[0] == pytest.approx(0.007)
@@ -125,6 +125,25 @@ def test_production_monitor_enablement_and_shared_source(monkeypatch):
             monitor.detach(second, GROUP_B)
         assert calls[-3:] == [("record", GROUP_B), ("close", None), ("detach", GROUP_B)]
         assert calls.count(("close", None)) == 1
+    finally:
+        monitor.shutdown()
+
+
+def test_legacy_recorder_open_does_not_touch_history(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
+    monitor = _load_monitor().KernelTrace
+    source = SimpleNamespace(identity=1, poll_interval_ms=2, calibration=lambda: {"device": 0})
+    history = tmp_path / "old-trace.txt"
+    history.write_bytes(b"previous trace\n")
+
+    def open_legacy_recorder(source):
+        history.unlink()
+
+    native = SimpleNamespace(get_kernel_trace=lambda: source, open_trace_recorder=open_legacy_recorder)
+    try:
+        with pytest.warns(RuntimeWarning, match=r"open_legacy_recorder.*argument"):
+            assert monitor.attach(native, GROUP_A) is None
+        assert history.read_bytes() == b"previous trace\n"
     finally:
         monitor.shutdown()
 
@@ -149,7 +168,8 @@ def test_idle_poller_does_not_hold_last_writer(monkeypatch):
             if not closing:
                 polled.set()
 
-    def open_recorder(source):
+    def open_recorder(trace_source, comm_id):
+        assert trace_source is source and comm_id == GROUP_A
         writer = Recorder()
         writer_refs.append(weakref.ref(writer))
         return writer
@@ -186,7 +206,7 @@ def test_shutdown_drains_once_and_balances_each_group_reference(monkeypatch):
         detach=lambda group: calls.append(("detach", group)),
         drain=drain,
     )
-    native = SimpleNamespace(get_kernel_trace=lambda: source, open_trace_recorder=lambda _: writer)
+    native = SimpleNamespace(get_kernel_trace=lambda: source, open_trace_recorder=lambda _, comm_id: writer)
     try:
         for group in (GROUP_A, GROUP_B, GROUP_A):
             assert monitor.attach(native, group) == source.identity
@@ -198,40 +218,37 @@ def test_shutdown_drains_once_and_balances_each_group_reference(monkeypatch):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_production_comm_id_is_shared_from_rank_zero(monkeypatch, rank):
+@pytest.mark.parametrize("comm_id", [GROUP_A, GROUP_B])
+def test_production_comm_id_is_shared_from_rank_zero(monkeypatch, rank, comm_id):
     trace = _load_monitor()
     monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
-    monkeypatch.setattr(trace.uuid, "uuid4", lambda: SimpleNamespace(hex=GROUP_A))
     monkeypatch.setattr(trace, "_global_rank", lambda: 10 + rank)
+    random_bits = []
     attached = []
     native = SimpleNamespace(
-        trace_recorder_version=3,
         kernel_trace_metadata_version=2,
         make_trace_metadata=lambda fields, *, recorder: fields,
     )
 
+    def randbits(bits):
+        random_bits.append(bits)
+        return int(comm_id)
+
     def all_gather(group, tensor, ep_size, proposal):
-        assert ep_size == 2 and proposal == (True, GROUP_A if rank == 0 else None, "", False)
-        return [(True, GROUP_A, "", False), (True, None, "", False)]
+        assert ep_size == 2 and proposal == (True, comm_id if rank == 0 else None, "", False)
+        return [(True, comm_id, "", False), (True, None, "", False)]
 
     def attach(native_module, comm_id):
         assert native_module is native
         attached.append(comm_id)
         return 23
 
+    monkeypatch.setattr(trace.secrets, "randbits", randbits)
     monkeypatch.setattr(trace.KernelTrace, "attach", staticmethod(attach))
     identity, session = trace.attach_trace_session(native, None, rank, 2, all_gather)
-    assert identity == 23 and attached == [GROUP_A]
-    assert session.fields["comm_id"] == GROUP_A
-
-
-def test_production_rejects_old_recorder_extension(monkeypatch):
-    trace = _load_monitor()
-    monkeypatch.setenv("DEEPEP_TRACE_RECORDER_ENABLE", "1")
-    native = SimpleNamespace(trace_recorder_version=2, kernel_trace_metadata_version=2)
-
-    with pytest.raises(RuntimeError, match=r"trace recorder requires .* \(version 3\)"):
-        trace.attach_trace_session(native, None, 0, 1, lambda group, tensor, size, proposal: [proposal])
+    assert random_bits == ([64] if rank == 0 else [])
+    assert identity == 23 and attached == [comm_id]
+    assert session.fields["comm_id"] == comm_id
 
 
 def test_dispatch_count_follows_python_call_and_origin_handle():
@@ -271,8 +288,8 @@ def test_dispatch_count_follows_python_call_and_origin_handle():
     assert passed == [0, 1, 0, -1, 2]
 
 
-DEVICE_UUID = "22" * 16
-FOREIGN_DEVICE_UUID = "33" * 16
+DEVICE_UUID = "ab" * 16
+FOREIGN_DEVICE_UUID = "cd" * 16
 
 
 @pytest.fixture(scope="module")
@@ -285,7 +302,6 @@ def recorder_executable(tmp_path_factory):
     (build / "acl/acl.h").write_text(
         "#pragma once\n#include <cstdint>\nusing aclrtContext = void*;\n"
         "using aclError = int;\ninline constexpr aclError ACL_SUCCESS = 0;\n"
-        "enum aclrtDevAttr { ACL_DEV_ATTR_HD_CONNECT_TYPE = 408 };\n"
         "struct aclrtUuid { char bytes[16]; };\n",
         encoding="utf-8",
     )
@@ -306,14 +322,23 @@ def recorder_executable(tmp_path_factory):
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
+#include <string>
 #include <sys/wait.h>
 #include <system_error>
 #include <unistd.h>
 
+namespace {
+constexpr uint32_t kPhysicalDeviceId = 3;
+const std::string kDeviceUuid = "abababababababababababababababab";
+const std::string kGroupA = "18446744073709551615";
+const std::string kGroupB = "0";
+}
+
 namespace ascend_deepep::trace {
 struct TraceRecorderTestAccess {
-    static std::shared_ptr<TraceRecorder> Open(const std::string& directory, uint64_t limit, uint32_t bus_id = 8413184) {
-        return TraceRecorder::OpenAt(directory, bus_id, std::string(32, '2'), limit, 3);
+    static std::shared_ptr<TraceRecorder> Open(const std::string& directory, uint64_t limit,
+                                               uint32_t bus_id = kPhysicalDeviceId) {
+        return TraceRecorder::OpenAt(directory, bus_id, kDeviceUuid, limit, kPhysicalDeviceId);
     }
 };
 }
@@ -334,24 +359,21 @@ struct WriteFault {
 } fault;
 bool readonly_existing_lock = false;
 bool saw_device_lock = false;
-bool queried_ub_bdf = false;
-bool use_legacy_identity_symbols = false;
+bool use_logic_to_physical_query = false;
 
 struct MockDevice {
     const char* mode;
     int32_t physical_id;
-    int64_t connection_type;
-    char uuid_byte;
+    unsigned char uuid_byte;
 };
 
 constexpr MockDevice devices[] = {
-    {"configured", 3, 0, 0x22},
-    {"foreign-device", 3, 0, 0x33},
-    {"ub-first", 5, 2, 0x22},
-    {"ub-second", 6, 2, 0x22},
-    {"connection-query-failed", 7, -1, 0x22},
-    {"unsupported-connection", 8, 1, 0x22},
-    {"invalid-physical-id", -1, 0, 0x22},
+    {"configured", 3, 0xab},
+    {"foreign-device", 3, 0xcd},
+    {"physical-first", 5, 0xab},
+    {"physical-second", 6, 0xab},
+    {"invalid-physical-id", -1, 0xab},
+    {"empty-device-uuid", 7, 0x00},
 };
 
 bool ValidDevice(int32_t device)
@@ -375,8 +397,7 @@ extern "C" void* __real_dlsym(void* handle, const char* name);
 
 extern "C" void* __wrap_dlsym(void* handle, const char* name)
 {
-    if (use_legacy_identity_symbols &&
-        (std::strcmp(name, "aclrtGetPhyDevIdByUserDevId") == 0 || std::strcmp(name, "aclrtGetDeviceInfo") == 0))
+    if (use_logic_to_physical_query && std::strcmp(name, "aclrtGetPhyDevIdByUserDevId") == 0)
         return nullptr;
     return __real_dlsym(handle, name);
 }
@@ -384,9 +405,9 @@ extern "C" void* __wrap_dlsym(void* handle, const char* name)
 extern "C" int __wrap_openat(int directory, const char* name, int flags, ...)
 {
     constexpr char lock_prefix[] = ".trmt-deepep-trace-device-";
-    if (readonly_existing_lock && std::strncmp(name, lock_prefix, sizeof(lock_prefix) - 1) == 0) {
+    if (std::strncmp(name, lock_prefix, sizeof(lock_prefix) - 1) == 0) {
         saw_device_lock = true;
-        if ((flags & O_ACCMODE) != O_RDONLY) {
+        if (readonly_existing_lock && (flags & O_ACCMODE) != O_RDONLY) {
             errno = EACCES;
             return -1;
         }
@@ -418,18 +439,6 @@ extern "C" ssize_t __wrap_write(int fd, const void* data, size_t bytes)
     return __real_write(fd, data, bytes);
 }
 
-extern "C" aclError aclrtDeviceGetPCIBusId(int32_t device, char* address, int32_t length)
-{
-    const char bdf[] = "0080:60:00.0";
-    if (!ValidDevice(device) || length < static_cast<int32_t>(sizeof(bdf))) return 1;
-    if (devices[device].connection_type == 2) {
-        queried_ub_bdf = true;
-        return 1;
-    }
-    std::memcpy(address, bdf, sizeof(bdf));
-    return ACL_SUCCESS;
-}
-
 extern "C" aclError aclrtGetPhyDevIdByUserDevId(int32_t device, int32_t* physical_id)
 {
     if (!ValidDevice(device)) return 1;
@@ -440,14 +449,6 @@ extern "C" aclError aclrtGetPhyDevIdByUserDevId(int32_t device, int32_t* physica
 extern "C" aclError aclrtGetPhyDevIdByLogicDevId(int32_t device, int32_t* physical_id)
 {
     return aclrtGetPhyDevIdByUserDevId(device, physical_id);
-}
-
-extern "C" aclError aclrtGetDeviceInfo(uint32_t device, aclrtDevAttr attr, int64_t* value)
-{
-    if (device >= std::size(devices) || attr != ACL_DEV_ATTR_HD_CONNECT_TYPE || devices[device].connection_type < 0)
-        return 1;
-    *value = devices[device].connection_type;
-    return ACL_SUCCESS;
 }
 
 extern "C" aclError aclrtDeviceGetUuid(int32_t device, aclrtUuid* uuid)
@@ -475,7 +476,8 @@ TraceRecord Record(const std::string& group, int64_t gid, bool complete, int64_t
 
 void TestWriteRetry(TraceRecorder& writer, const std::string& mode)
 {
-    const std::string a(32, '1'), b(32, '2');
+    const auto& a = kGroupA;
+    const auto& b = kGroupB;
     writer.Attach(a);
     if (mode == "retry-recover") {
         fault.actions = {WriteAction::interrupt, WriteAction::error, WriteAction::zero, WriteAction::error};
@@ -515,7 +517,7 @@ void TestGroupDetach(TraceRecorder& writer)
                              std::filesystem::directory_iterator{});
     };
     const auto before = fd_count();
-    const std::string group(32, '1');
+    const auto& group = kGroupA;
     writer.Attach(group);
     writer.Attach(group);
     if (fd_count() != before + 1) throw std::runtime_error("group did not share a single log descriptor");
@@ -541,7 +543,8 @@ void WaitForChild(pid_t child)
 
 void TestForkLock(std::shared_ptr<TraceRecorder>& writer, const std::string& directory)
 {
-    const std::string a(32, '1'), b(32, '2');
+    const auto& a = kGroupA;
+    const auto& b = kGroupB;
     writer->Attach(a);
     writer->Write({Record(a, 1, true)});
 
@@ -593,70 +596,84 @@ void TestForkLock(std::shared_ptr<TraceRecorder>& writer, const std::string& dir
     WaitForChild(child_stays_alive);
 }
 
+template <class Action>
+void RejectNoncanonicalCommIds(Action action)
+{
+    for (const auto* invalid : {"", "00", "+1", "-1", "18446744073709551616", kDeviceUuid.c_str()}) {
+        try {
+            action(invalid);
+        } catch (const std::invalid_argument&) {
+            continue;
+        }
+        throw std::runtime_error("accepted invalid comm_id " + std::string(invalid));
+    }
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
     const std::string directory = argv[1], mode = argv[2];
     try {
-        if (mode == "ub-pair") {
-            auto first = TraceRecorder::Open(2);
-            auto second = TraceRecorder::Open(3);
-            if (queried_ub_bdf) throw std::runtime_error("queried PCI BDF for a UB device");
-            const std::string group(32, '1');
-            first->Attach(group);
-            second->Attach(group);
-            first->Write({Record(group, 1, true)});
-            second->Write({Record(group, 1, true)});
+        if (mode == "invalid-open-comm-id") {
+            RejectNoncanonicalCommIds([](const std::string& comm_id) { TraceRecorder::Open(0, comm_id); });
+            if (saw_device_lock) throw std::runtime_error("invalid comm_id opened a device lock");
+            return 0;
+        }
+        if (mode == "physical-pair") {
+            auto first = TraceRecorder::Open(2, kGroupA);
+            auto second = TraceRecorder::Open(3, kGroupA);
+            first->Attach(kGroupA);
+            second->Attach(kGroupA);
+            first->Write({Record(kGroupA, 1, true)});
+            second->Write({Record(kGroupA, 1, true)});
             return 0;
         }
         const bool retry = mode.rfind("retry-", 0) == 0;
-        use_legacy_identity_symbols = mode == "legacy-pci";
-        const auto device_mode = use_legacy_identity_symbols ? "configured" : mode;
+        use_logic_to_physical_query = mode == "legacy-physical-query";
+        const auto device_mode = use_logic_to_physical_query ? "configured" : mode;
         const auto device = std::find_if(std::begin(devices), std::end(devices), [&](const MockDevice& value) {
             return device_mode == value.mode;
         });
         const bool configured = device != std::end(devices);
         const bool large_limit = mode == "schemas" || mode == "detach" || retry;
         readonly_existing_lock = mode == "readonly-lock";
-        auto writer = configured ? TraceRecorder::Open(static_cast<int32_t>(device - std::begin(devices)))
+        const auto& group = mode == "foreign-device" ? kGroupB : kGroupA;
+        auto writer = configured ? TraceRecorder::Open(static_cast<int32_t>(device - std::begin(devices)), group)
             : TraceRecorderTestAccess::Open(directory, large_limit ? 16 * 1024 : 512,
-                                            mode == "contend-other-bus" ? 8413185 : 8413184);
+                                            kPhysicalDeviceId + (mode == "contend-other-bus" ? 1 : 0));
         if (configured) {
-            const std::string group(32, mode == "foreign-device" ? '2' : '1');
             writer->Attach(group);
             writer->Write({Record(group, 1, true)});
         } else if (mode == "hold") {
-            const std::string group(32, '1');
-            writer->Attach(group);
-            writer->Write({Record(group, 1, true)});
+            writer->Attach(kGroupA);
+            writer->Write({Record(kGroupA, 1, true)});
             std::ofstream(directory + "/test-lock-ready") << "ready\n";
             std::cin.get();
         } else if (mode == "emit") {
-            const std::string a(32, '1'), b(32, '2');
-            writer->Attach(a);
-            writer->Attach(b);
+            writer->Attach(kGroupA);
+            writer->Attach(kGroupB);
             std::vector<TraceRecord> batch;
-            for (int64_t gid = 1; gid <= 9; ++gid) batch.push_back(Record(a, gid, true));
-            batch.push_back(Record(b, 1, false));
+            for (int64_t gid = 1; gid <= 9; ++gid) batch.push_back(Record(kGroupA, gid, true));
+            batch.push_back(Record(kGroupB, 1, false));
             writer->Write(batch);
         } else if (mode == "schemas") {
-            const std::string group(32, '1');
-            writer->Attach(group);
+            writer->Attach(kGroupA);
             std::vector<TraceRecord> batch;
             for (int64_t op = 0; op < 10; ++op) {
-                batch.push_back(Record(group, op + 1, false, op));
-                batch.push_back(Record(group, op + 1, true, op));
+                batch.push_back(Record(kGroupA, op + 1, false, op));
+                batch.push_back(Record(kGroupA, op + 1, true, op));
             }
             writer->Write(batch);
+        } else if (mode == "invalid-comm-id") {
+            RejectNoncanonicalCommIds([&writer](const std::string& comm_id) { writer->Attach(comm_id); });
         } else if (mode == "detach") {
             TestGroupDetach(*writer);
         } else if (mode == "fork-lock") {
             TestForkLock(writer, directory);
         } else if (mode == "readonly-lock") {
             if (!saw_device_lock) throw std::runtime_error("expected opening the existing lock");
-            const std::string group(32, '1');
-            writer->Attach(group);
-            writer->Write({Record(group, 1, true)});
+            writer->Attach(kGroupA);
+            writer->Write({Record(kGroupA, 1, true)});
         } else if (retry) {
             TestWriteRetry(*writer, mode);
         }
@@ -706,7 +723,7 @@ def _device_lock(directory, physical_id, device_uuid=DEVICE_UUID):
     return directory / f".trmt-deepep-trace-device-{device_uuid}-{physical_id}.lock"
 
 
-@pytest.mark.parametrize("mode", ["configured", "legacy-pci"])
+@pytest.mark.parametrize("mode", ["configured", "legacy-physical-query"])
 def test_production_directory_from_environment(recorder_executable, tmp_path, mode):
     directory = tmp_path / "configured logs"
     directory.mkdir()
@@ -731,30 +748,29 @@ def test_production_directory_from_environment(recorder_executable, tmp_path, mo
     assert outside.read_text(encoding="utf-8") == "keep outside file"
     assert outside_marker.is_file()
     files = [_filename(directory, GROUP_A, BUS, i) for i in range(8)]
-    assert json.loads(files[0].read_bytes())["comm_id"] == GROUP_A
+    assert json.loads(files[0].read_bytes())["comm_id"] == int(GROUP_A)
     assert all(path.read_bytes() == b"" for path in files[1:])
     assert _owner_marker(directory, GROUP_A, BUS).read_bytes() == b""
 
 
-def test_native_recorder_uses_distinct_physical_ub_ids_for_shared_uuid(recorder_executable, tmp_path):
+def test_native_recorder_uses_distinct_physical_ids_for_shared_uuid(recorder_executable, tmp_path):
     subprocess.run(
-        [recorder_executable, tmp_path, "ub-pair"],
+        [recorder_executable, tmp_path, "physical-pair"],
         env=dict(os.environ, DEEPEP_TRACE_DIR=str(tmp_path)),
         check=True,
         timeout=15,
     )
 
     for physical_id in (5, 6):
-        bus_id = (1 << 31) + physical_id
-        files = [_filename(tmp_path, GROUP_A, bus_id, i) for i in range(8)]
+        files = [_filename(tmp_path, GROUP_A, physical_id, i) for i in range(8)]
         record = json.loads(files[0].read_bytes())
-        assert record["comm_id"] == GROUP_A and record["bus_id"] == bus_id
+        assert record["comm_id"] == int(GROUP_A) and record["bus_id"] == physical_id
         assert all(path.read_bytes() == b"" for path in files[1:])
-        assert _owner_marker(tmp_path, GROUP_A, bus_id, physical_id=physical_id).is_file()
+        assert _owner_marker(tmp_path, GROUP_A, physical_id, physical_id=physical_id).is_file()
         assert _device_lock(tmp_path, physical_id).is_file()
 
 
-@pytest.mark.parametrize("mode", ["connection-query-failed", "unsupported-connection", "invalid-physical-id"])
+@pytest.mark.parametrize("mode", ["invalid-physical-id", "empty-device-uuid"])
 def test_native_recorder_rejects_unresolved_device_identity(recorder_executable, tmp_path, mode):
     result = subprocess.run(
         [recorder_executable, tmp_path, mode],
@@ -767,37 +783,76 @@ def test_native_recorder_rejects_unresolved_device_identity(recorder_executable,
     assert not list(tmp_path.iterdir())
 
 
+def test_native_recorder_rejects_noncanonical_comm_ids(recorder_executable, tmp_path):
+    subprocess.run([recorder_executable, tmp_path, "invalid-comm-id"], check=True, timeout=15)
+    assert list(tmp_path.iterdir()) == [_device_lock(tmp_path, PHYSICAL_DEVICE_ID)]
+
+
+def test_native_recorder_rejects_invalid_open_before_cleanup(recorder_executable, tmp_path):
+    history = _filename(tmp_path, OLD_GROUP, BUS, 0)
+    history.write_bytes(b"previous trace\n")
+    marker = _owner_marker(tmp_path, OLD_GROUP, BUS)
+    marker.touch()
+    lock = _device_lock(tmp_path, PHYSICAL_DEVICE_ID)
+    lock.touch()
+
+    def snapshot():
+        return {
+            path.name: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+            for path in tmp_path.iterdir()
+        }
+
+    previous = snapshot()
+    subprocess.run(
+        [recorder_executable, tmp_path, "invalid-open-comm-id"],
+        env=dict(os.environ, DEEPEP_TRACE_DIR=str(tmp_path)),
+        check=True,
+        timeout=15,
+    )
+    assert snapshot() == previous
+
+
 def test_native_cleanup_rotation_and_record_fields(recorder_executable, tmp_path):
     old = _filename(tmp_path, OLD_GROUP, BUS, 0)
     old.write_text("old", encoding="utf-8")
     old_marker = _owner_marker(tmp_path, OLD_GROUP, BUS)
     old_marker.touch()
-    older_group = "0" * 32
+    older_group = "a3" * 16
     older = _filename(tmp_path, older_group, BUS, 7)
     older.write_text("older", encoding="utf-8")
     older_marker = _owner_marker(tmp_path, older_group, BUS)
     older_marker.touch()
-    unmarked = _filename(tmp_path, "4" * 32, BUS, 0)
+    unmarked = _filename(tmp_path, "444", BUS, 0)
     unmarked.write_text("keep unmarked file", encoding="utf-8")
-    foreign_group = "5" * 32
+    foreign_group = "555"
     foreign = _filename(tmp_path, foreign_group, BUS, 0)
-    foreign.write_text("keep same BDF foreign file", encoding="utf-8")
+    foreign.write_text("keep same bus ID foreign file", encoding="utf-8")
     foreign_marker = _owner_marker(tmp_path, foreign_group, BUS, FOREIGN_DEVICE_UUID)
     foreign_marker.touch()
     other_bus = _filename(tmp_path, OLD_GROUP, BUS + 1, 0)
     other_bus.write_text("keep other device", encoding="utf-8")
     other_bus_marker = _owner_marker(tmp_path, OLD_GROUP, BUS + 1)
     other_bus_marker.touch()
-    other_device_group = "7" * 32
+    other_device_group = "777"
     other_device = _filename(tmp_path, other_device_group, BUS, 0)
     other_device.write_text("keep same UUID other physical device", encoding="utf-8")
     other_device_marker = _owner_marker(tmp_path, other_device_group, BUS, physical_id=PHYSICAL_DEVICE_ID + 1)
     other_device_marker.touch()
-    legacy_group = "8" * 32
+    legacy_group = "a8" * 16
     legacy = _filename(tmp_path, legacy_group, BUS, 0)
     legacy.write_text("keep legacy history", encoding="utf-8")
     legacy_marker = tmp_path / f".trmt-deepep-trace-owner-{DEVICE_UUID}-{BUS}-{legacy_group}"
     legacy_marker.touch()
+    previous_bus = (1 << 31) + PHYSICAL_DEVICE_ID
+    previous = _filename(tmp_path, older_group, previous_bus, 0)
+    previous.write_text("keep legacy history for a different bus ID", encoding="utf-8")
+    previous_marker = _owner_marker(tmp_path, older_group, previous_bus)
+    previous_marker.touch()
+    invalid_group = str(2**64)
+    invalid = _filename(tmp_path, invalid_group, BUS, 0)
+    invalid.write_text("keep file with invalid comm_id", encoding="utf-8")
+    invalid_marker = _owner_marker(tmp_path, invalid_group, BUS)
+    invalid_marker.touch()
     other_index = _filename(tmp_path, OLD_GROUP, BUS, 8)
     other_index.write_text("keep unrelated filename", encoding="utf-8")
     other_file = tmp_path / "user_archive.txt"
@@ -806,9 +861,9 @@ def test_native_cleanup_rotation_and_record_fields(recorder_executable, tmp_path
     symbolic_link.symlink_to(other_file)
     matching_directory = _filename(tmp_path, OLD_GROUP, BUS, 2)
     matching_directory.mkdir()
-    marked_by_symlink = _filename(tmp_path, "6" * 32, BUS, 0)
+    marked_by_symlink = _filename(tmp_path, "666", BUS, 0)
     marked_by_symlink.write_text("keep a file marked by a symlink", encoding="utf-8")
-    symlink_marker = _owner_marker(tmp_path, "6" * 32, BUS)
+    symlink_marker = _owner_marker(tmp_path, "666", BUS)
     symlink_marker.symlink_to(other_file)
 
     subprocess.run([recorder_executable, tmp_path, "emit"], check=True, timeout=15)
@@ -818,7 +873,7 @@ def test_native_cleanup_rotation_and_record_fields(recorder_executable, tmp_path
     assert not older.exists()
     assert not older_marker.exists()
     assert unmarked.read_text(encoding="utf-8") == "keep unmarked file"
-    assert foreign.read_text(encoding="utf-8") == "keep same BDF foreign file"
+    assert foreign.read_text(encoding="utf-8") == "keep same bus ID foreign file"
     assert foreign_marker.is_file()
     assert other_bus.read_text(encoding="utf-8") == "keep other device"
     assert other_bus_marker.is_file()
@@ -826,6 +881,10 @@ def test_native_cleanup_rotation_and_record_fields(recorder_executable, tmp_path
     assert other_device_marker.is_file()
     assert legacy.read_text(encoding="utf-8") == "keep legacy history"
     assert legacy_marker.is_file()
+    assert previous.read_text(encoding="utf-8") == "keep legacy history for a different bus ID"
+    assert previous_marker.is_file()
+    assert invalid.read_text(encoding="utf-8") == "keep file with invalid comm_id"
+    assert invalid_marker.is_file()
     assert other_index.read_text(encoding="utf-8") == "keep unrelated filename"
     assert other_file.read_text(encoding="utf-8") == "keep archive"
     assert symbolic_link.is_symlink()
@@ -855,7 +914,7 @@ def test_native_cleanup_rotation_and_record_fields(recorder_executable, tmp_path
         "topk": 8,
         "pid": 1864,
         "stream": 2**64 - 1,
-        "comm_id": GROUP_A,
+        "comm_id": int(GROUP_A),
         "launch_time": "2026-11-12 15:29:04.967346",
         "start_time": "2026-11-12 15:29:04.967558",
         "end_time": "2026-11-12 15:29:04.967564",
@@ -866,7 +925,9 @@ def test_native_cleanup_rotation_and_record_fields(recorder_executable, tmp_path
     group_b = [_filename(tmp_path, GROUP_B, BUS, i).read_bytes() for i in range(8)]
     assert all(data == b"" for data in group_b[1:])
     timeout = json.loads(group_b[0])
-    assert timeout["type"] == 1 and timeout["comm_id"] == GROUP_B
+    assert type(records[0]["comm_id"]) is int
+    assert timeout["type"] == 1 and timeout["comm_id"] == int(GROUP_B)
+    assert type(timeout["comm_id"]) is int
     assert timeout.keys() == records[0].keys()
     assert all(timeout[key] is None for key in ("start_time", "end_time", "elapsed_ns", "start_tick", "end_tick"))
 
@@ -881,7 +942,7 @@ def test_native_recorder_skips_cleanup_for_active_device(recorder_executable, tm
             assert ready.is_file()
             active = _filename(tmp_path, GROUP_A, BUS, 0)
             original = active.read_bytes()
-            assert json.loads(original)["comm_id"] == GROUP_A
+            assert json.loads(original)["comm_id"] == int(GROUP_A)
             own_marker = _owner_marker(tmp_path, GROUP_A, BUS)
             assert own_marker.is_file()
             for mode in ("contend", "contend-other-bus"):
@@ -958,7 +1019,7 @@ def test_native_recorder_long_and_short_schemas(recorder_executable, tmp_path):
             "num_sms": 32,
             "pid": 1864,
             "stream": 2**64 - 1,
-            "comm_id": GROUP_A,
+            "comm_id": int(GROUP_A),
             "launch_time": "2026-11-12 15:29:04.967346",
         }
         if row["op"] in (2, 4, 5, 7, 8, 9):

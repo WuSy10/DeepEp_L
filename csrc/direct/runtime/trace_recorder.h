@@ -10,7 +10,7 @@ struct TraceRecord;
 
 class TraceRecorder {
 public:
-    static std::shared_ptr<TraceRecorder> Open(int device);
+    static std::shared_ptr<TraceRecorder> Open(int device, const std::string& comm_id);
     ~TraceRecorder();
 
     void Attach(const std::string& comm_id);

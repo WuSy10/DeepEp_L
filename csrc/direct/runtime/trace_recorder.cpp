@@ -6,7 +6,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <ctime>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -23,7 +22,6 @@
 #include <sys/stat.h>
 #include <system_error>
 #include <thread>
-#include <tuple>
 #include <unistd.h>
 #include <utility>
 
@@ -38,7 +36,7 @@ constexpr unsigned kFileCount = 8;
 constexpr uint64_t kFileLimit = 1000000000;
 constexpr unsigned kWriteRetries = 3;
 constexpr std::chrono::milliseconds kWriteRetryDelay{3};
-constexpr size_t kCommIdChars = 32;
+constexpr size_t kUuidChars = 32;
 static_assert(kFileCount <= 10);
 
 class FileDescriptor {
@@ -71,63 +69,13 @@ private:
 }
 
 template <class Integer>
-std::optional<Integer> ParseNumber(std::string_view text, int base = 10)
+std::optional<Integer> ParseNumber(std::string_view text)
 {
     if (text.empty()) return {};
     Integer value{};
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, base);
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
     if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return {};
     return value;
-}
-
-std::optional<uint32_t> PackPciBdf(std::string_view bdf)
-{
-    const auto colon1 = bdf.find(':');
-    if (colon1 == std::string_view::npos) return {};
-    const auto colon2 = bdf.find(':', colon1 + 1);
-    if (colon2 == std::string_view::npos) return {};
-    const auto dot = bdf.find('.', colon2 + 1);
-    if (dot == std::string_view::npos) return {};
-    const auto domain = ParseNumber<uint32_t>(bdf.substr(0, colon1), 16);
-    const auto bus = ParseNumber<uint32_t>(bdf.substr(colon1 + 1, colon2 - colon1 - 1), 16);
-    const auto slot = ParseNumber<uint32_t>(bdf.substr(colon2 + 1, dot - colon2 - 1), 16);
-    const auto function = ParseNumber<uint32_t>(bdf.substr(dot + 1), 16);
-    if (!domain || !bus || !slot || !function || *domain > 0xffff || *bus > 0xff || *slot > 0x1f ||
-        *function > 7) return {};
-    return (*domain << 16) | (*bus << 8) | (*slot << 3) | *function;
-}
-
-uint32_t PciBusId(int device)
-{
-    using Query = aclError (*)(int32_t, char*, int32_t);
-    const auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtDeviceGetPCIBusId"));
-    char address[64]{};
-    if (query && query(device, address, sizeof(address)) == ACL_SUCCESS) {
-        const auto length = strnlen(address, sizeof(address));
-        if (length < sizeof(address)) {
-            if (const auto bus = PackPciBdf(std::string_view(address, length))) return *bus;
-        }
-    }
-
-    using ReverseQuery = aclError (*)(const char*, int32_t*);
-    const auto reverse = reinterpret_cast<ReverseQuery>(dlsym(RTLD_DEFAULT, "aclrtDeviceGetByPCIBusId"));
-    std::optional<uint32_t> bus_id;
-    if (reverse) {
-        std::error_code error;
-        auto iter = std::filesystem::directory_iterator("/sys/bus/pci/devices", error);
-        const auto end = std::filesystem::directory_iterator{};
-        for (; !error && iter != end; iter.increment(error)) {
-            const auto bdf = iter->path().filename().string();
-            const auto candidate = PackPciBdf(bdf);
-            int32_t matched = -1;
-            if (!candidate || reverse(bdf.c_str(), &matched) != ACL_SUCCESS || matched != device) continue;
-            if (bus_id && *bus_id != *candidate)
-                throw std::runtime_error("ambiguous PCI BDF for ACL device " + std::to_string(device));
-            bus_id = candidate;
-        }
-        if (bus_id && !error) return *bus_id;
-    }
-    throw std::runtime_error("PCI BDF unavailable for ACL device " + std::to_string(device));
 }
 
 uint32_t PhysicalDeviceId(int device)
@@ -139,25 +87,6 @@ uint32_t PhysicalDeviceId(int device)
     if (!query || query(device, &physical_device_id) != ACL_SUCCESS || physical_device_id < 0)
         throw std::runtime_error("physical device ID unavailable for ACL device " + std::to_string(device));
     return static_cast<uint32_t>(physical_device_id);
-}
-
-uint32_t TraceBusId(int device, uint32_t physical_device_id)
-{
-    using Query = aclError (*)(uint32_t, aclrtDevAttr, int64_t*);
-    const auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetDeviceInfo"));
-    if (!query) return PciBusId(device);
-
-    // Older CANN headers may omit ACL_DEV_ATTR_HD_CONNECT_TYPE.
-    constexpr auto kConnectionType = static_cast<aclrtDevAttr>(408);
-    constexpr int64_t kPcie = 0;
-    constexpr int64_t kUnifiedBus = 2;
-    constexpr uint32_t kUbBusIdBase = 0x80000000u;
-    int64_t connection = -1;
-    if (query(device, kConnectionType, &connection) != ACL_SUCCESS)
-        throw std::runtime_error("connection type unavailable for ACL device " + std::to_string(device));
-    if (connection == kPcie) return PciBusId(device);
-    if (connection == kUnifiedBus) return kUbBusIdBase + physical_device_id;
-    throw std::runtime_error("unsupported trace connection type " + std::to_string(connection));
 }
 
 std::string DeviceUuid(int device)
@@ -228,13 +157,24 @@ FileDescriptor LockDevice(int directory, const std::string& device_key)
     return lock;
 }
 
-bool ValidCommId(std::string_view uuid)
+bool ValidUuid(std::string_view uuid)
 {
-    if (uuid.size() != kCommIdChars) return false;
+    if (uuid.size() != kUuidChars) return false;
     for (const char c : uuid) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
     }
     return true;
+}
+
+bool ValidCommId(std::string_view comm_id)
+{
+    return !comm_id.empty() && (comm_id.size() == 1 || comm_id.front() != '0') &&
+           ParseNumber<uint64_t>(comm_id).has_value();
+}
+
+void CheckCommId(std::string_view comm_id)
+{
+    if (!ValidCommId(comm_id)) throw std::invalid_argument("expected a canonical decimal uint64 trace communication ID");
 }
 
 std::string TraceFileStem(std::string_view comm_id, uint32_t bus_id)
@@ -262,8 +202,10 @@ void CleanHistory(int directory, uint32_t bus_id, const std::string& owner_prefi
             break;
         }
         const std::string_view name(entry->d_name);
-        if (name.substr(0, owner_prefix.size()) == owner_prefix && ValidCommId(name.substr(owner_prefix.size())))
-            candidates.emplace_back(name);
+        if (name.substr(0, owner_prefix.size()) != owner_prefix) continue;
+        const auto comm_id = name.substr(owner_prefix.size());
+        // Existing owner-v2 markers can contain a hexadecimal communication ID.
+        if (ValidCommId(comm_id) || ValidUuid(comm_id)) candidates.emplace_back(name);
     }
     entries.reset();
     for (const auto& marker : candidates) {
@@ -358,7 +300,7 @@ std::string FormatRecord(const TraceRecord& record, std::string_view comm_id, ui
     const auto stream = record.labels.find("stream");
     const auto handle = stream == record.labels.end() ? std::nullopt : ParseNumber<uint64_t>(stream->second);
     field("stream", handle ? std::to_string(*handle) : "null");
-    field("comm_id", "\"" + std::string(comm_id) + '"');
+    field("comm_id", comm_id);
     time("launch_time", value("launch_ns"));
     time("start_time", completed ? value("start_ns") : std::nullopt);
     time("end_time", completed ? value("end_ns") : std::nullopt);
@@ -473,7 +415,7 @@ std::shared_ptr<TraceRecorder> TraceRecorder::OpenAt(const std::string& director
 {
     if (!file_limit || file_limit > static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
         throw std::invalid_argument("invalid trace file size limit");
-    if (!ValidCommId(device_uuid)) throw std::invalid_argument("invalid trace device UUID");
+    if (!ValidUuid(device_uuid)) throw std::invalid_argument("invalid trace device UUID");
     auto dir = OpenDirectory(directory);
     const auto device_key = device_uuid + "-" + std::to_string(physical_device_id);
     auto lock = LockDevice(dir.Get(), device_key);
@@ -483,26 +425,25 @@ std::shared_ptr<TraceRecorder> TraceRecorder::OpenAt(const std::string& director
         new TraceRecorder(std::make_unique<Impl>(std::move(dir), std::move(lock), bus_id, std::move(prefix), file_limit)));
 }
 
-std::shared_ptr<TraceRecorder> TraceRecorder::Open(int device)
+std::shared_ptr<TraceRecorder> TraceRecorder::Open(int device, const std::string& comm_id)
 {
+    CheckCommId(comm_id);
     static std::mutex mutex;
     static std::map<int, std::weak_ptr<TraceRecorder>> devices;
-    using WriterKey = std::tuple<uint32_t, std::string, uint32_t>;
-    static std::map<WriterKey, std::weak_ptr<TraceRecorder>> writers;
+    static std::map<std::pair<uint32_t, std::string>, std::weak_ptr<TraceRecorder>> writers;
     std::lock_guard<std::mutex> lock(mutex);
     if (auto old = devices[device].lock()) {
         if (old->impl_->owner != getpid()) throw std::runtime_error("cannot use inherited trace recorder");
         return old;
     }
     const auto physical_device_id = PhysicalDeviceId(device);
-    const auto bus_id = TraceBusId(device, physical_device_id);
     const auto device_uuid = DeviceUuid(device);
-    auto& cached = writers[{bus_id, device_uuid, physical_device_id}];
+    auto& cached = writers[{physical_device_id, device_uuid}];
     auto recorder = cached.lock();
     if (!recorder) {
         const char* directory = std::getenv("DEEPEP_TRACE_DIR");
-        recorder = OpenAt(directory && *directory ? directory : kDefaultDirectory, bus_id, device_uuid, kFileLimit,
-                          physical_device_id);
+        recorder = OpenAt(directory && *directory ? directory : kDefaultDirectory, physical_device_id, device_uuid,
+                          kFileLimit, physical_device_id);
         cached = recorder;
     }
     if (recorder->impl_->owner != getpid()) throw std::runtime_error("cannot use inherited trace recorder");
@@ -513,7 +454,7 @@ std::shared_ptr<TraceRecorder> TraceRecorder::Open(int device)
 void TraceRecorder::Attach(const std::string& comm_id)
 {
     if (impl_->owner != getpid()) throw std::runtime_error("cannot use inherited trace recorder");
-    if (!ValidCommId(comm_id)) throw std::invalid_argument("expected a lowercase hexadecimal trace communication UUID");
+    CheckCommId(comm_id);
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto [it, inserted] = impl_->groups.try_emplace(comm_id);
     if (!inserted) {

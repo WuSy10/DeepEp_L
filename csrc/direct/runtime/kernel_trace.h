@@ -135,7 +135,7 @@ private:
     void Init(int device);
     bool recorder_mode_ = true;
     int poll_interval_ms_ = 2;
-    int timeout_ms_ = 10;
+    int timeout_ms_ = 10000;
     unsigned slot_count_ = 128;
     std::unique_ptr<Slot[]> slots_;
     std::mutex drain_mutex_;

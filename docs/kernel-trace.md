@@ -28,7 +28,7 @@ export DEEPEP_TRACE_RECORDER_ENABLE=1
 # 可选：在创建 Buffer 前指定本机输出目录和时间参数
 # export DEEPEP_TRACE_DIR=/path/to/deepep-logs
 # export DEEPEP_TRACE_POLL_INTERVAL_MS=2
-# export DEEPEP_TRACE_TIMEOUT_MS=10
+# export DEEPEP_TRACE_TIMEOUT_MS=10000
 python -u benchmarks/clos/bench_v2_bandwidth.py \
     --ep-size 4 --nnodes 1 --aiv 32 --dtypes bf16 --expand 0 \
     --num-tokens 2048 --hidden 6144 --num-topk 8 --experts-per-rank 32 \
@@ -38,21 +38,18 @@ ls -lh "${DEEPEP_TRACE_DIR:-/dockerdata/.trmt/deepep}"/trmt-deepep-trace-*.txt
 
 生产日志写入 `DEEPEP_TRACE_DIR` 指定的本机可写目录，未设置或为空时使用 `/dockerdata/.trmt/deepep/`。请在创建 Buffer 前设置目录，可以使用相对路径或指向目标目录的符号链接。采集开关仍由 `DEEPEP_TRACE_RECORDER_ENABLE` 控制。文件前缀、容量和文件数固定，文件名为 `trmt-deepep-trace-<commId>-<busId>-<序号>.txt`，其中：
 
-- `commId` 是由 32 个小写十六进制字符表示的 UUID。EP rank 0 在 Buffer 初始化时生成并通过 all-gather 同步，日志的 `comm_id` 使用同一字符串。
-- `busId` 是设备标识的无符号十进制编码，和日志的 `bus_id` 一致。采集器按 CANN 报告的 Host 与 Device 连接类型选择编码。
-  - PCIe 使用 CANN 提供的完整 PCI BDF，按 `(domain << 16) | (bus << 8) | (device << 3) | function` 打包。例如 `0080:60:00.0` 对应 `8413184`。容器或虚拟机可能报告虚拟 BDF。
-  - Unified Bus（UB）使用 `0x80000000 + physical_device_id`。采集器通过 `aclrtGetPhyDevIdByUserDevId` 将 ACL 用户设备编号转换为当前主机的物理设备编号。例如物理设备 `3` 对应 `2147483651`。该编号的作用域是当前主机。
-  - 同一通信组内，如果两个 rank 的 `busId` 相同，应使用不同的输出目录以区分文件名。无法取得有效设备标识、物理设备编号或 CANN 设备 UUID 时，采集器会报告警告并跳过该设备。[CANN 设备标识接口](https://github.com/hicann/runtime/blob/master/docs/zh/api_ref/04_device_management.md#aclrtgetphydevidbyuserdevid)
+- `commId` 是随机无符号 64 位通信组 ID 的十进制表示，文件名中不补前导零。EP rank 0 在 Buffer 初始化时调用 `secrets.randbits(64)` 生成该 ID，并通过 all-gather 同步。日志中的 `comm_id` 为同一 ID 的 JSON 整数。
+- `busId` 是当前主机的 CANN 物理设备编号，和日志中的整数 `bus_id` 一致，各连接类型都直接使用该值。采集器通过 `aclrtGetPhyDevIdByUserDevId` 将 ACL 用户设备编号转换为物理设备编号。运行时缺少该符号时，使用 `aclrtGetPhyDevIdByLogicDevId`。例如 ACL 用户设备 `0` 映射到物理设备 `3` 时，日志记录 `bus_id=3`。同一通信组内，如果两个 rank 的 `busId` 相同，应使用不同的输出目录以区分文件名。无法取得物理设备编号或 CANN 设备 UUID 时，采集器会报告警告并跳过该设备。[CANN 设备标识接口](https://github.com/hicann/runtime/blob/master/docs/zh/api_ref/04_device_management.md#aclrtgetphydevidbyuserdevid)
 - 序号为 `0–7`，同一 `(commId, busId)` 固定有八个文件。单文件上限为 1 GB（1,000,000,000 字节），按 UTF-8 整行统计，包含换行符。下一行将超限时，先切换到 `(i+1) % 8` 并截断目标文件，再写入该行。每组每卡的日志内容合计最多 8 GB；单组八卡最多 64 GB。
 
-**启动时，采集器按 CANN 设备 UUID 和物理设备编号获取设备锁。** 采集器持锁扫描所选目录的 `owner-v2` 归属标记，清理设备 UUID、物理设备编号、`busId` 均匹配的旧通信组普通日志文件及归属标记。旧版归属标记、对应日志和无归属日志均保留。锁文件可用只读方式打开，采集器由持锁进程正常销毁时会显式解锁。需要保留的新版日志请在同一设备重跑前移出该目录。
+**启动时，采集器按 CANN 设备 UUID 和物理设备编号获取设备锁。** 采集器持锁扫描所选目录的 `owner-v2` 归属标记，清理设备 UUID、物理设备编号、`busId` 均匹配的旧通信组普通日志文件及归属标记。该规则也适用于通信组 ID 为 32 个小写十六进制字符的 `owner-v2` 标记。历史 `busId` 与当前物理设备编号不同的文件、旧版归属标记及对应日志、无归属日志均保留。锁文件可用只读方式打开，采集器由持锁进程正常销毁时会显式解锁。需要保留的日志请在同一设备重跑前移出该目录。
 
 ## 轮询和超时配置
 
 | 环境变量 | 默认值 | 含义 |
 | --- | ---: | --- |
 | `DEEPEP_TRACE_POLL_INTERVAL_MS` | 2 ms | 生产后台线程在每次扫描前的等待时间。收集、写入和线程调度也会影响相邻扫描的实际间隔。 |
-| `DEEPEP_TRACE_TIMEOUT_MS` | 10 ms | 从 Host 成功提交开始计时。达到阈值后，后台扫描仍未收齐完成序号时才报告 `type=1`。 |
+| `DEEPEP_TRACE_TIMEOUT_MS` | 10000 ms（10 秒） | 从 Host 成功提交开始计时。达到阈值后，后台扫描仍未收齐完成序号时才报告 `type=1`。 |
 
 两个值独立设置，均填写 1～2,147,483,647 的十进制整数，单位为毫秒。未设置或为空时使用默认值。请在启动训练、创建 Buffer 前设置，修改后需重新启动。无效值会发出警告并关闭该设备在本进程中的生产采集，训练继续运行。开发诊断保留原有设置。
 
@@ -68,10 +65,10 @@ ls -lh "${DEEPEP_TRACE_DIR:-/dockerdata/.trmt/deepep}"/trmt-deepep-trace-*.txt
 | `type` | `2` 表示所有参与 AIV 的完成序号已匹配。`1` 表示 Host 成功提交后达到配置的超时阈值，轮询时仍未收齐完成序号。每个 `gid` 至多报告一次超时；之后完成仍可输出同一 `gid` 的 `type=2`。Host 提交失败与未观察到设备完成分别处理。 |
 | `gid`、`op`、`op_count` | Host 为有效票据分配的进程内序号（从 1 开始）、上表固定 kernel 编号，以及本 rank 在当前通信组中同名 kernel 的启动计数（从 0 开始）。 |
 | `dispatch_count` | Python dispatch 调用计数，从 0 开始。fresh 与 cached 各按一次调用计数，同一次调用的 notify 与 dispatch 保持一致。combine 使用 handle 关联的原始 fresh dispatch 计数；不可取得时为 `null`。 |
-| `bus_id`、`rank`、`nvl_rank` | 编码后的设备标识（PCI BDF 或 UB 物理设备编号）、EP 组内 rank、按约定计算的 `rank % 16`。 |
+| `bus_id`、`rank`、`nvl_rank` | CANN 物理设备编号、EP 组内 rank、按约定计算的 `rank % 16`。 |
 | `num_sms` | 实际参与的 AIV 数。 |
 | `ep_size`、`hidden_size`、`num_experts`、`num_tokens`、`topk` | 仅长格式。分别为 EP 组大小、API 输入特征维度、专家数、原始路由 tensor 行数及 top-k。缺少相应元数据时字段值可为 `null`。 |
-| `pid`、`stream`、`comm_id` | 进程号、启动时的本地 ACL 流句柄（无符号整数）、通信组 UUID。 |
+| `pid`、`stream`、`comm_id` | 进程号、启动时的本地 ACL 流句柄（无符号整数）、随机无符号 64 位通信组 ID（JSON 整数）。 |
 | `launch_time`、`start_time`、`end_time` | 提交前的 Host 时间、校准后的最早设备开始和最晚设备结束时间。采用 UTC+8，格式为 `YYYY-MM-DD HH:MM:SS.ffffff`。 |
 | `elapsed_ns`、`start_tick`、`end_tick` | 设备起止 tick 以及两者的差值，Ascend950 的 1 GHz tick 对应纳秒。 |
 
@@ -80,13 +77,13 @@ ls -lh "${DEEPEP_TRACE_DIR:-/dockerdata/.trmt/deepep}"/trmt-deepep-trace-*.txt
 长格式完成记录（`op=2`）：
 
 ```json
-{"type":2,"gid":1,"op":2,"op_count":0,"dispatch_count":0,"ep_size":4,"bus_id":8413184,"rank":0,"nvl_rank":0,"hidden_size":6144,"num_experts":256,"num_sms":32,"num_tokens":2048,"topk":8,"pid":1864,"stream":187651357453200,"comm_id":"fe12434710f94e0393392f417fa778c2","launch_time":"2026-11-12 15:29:04.967346","start_time":"2026-11-12 15:29:04.967558","end_time":"2026-11-12 15:29:04.967564","elapsed_ns":6000,"start_tick":120000,"end_tick":126000}
+{"type":2,"gid":1,"op":2,"op_count":0,"dispatch_count":0,"ep_size":4,"bus_id":3,"rank":0,"nvl_rank":0,"hidden_size":6144,"num_experts":256,"num_sms":32,"num_tokens":2048,"topk":8,"pid":1864,"stream":187651357453200,"comm_id":16619284372657870125,"launch_time":"2026-11-12 15:29:04.967346","start_time":"2026-11-12 15:29:04.967558","end_time":"2026-11-12 15:29:04.967564","elapsed_ns":6000,"start_tick":120000,"end_tick":126000}
 ```
 
 短格式超时记录（`op=0`）：
 
 ```json
-{"type":1,"gid":2,"op":0,"op_count":0,"dispatch_count":1,"bus_id":8413184,"rank":0,"nvl_rank":0,"num_sms":32,"pid":1864,"stream":187651357453200,"comm_id":"fe12434710f94e0393392f417fa778c2","launch_time":"2026-11-12 15:29:05.010000","start_time":null,"end_time":null,"elapsed_ns":null,"start_tick":null,"end_tick":null}
+{"type":1,"gid":2,"op":0,"op_count":0,"dispatch_count":1,"bus_id":3,"rank":0,"nvl_rank":0,"num_sms":32,"pid":1864,"stream":187651357453200,"comm_id":16619284372657870125,"launch_time":"2026-11-12 15:29:05.010000","start_time":null,"end_time":null,"elapsed_ns":null,"start_tick":null,"end_tick":null}
 ```
 
 ## 时间含义
@@ -138,7 +135,7 @@ notify、dispatch、combine 的每次启动分别预留 ticket，独立发布 do
 | kernel_input_rows / kernel_output_rows | dispatch/combine 启动点实际传入的输入/输出 tensor 行数；notify 不附加这两个字段。固定容量输出记录的是分配行数，不冒充有效接收行数 |
 | cached / do_expand | 是否 cached dispatch、是否使用展开模式，0/1 |
 | token_capacity | Buffer/handle 的每 rank token 容量，与实际 token 数分开 |
-| comm_id | 每次 Buffer 初始化，由 EP rank 0 生成并发给组内所有 rank 的 UUID；同组此次 Buffer 实例一致，重新创建 Buffer 会生成新 ID |
+| comm_id | 每次 Buffer 初始化，由 EP rank 0 生成并发给组内所有 rank 的随机无符号 64 位整数。诊断记录用十进制字符串表示，同组此次 Buffer 实例使用同一 ID |
 | buffer_id | 本进程内的 Python Buffer 标识；即使共享原生采集器也独立 |
 | process_id / hostname / pid | 进程生命周期 UUID、主机名、操作系统 PID；PID 可复用，因此跨文件身份使用 process_id |
 | rank / global_rank | EP 组内 rank；global_rank 仅在已初始化的 PyTorch distributed 环境中获取，其他环境省略，不用组内 rank 冒充 |
@@ -163,7 +160,7 @@ C++ 元数据上下文采用线程局部存储和作用域恢复，异常退出�
 
 只用初始化时的配置决定是否启用采集。多个 Buffer 可以共享日志线程和原生槽池，但各自的 comm_id/buffer_id 随调用快照保存。Graph 捕获/重放仍不产生 kernel trace，调用编号因此可能有空缺。
 
-详细元数据来自 V2 Python API；直接调用底层原生接口时可能缺少 Python API 或 handle 字段。开发事件中的 `device` 为 ACL 用户设备编号。采集器独立查询设备标识并编码为生产记录的 `bus_id`。
+详细元数据来自 V2 Python API；直接调用底层原生接口时可能缺少 Python API 或 handle 字段。开发事件中的 `device` 为 ACL 用户设备编号。采集器查询物理设备编号并将其写为生产记录的 `bus_id`。
 
 开发产物可使用 `scripts/check_kernel_trace.py` 的 `--require-metadata` 选项校验字段完整性、launch/end 元数据相等、同一 API 的元数据一致性及 handle 路由信息稳定性。旧版 `kernel-*.jsonl` 无需该选项仍可校验。远端验证应覆盖 fresh/cached/无 weight 与带 weight 的 combine、expand=0/1、超过 128 槽的复用、不同通信/归约 AIV 数，以及多个 Buffer 的身份隔离。必须重新构建 Host 扩展；性能开销需要相同输入下 trace 开关对照。
 
