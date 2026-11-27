@@ -205,7 +205,7 @@ class KernelTrace:
 
             entry["references"] -= 1
             if not entry["references"]:
-                cls._close_source(identity, entry)
+                cls._close_source(identity, entry, synchronized=synchronized)
                 return
 
             if recorder is None:
@@ -226,10 +226,11 @@ class KernelTrace:
                 recorder.detach(comm_id)
 
     @classmethod
-    def _close_source(cls, identity, entry):
+    def _close_source(cls, identity, entry, *, synchronized=False):
         try:
             try:
-                entry["source"].synchronize()
+                if not synchronized:
+                    entry["source"].synchronize()
             finally:
                 cls._drain(entry, closing=True)
         finally:
@@ -419,9 +420,36 @@ class KernelTraceSession:
         self._templates = {}
         self._element_bytes = {}
 
+    def call_shape(
+        self, api_name, x, *, num_tokens, num_experts, topk, handle=None, cached=False, expanded=False, capacity=0
+    ):
+        """Start a call from routing dimensions when the API has no route tensor."""
+        return self.call(
+            api_name,
+            x,
+            None,
+            num_experts,
+            handle,
+            cached=cached,
+            expanded=expanded,
+            capacity=capacity,
+            _route_shape=(num_tokens, topk),
+        )
+
     @contextmanager
     def call(
-        self, api_name, x, routes, num_experts, handle=None, *, cached=False, expanded=False, capacity=0, _probe=None
+        self,
+        api_name,
+        x,
+        routes,
+        num_experts,
+        handle=None,
+        *,
+        cached=False,
+        expanded=False,
+        capacity=0,
+        _probe=None,
+        _route_shape=None,
     ):
         if _probe is not None:
             _probe.mark("metadata_begin")
@@ -443,7 +471,8 @@ class KernelTraceSession:
         # Cache by scalar shape/context only; never retain user tensors or handles.
         if _probe is not None:
             _probe.mark("identity_done")
-        x_shape, route_shape, dtype = x.shape, routes.shape, x.dtype
+        x_shape, dtype = x.shape, x.dtype
+        route_shape = routes.shape if _route_shape is None else _route_shape
         element_bytes = self._element_bytes.get(dtype)
         if element_bytes is None:
             element_bytes = x.element_size()
@@ -455,7 +484,7 @@ class KernelTraceSession:
             x_shape[1],
             element_bytes,
             dtype,
-            int(num_experts),
+            None if num_experts is None else int(num_experts),
             route_shape[1],
             route_shape[0],
             x_shape[0],
@@ -467,8 +496,9 @@ class KernelTraceSession:
         if _probe is not None:
             _probe.mark("template_lookup_done")
         if template is None:
-            fields = dict(
-                zip(
+            fields = {
+                name: value
+                for name, value in zip(
                     (
                         "api_name",
                         "hidden_size",
@@ -484,7 +514,8 @@ class KernelTraceSession:
                     ),
                     key,
                 )
-            )
+                if value is not None
+            }
             fields["dtype"] = str(fields["dtype"])
             template = (fields, self.native.make_trace_metadata(fields, self._base))
             if len(self._templates) >= 64:
@@ -520,14 +551,14 @@ class KernelTraceSession:
                 stats["restore_ns"] += time.perf_counter_ns() - started
 
 
-def attach_trace_session(native, group, rank, ep_size, all_gather):
+def attach_trace_session(native, group, rank, ep_size, all_gather, *, comm=None):
     """Agree once at Buffer initialization, including disabled ranks; no per-call collective."""
     enabled = _recorder_enabled()
     production = KernelTrace._benchmark_directory is None
     mode, timing = ("", False) if production else diagnostic_config()
     # Keep the uint64 as decimal text in the native metadata labels.
     proposal = str(secrets.randbits(64)) if enabled and rank == 0 else None
-    peers = all_gather(group, None, ep_size, (enabled, proposal, mode, timing))
+    peers = all_gather(group, comm, ep_size, (enabled, proposal, mode, timing))
     if any((peer[0], peer[2], peer[3]) != (enabled, mode, timing) for peer in peers):
         raise ValueError("all EP ranks must agree on DEEPEP_TRACE_RECORDER_ENABLE and diagnostic settings")
     if not enabled:
@@ -535,10 +566,16 @@ def attach_trace_session(native, group, rank, ep_size, all_gather):
     if not production and getattr(native, "kernel_trace_diagnostic_version", 0) != 4:
         raise RuntimeError("KernelTrace requires the matching rebuilt native extension")
     try:
-        global_rank = _global_rank()
+        global_rank = _global_rank() if comm is None else None
     except (ImportError, RuntimeError):
         global_rank = None
     comm_id = peers[0][1]
     session = KernelTraceSession(native, comm_id, ep_size, global_rank, recorder=production)
     identity = None if mode == "metadata" else KernelTrace.attach(native, comm_id)
     return (identity, session) if identity is not None or mode == "metadata" else (None, None)
+
+
+def detach_trace_session(identity, session, *, synchronized=False):
+    if identity is not None:
+        comm_id = session.fields["comm_id"] if session is not None else None
+        KernelTrace.detach(identity, comm_id, synchronized=synchronized)

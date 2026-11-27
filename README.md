@@ -114,7 +114,7 @@ python -m pip install -v --no-build-isolation --no-deps .
 
 ### Kernel Trace
 
-Ascend950 Global Clos 的 eager UDMA 路径支持按 kernel 记录 notify、dispatch 和 combine。默认关闭，运行前在同一 EP 组的所有 rank 设置：
+Ascend950 Global Clos 的 V1 `Buffer` 和 V2 `ElasticBuffer` 在 eager UDMA 路径支持按 kernel 记录 notify、dispatch 和 combine。默认关闭，运行前在同一 EP 组的所有 rank 设置：
 
 ```bash
 export DEEPEP_TRACE_RECORDER_ENABLE=1

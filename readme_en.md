@@ -123,7 +123,7 @@ The package name is `ascend-deepep`; the Python import is `deep_ep`. See the [bu
 
 ### Kernel tracing
 
-The Ascend950 Global Clos eager UDMA path can trace individual notify, dispatch, and combine kernels. Tracing is off by default. To enable it, set this before launch on every rank in the EP group:
+On Ascend950 Global Clos, V1 `Buffer` and V2 `ElasticBuffer` can trace individual notify, dispatch, and combine kernels on the eager UDMA path. Tracing is off by default. To enable it, set this before launch on every rank in the EP group:
 
 ```bash
 export DEEPEP_TRACE_RECORDER_ENABLE=1

@@ -546,13 +546,12 @@ class ElasticBuffer:
         trace = getattr(self, "_kernel_trace", None)
         if trace is None:
             return
-        from ...utils.kernel_trace import KernelTrace
+        from ...utils.kernel_trace import detach_trace_session
 
         session = getattr(self, "_trace_session", None)
-        comm_id = session.fields["comm_id"] if session is not None else None
         self._kernel_trace = None
         self._trace_session = None
-        KernelTrace.detach(trace, comm_id, synchronized=synchronized)
+        detach_trace_session(trace, session, synchronized=synchronized)
 
     def barrier(
         self,

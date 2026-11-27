@@ -873,6 +873,7 @@ def test_checker_host_metadata(mixed_trace, corruption):
 
 
 PERF_OPS = ("fresh_dispatch", "cached_dispatch", "combine_unweighted", "combine_weighted")
+DEFAULT_NPU_AIV = 32
 
 HOST_DISPATCH_POINTS = (
     "native_entry",
@@ -1386,6 +1387,7 @@ def validate_production_trace(directory, manifests, args):
     from datetime import datetime, timedelta
     import re
 
+    api_version = getattr(args, "api_version", "v2")
     ranks = set(range(args.ep_size))
     if len(manifests) != args.ep_size or {m.get("rank") for m in manifests} != ranks:
         raise ValueError("invalid production trace manifest ranks")
@@ -1401,6 +1403,7 @@ def validate_production_trace(directory, manifests, args):
     for manifest in manifests:
         if (
             manifest.get("trace_comm_id") != comm_text
+            or manifest.get("api_version", "v2") != api_version
             or manifest.get("precision_passed") is not True
             or manifest.get("trace_mode") != "production"
             or manifest.get("trace_ring_active") is not True
@@ -1447,7 +1450,7 @@ def validate_production_trace(directory, manifests, args):
         num_tokens=args.num_tokens, topk=args.num_topk,
     )
     short_ops = {0, 1, 3, 6}
-    effective_aiv = args.aiv or 32
+    effective_aiv = args.aiv or DEFAULT_NPU_AIV
     reduce_aiv = args.reduce_aiv or effective_aiv
     by_bus = {}
     bus_by_rank = {}
@@ -1536,9 +1539,9 @@ def validate_production_trace(directory, manifests, args):
         0: [0, *range(2, per_kind + 1)],
         1: [1, *range(per_kind + 1, 2 * per_kind)],
         2: list(range(2 * per_kind)),
-        5: [0] * (2 * per_kind),
-        6: [0] * (2 * per_kind),
     }
+    combine_ops = (4,) if api_version == "v1" else (5, 6)
+    dispatch_ids.update({op: [0] * (2 * per_kind) for op in combine_ops})
     expected = {op: len(ids) for op, ids in dispatch_ids.items()}
     for rank, operations in completed.items():
         counts = {op: len(records) for op, records in operations.items()}
@@ -1568,6 +1571,7 @@ def validate_production_trace(directory, manifests, args):
                 raise ValueError(f"production trace logger reported failure: {line.strip()}")
 
 
+@pytest.mark.parametrize("api_version", ("v1", "v2"))
 @pytest.mark.parametrize(
     "corruption, message",
     [
@@ -1579,12 +1583,17 @@ def validate_production_trace(directory, manifests, args):
         ("zero_counts", "op_count"), ("zero_dispatch_counts", "dispatch_count"),
         ("wrong_dispatch_association", "dispatch_count"), ("wrong_reduce_aiv", "op 6 num_sms"),
         ("string_comm_id", "comm_id"), ("encoded_bus_id", "bus ID"),
+        ("missing_shape_metadata", "shape metadata"), ("wrong_combine_association", "dispatch_count"),
         ("dropped", "logger reported failure"),
     ],
 )
-def test_validate_production_trace(tmp_path, corruption, message):
+def test_validate_production_trace(tmp_path, corruption, message, api_version):
     from types import SimpleNamespace
 
+    combine_ops = (4,) if api_version == "v1" else (5, 6)
+    combine_op = combine_ops[-1]
+    if api_version == "v1" and corruption == "wrong_reduce_aiv":
+        message = "op 4 num_sms"
     logged_aiv = 48 if corruption == "default_reduce" else 32
     if corruption in ("default_reduce", "default_both_aiv"):
         reduce_aiv, logged_reduce_aiv = 0, logged_aiv
@@ -1592,13 +1601,13 @@ def test_validate_production_trace(tmp_path, corruption, message):
         reduce_aiv = logged_reduce_aiv = 64
     args = SimpleNamespace(
         ep_size=2, num_tokens=128, hidden=6144, num_topk=8, experts_per_rank=32, warmup=1, windows=2, iterations=1,
-        aiv=0 if corruption == "default_both_aiv" else logged_aiv, reduce_aiv=reduce_aiv,
+        aiv=0 if corruption == "default_both_aiv" else logged_aiv, reduce_aiv=reduce_aiv, api_version=api_version,
     )
     directory = tmp_path / "trace"
     directory.mkdir()
     comm_id = (1 << 64) - 1
     manifests = [
-        dict(rank=rank, pid=100 + rank, precision_passed=True, trace_mode="production",
+        dict(rank=rank, api_version=api_version, pid=100 + rank, precision_passed=True, trace_mode="production",
              trace_ring_active=True, trace_slots=128, trace_comm_id=str(comm_id))
         for rank in range(args.ep_size)
     ]
@@ -1623,7 +1632,7 @@ def test_validate_production_trace(tmp_path, corruption, message):
                 end_time="2026-11-12 15:29:04.967564" if rank == 0 else "2026-11-12 15:29:04.967566",
                 elapsed_ns=6000, start_tick=120000, end_tick=126000,
             )
-            if op in (2, 5):
+            if op in (2, 4, 5):
                 row.update(ep_size=2, hidden_size=6144, num_experts=64, num_tokens=128, topk=8)
             rows.append(row)
 
@@ -1632,8 +1641,8 @@ def test_validate_production_trace(tmp_path, corruption, message):
             record(notify, dispatch_count)
             record(2, dispatch_count)
         for _ in range(2 * per_kind):
-            record(5, 0)
-            record(6, 0)
+            for op in combine_ops:
+                record(op, 0)
         timeout = dict(rows[0], type=1, start_time=None, end_time=None, elapsed_ns=None, start_tick=None, end_tick=None)
         if rank == 0:
             if corruption == "missing_completion":
@@ -1647,11 +1656,11 @@ def test_validate_production_trace(tmp_path, corruption, message):
             elif corruption == "ticks":
                 rows[0]["end_tick"] += 1
             elif corruption == "sub_microsecond":
-                next(row for row in rows if row["op"] == 6).update(
+                next(row for row in rows if row["op"] == combine_op).update(
                     start_tick=120800, end_tick=121050, elapsed_ns=250, end_time="2026-11-12 15:29:04.967559"
                 )
             elif corruption == "wall_offset":
-                next(row for row in rows if row["op"] == 6).update(
+                next(row for row in rows if row["op"] == combine_op).update(
                     start_time="2026-11-13 15:29:04.967558", end_time="2026-11-13 15:29:04.967564"
                 )
             elif corruption == "mismatched_timeout":
@@ -1665,9 +1674,15 @@ def test_validate_production_trace(tmp_path, corruption, message):
                 first, second = [row for row in rows if row["op"] == 2][:2]
                 first["dispatch_count"], second["dispatch_count"] = second["dispatch_count"], first["dispatch_count"]
             elif corruption == "wrong_reduce_aiv":
-                next(row for row in rows if row["op"] == 6)["num_sms"] = logged_aiv
+                next(row for row in rows if row["op"] == combine_op)["num_sms"] = (
+                    logged_reduce_aiv if api_version == "v1" else logged_aiv
+                )
             elif corruption == "string_comm_id":
                 rows[0]["comm_id"] = str(comm_id)
+            elif corruption == "missing_shape_metadata":
+                next(row for row in rows if row["op"] == 2)["topk"] = None
+            elif corruption == "wrong_combine_association":
+                next(row for row in rows if row["op"] == combine_op)["dispatch_count"] = 1
         (directory / f"{stem}0.txt").write_text(
             "".join(json.dumps(row) + "\n" for row in reversed(rows)), encoding="utf-8"
         )
@@ -1849,6 +1864,12 @@ def test_window_collection_rejects_capacity_overflow(tmp_path, options):
     assert not args.output.exists()
 
 
+def configure_npu_reference(args):
+    args.dtype, args.seed = "bf16", 20260823
+    # The golden reference uses a positive channel count. Leave args.aiv unchanged for native default selection.
+    args.num_aiv, args.expert_alignment = args.aiv or DEFAULT_NPU_AIV, 1
+
+
 def npu_worker(args):
     """Use the installed wheel. CPU references and assertions stay outside timing."""
     import datetime
@@ -1862,17 +1883,27 @@ def npu_worker(args):
     sys.path.insert(0, str(ROOT / "tests/clos"))
     import common as golden
 
+    api_version = getattr(args, "api_version", "v2")
+    legacy_buffer = api_version == "v1"
+    validate_v1_trace_options(args)
     rank = int(os.environ["RANK"])
     assert int(os.environ["WORLD_SIZE"]) == args.ep_size
     torch.set_num_threads(1)
     torch.npu.set_device(args.first_device + rank)
     dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=300))
-    args.dtype, args.seed = "bf16", 20260823
-    args.num_aiv, args.expert_alignment = args.aiv, 1
+    configure_npu_reference(args)
     routes = [golden._make_topk_idx(peer, args) for peer in range(args.ep_size)]
     source = golden._make_dispatch_x(rank, args)
     weights_cpu = golden._make_weights(rank, args)
     x, idx, weights = source.to("npu"), routes[rank].to("npu"), weights_cpu.to("npu")
+    if legacy_buffer:
+        from deep_ep.backends.direct import Config
+        from deep_ep.backends.global_clos import Buffer
+
+        num_experts = args.ep_size * args.experts_per_rank
+        cached_x = golden._make_dispatch_x(rank, args, delta=1).to("npu")
+        config = Config(args.aiv)
+        workspace_bytes = config.get_nvl_buffer_size_hint(args.hidden * 2, args.ep_size, num_tokens=args.num_tokens)
     trace_enabled = _recorder_enabled()
     trace_mode = "production" if trace_enabled else "off"
     if trace_enabled and args.diagnostic:
@@ -1882,14 +1913,17 @@ def npu_worker(args):
         KernelTrace._benchmark_directory = args.output / "trace"
         load_native_module()._configure_trace_test_mode(metadata_only=trace_mode == "metadata")
     started = time.perf_counter_ns()
-    buffer = ElasticBuffer(
-        dist.group.WORLD,
-        num_max_tokens_per_rank=args.num_tokens,
-        hidden=args.hidden,
-        num_topk=args.num_topk,
-        explicitly_destroy=True,
-        transport="udma",
-    )
+    if legacy_buffer:
+        buffer = Buffer(dist.group.WORLD, num_nvl_bytes=workspace_bytes, explicitly_destroy=True, transport="udma")
+    else:
+        buffer = ElasticBuffer(
+            dist.group.WORLD,
+            num_max_tokens_per_rank=args.num_tokens,
+            hidden=args.hidden,
+            num_topk=args.num_topk,
+            explicitly_destroy=True,
+            transport="udma",
+        )
     init_ns = time.perf_counter_ns() - started
     trace_entry = KernelTrace._sources.get(buffer._kernel_trace)
     deferred = os.environ.get("DEEPEP_TRACE_DIAGNOSTIC_MODE") == "record_only"
@@ -1920,17 +1954,40 @@ def npu_worker(args):
         python_probe = DispatchPythonProbe(1 + args.warmup + args.windows * args.iterations)
         buffer._dispatch_python_probe = python_probe
 
-    def dispatch(handle=None):
-        return buffer.dispatch(
-            x,
-            topk_idx=idx if handle is None else None,
-            topk_weights=weights if handle is None else None,
-            num_experts=args.ep_size * args.experts_per_rank,
-            handle=handle,
-            num_sms=args.aiv,
-            expert_alignment=1,
-            async_with_compute_stream=True,
-        )
+    if legacy_buffer:
+        dispatch_options = dict(config=config, async_finish=True, zero_copy=False, allocate_on_comm_stream=False)
+
+        def dispatch(handle=None):
+            layout = None
+            if handle is None:
+                layout = buffer.get_dispatch_layout(idx, num_experts, async_finish=True)
+                result = buffer.dispatch(
+                    x,
+                    num_tokens_per_rank=layout[0],
+                    num_tokens_per_expert=layout[2],
+                    is_token_in_rank=layout[3],
+                    topk_idx=idx,
+                    topk_weights=weights,
+                    expert_alignment=1,
+                    previous_event=layout[-1],
+                    **dispatch_options,
+                )
+            else:
+                result = buffer.dispatch(cached_x, handle=handle, **dispatch_options)
+            # Keep layout tensors alive through the consumer dependency, as in the V1 benchmark.
+            return result, layout, result[-1]
+    else:
+        def dispatch(handle=None):
+            return buffer.dispatch(
+                x,
+                topk_idx=idx if handle is None else None,
+                topk_weights=weights if handle is None else None,
+                num_experts=args.ep_size * args.experts_per_rank,
+                handle=handle,
+                num_sms=args.aiv,
+                expert_alignment=1,
+                async_with_compute_stream=True,
+            )
 
     def consume(result):
         # Preserve the normal consumer dependency; this is a stream wait, not CPU synchronization.
@@ -1939,24 +1996,44 @@ def npu_worker(args):
 
     fresh = consume(dispatch())
     torch.npu.synchronize()
+    if legacy_buffer:
+        fresh = fresh[0]
     ref = golden._dispatch_reference(rank, args)
     for actual, key in zip(fresh[:3], ("recv_x", "recv_topk_idx", "recv_topk_weights")):
         golden._assert_equal(key, actual, ref[key])
-    handle = fresh[3]
+    if legacy_buffer:
+        golden._assert_equal("expert counts", torch.tensor(fresh[3], dtype=torch.int32), ref["expert_counts"])
+    handle = fresh[4] if legacy_buffer else fresh[3]
     owned, recv_weights = fresh[0].clone(), fresh[2].clone()
     cached = consume(dispatch(handle))
     torch.npu.synchronize()
-    golden._assert_equal("cached dispatch", cached[0], ref["recv_x"])
+    cached_ref = ref["recv_x"]
+    if legacy_buffer:
+        cached = cached[0]
+        cached_ref = golden._dispatch_reference(rank, args, delta=1)["recv_x"]
+        assert all(value is None for value in cached[1:5]), "payload-only cached dispatch returned metadata"
+    golden._assert_equal("cached dispatch", cached[0], cached_ref)
 
-    def combine(weighted):
-        return buffer.combine(
-            owned,
-            handle,
-            topk_weights=recv_weights if weighted else None,
-            num_sms=args.aiv,
-            reduce_num_sms=args.reduce_aiv,
-            async_with_compute_stream=True,
-        )
+    if legacy_buffer:
+        def combine(weighted):
+            return buffer.combine(
+                owned,
+                handle,
+                topk_weights=recv_weights if weighted else None,
+                config=config,
+                async_finish=True,
+                allocate_on_comm_stream=False,
+            )
+    else:
+        def combine(weighted):
+            return buffer.combine(
+                owned,
+                handle,
+                topk_weights=recv_weights if weighted else None,
+                num_sms=args.aiv,
+                reduce_num_sms=args.reduce_aiv,
+                async_with_compute_stream=True,
+            )
 
     expected = torch.zeros_like(source, dtype=torch.float32)
     for peer in range(args.ep_size):
@@ -2010,6 +2087,7 @@ def npu_worker(args):
         del buffer._dispatch_python_probe
     manifest = dict(
         rank=rank,
+        api_version=api_version,
         pid=os.getpid(),
         wheel=deep_ep.__file__,
         init_ns=init_ns,
@@ -2049,6 +2127,10 @@ def npu_parser():
 
     parser = argparse.ArgumentParser(description="KernelTrace real-NPU metadata and trace off/on acceptance")
     parser.add_argument("--npu", action="store_true")
+    parser.add_argument(
+        "--api-version", choices=("v1", "v2"), default="v2",
+        help="Buffer API used for ordinary acceptance (default: v2)",
+    )
     parser.add_argument("--python-dispatch-timing", action="store_true", help="split fresh Python and binding phases")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--diagnostic", action="store_true", help="layered attribution, not performance acceptance")
@@ -2087,7 +2169,7 @@ def npu_parser():
         hidden=6144,
         num_topk=8,
         experts_per_rank=32,
-        aiv=32,
+        aiv=DEFAULT_NPU_AIV,
         reduce_aiv=32,
         pairs=6,
         windows=3,
@@ -2098,6 +2180,14 @@ def npu_parser():
     ).items():
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=default)
     return parser
+
+
+@pytest.mark.parametrize("requested,effective", ((0, 32), (32, 32), (24, 24)))
+def test_npu_reference_uses_effective_aiv(tmp_path, requested, effective):
+    args = npu_parser().parse_args(["--npu", "--aiv", str(requested), "--output", str(tmp_path)])
+    configure_npu_reference(args)
+    assert args.num_aiv == effective
+    assert args.aiv == requested
 
 
 def run_npu_process(command, destination, env, log, timeout):
@@ -2128,9 +2218,21 @@ def run_npu_process(command, destination, env, log, timeout):
             raise RuntimeError(f"NPU worker exited {code}; see {destination / 'run.log'}")
 
 
+def validate_v1_trace_options(args):
+    if getattr(args, "api_version", "v2") == "v1" and any(
+        getattr(args, option, False)
+        for option in (
+            "diagnostic", "diagnostic_timing", "paired_baselines", "windowed_collection", "host_dispatch_timing",
+            "notify_device_timing", "align_fresh_timing", "python_dispatch_timing",
+        )
+    ):
+        raise ValueError("--api-version v1 requires ordinary production acceptance without diagnostics or probes")
+
+
 def run_npu_acceptance(args):
     args._created_output = False
     try:
+        validate_v1_trace_options(args)
         if args.diagnostic_timing and not args.diagnostic:
             raise ValueError("--diagnostic-timing requires --diagnostic")
         if args.paired_baselines and not args.diagnostic:
@@ -2204,6 +2306,8 @@ def npu_run_trial(args, destination, mode, diagnostic=False):
     for key, value in vars(args).items():
         if type(value) is int and not key.startswith("_"):
             command += ["--" + key.replace("_", "-"), str(value)]
+    if getattr(args, "api_version", "v2") == "v1":
+        command += ["--api-version", "v1"]
     if diagnostic:
         command.append("--diagnostic")
     if args.windowed_collection:
@@ -2927,8 +3031,12 @@ def _run_npu_acceptance(args):
     return passed
 
 
-def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
-    args = npu_parser().parse_args(["--npu", "--output", str(tmp_path / "ab")])
+@pytest.mark.parametrize("api_version", ("v1", "v2"))
+def test_npu_controller_pairs_and_report(tmp_path, monkeypatch, api_version):
+    options = ["--npu", "--output", str(tmp_path / "ab")]
+    if api_version == "v1":
+        options += ["--api-version", "v1"]
+    args = npu_parser().parse_args(options)
     order = []
     checked = []
     monkeypatch.setenv("DEEPEP_TRACE_DIR", "must-not-leak")
@@ -2944,6 +3052,7 @@ def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
         assert "PYTHONPATH" not in env
         assert "DEEPEP_TRACE_DIAGNOSTIC_MODE" not in env and "DEEPEP_TRACE_DIAGNOSTIC_TIMING" not in env
         assert "--worker" in command and "--standalone" in command
+        assert npu_parser().parse_args(command[command.index("--worker"):]).api_version == api_version
         assert "--diagnostic" not in command and "DEEPEP_TRACE_SLOTS" not in env
         assert env.get("DEEPEP_TRACE_DIR") == (str(destination / "trace") if enabled else None)
         assert env["DEEPEP_TRACE_POLL_INTERVAL_MS"] == "5" and "DEEPEP_TRACE_TIMEOUT_MS" not in env
@@ -2968,6 +3077,14 @@ def test_npu_controller_pairs_and_report(tmp_path, monkeypatch):
     assert report["passed"] and set(report["operations"]) == set(PERF_OPS)
     for result in report["operations"].values():
         assert result["median_percent"] == pytest.approx(-1)
+
+
+@pytest.mark.parametrize("option", ("--diagnostic", "--host-dispatch-timing"))
+def test_v1_trace_acceptance_requires_uninstrumented_production(tmp_path, option):
+    args = npu_parser().parse_args(["--npu", "--api-version", "v1", option, "--output", str(tmp_path / "ab")])
+    with pytest.raises(ValueError, match="v1 requires ordinary production acceptance"):
+        run_npu_acceptance(args)
+    assert not args.output.exists()
 
 
 @pytest.mark.parametrize("paired,windowed", [(False, False), (True, False), (True, True)])

@@ -1,6 +1,6 @@
 # KernelTrace：notify、dispatch 与 combine 采集
 
-Ascend950 Global Clos 的生产采集器默认关闭。在创建 Buffer 前，给同一 EP 组的所有 rank 设置 `DEEPEP_TRACE_RECORDER_ENABLE=1` 可以开启采集。`0` 或未设置时关闭。采集范围是 eager V2 调用实际启动的下列 UDMA kernel。
+Ascend950 Global Clos 的生产采集器默认关闭。在创建 Buffer 前，给同一 EP 组的所有 rank 设置 `DEEPEP_TRACE_RECORDER_ENABLE=1` 可以开启采集。`0` 或未设置时关闭。采集范围是 V1 `Buffer` 和 V2 `ElasticBuffer` 的 eager 调用实际启动的下列 UDMA kernel。
 
 | op | kernel_name | 范围 | 生产日志格式 |
 | --- | --- | --- | --- |
@@ -17,6 +17,8 @@ Ascend950 Global Clos 的生产采集器默认关闭。在创建 Buffer 前，�
 
 普通 fused/communication combine 的 Begin 同步在通信 kernel 内，其耗时包含在 combine 记录中，不额外生成 notify 记录。采集不改变策略，也不额外启动通知 kernel。layout、expand、aggregate、缓存计划重建、显式 Buffer barrier 和 NPU Graph 捕获/重放不采集。图捕获时不预留槽位，避免重放旧序号。
 
+V1 fresh dispatch 记录 op 0 和 2，cached dispatch 记录 op 1 和 2，普通 combine 记录 op 4。V1 benchmark 在 combine 的 profiler 阶段启用独立 notify，因此这些调用还会记录 op 3。
+
 ## 运行、轮转与归档
 
 按[构建指南](build.md)在含匹配 CANN、Torch、torch_npu 和 SHMEM SDK 的环境安装本分支的 wheel。Host 与 Device 两部分均需重新构建。在单机四卡上可使用现有 benchmark 验证。
@@ -29,12 +31,14 @@ export DEEPEP_TRACE_RECORDER_ENABLE=1
 # export DEEPEP_TRACE_DIR=/path/to/deepep-logs
 # export DEEPEP_TRACE_POLL_INTERVAL_MS=2
 # export DEEPEP_TRACE_TIMEOUT_MS=10000
-python -u benchmarks/clos/bench_v2_bandwidth.py \
+python -u benchmarks/clos/bench_v1_bandwidth.py \
     --ep-size 4 --nnodes 1 --aiv 32 --dtypes bf16 --expand 0 \
     --num-tokens 2048 --hidden 6144 --num-topk 8 --experts-per-rank 32 \
     --warmup 2 --iterations 5 --no-flush-l2-cache --output "$RUN/bench"
 ls -lh "${DEEPEP_TRACE_DIR:-/dockerdata/.trmt/deepep}"/trmt-deepep-trace-*.txt
 ```
+
+验证 V2 时使用同样的参数运行 `benchmarks/clos/bench_v2_bandwidth.py`。
 
 生产日志写入 `DEEPEP_TRACE_DIR` 指定的本机可写目录，未设置或为空时使用 `/dockerdata/.trmt/deepep/`。请在创建 Buffer 前设置目录，可以使用相对路径或指向目标目录的符号链接。采集开关仍由 `DEEPEP_TRACE_RECORDER_ENABLE` 控制。文件前缀、容量和文件数固定，文件名为 `trmt-deepep-trace-<commId>-<busId>-<序号>.txt`，其中：
 
@@ -160,7 +164,7 @@ C++ 元数据上下文采用线程局部存储和作用域恢复，异常退出�
 
 只用初始化时的配置决定是否启用采集。多个 Buffer 可以共享日志线程和原生槽池，但各自的 comm_id/buffer_id 随调用快照保存。Graph 捕获/重放仍不产生 kernel trace，调用编号因此可能有空缺。
 
-详细元数据来自 V2 Python API；直接调用底层原生接口时可能缺少 Python API 或 handle 字段。开发事件中的 `device` 为 ACL 用户设备编号。采集器查询物理设备编号并将其写为生产记录的 `bus_id`。
+调用元数据来自 V1 和 V2 Python API。V1 保持六元素 handle 接口，Buffer 返回的 handle 保存可用的路由标量和原始 fresh `dispatch_count`。省略路由张量或传入普通六元组时，不能取得的字段按现有规则写为 `null`。开发事件中的 `device` 为 ACL 用户设备编号。采集器查询物理设备编号并将其写为生产记录的 `bus_id`。
 
 开发产物可使用 `scripts/check_kernel_trace.py` 的 `--require-metadata` 选项校验字段完整性、launch/end 元数据相等、同一 API 的元数据一致性及 handle 路由信息稳定性。旧版 `kernel-*.jsonl` 无需该选项仍可校验。远端验证应覆盖 fresh/cached/无 weight 与带 weight 的 combine、expand=0/1、超过 128 槽的复用、不同通信/归约 AIV 数，以及多个 Buffer 的身份隔离。必须重新构建 Host 扩展；性能开销需要相同输入下 trace 开关对照。
 
@@ -177,17 +181,17 @@ python -m pytest tests/runtime/test_kernel_trace.py -q
 在已安装本分支 wheel、Torch、torch_npu、pytest 的 Linux 单机 UDMA 环境，空闲的四张 NPU 上执行：
 
 ```bash
-python -u tests/runtime/test_kernel_trace.py --npu \
+python -u tests/runtime/test_kernel_trace.py --npu --api-version v1 \
     --ep-size 4 --first-device 0 \
     --num-tokens 2048 --hidden 6144 --num-topk 8 --experts-per-rank 32 \
-    --aiv 32 --reduce-aiv 32 \
+    --aiv 32 \
     --pairs 6 --windows 3 --iterations 100 --warmup 10 \
     --output "$PWD/kernel_trace_acceptance_$(date +%Y%m%d_%H%M%S)"
 ```
 
-输出目录必须尚不存在。也可设置 `DEEPEP_RUN_TRACE_NPU=1` 后通过 pytest 运行 `test_npu_metadata_and_overhead`；该入口使用上述默认配置。普通 pytest 默认跳过实机测试。
+输出目录必须尚不存在。`--api-version` 默认为 `v2`，开发诊断沿用 V2。也可设置 `DEEPEP_RUN_TRACE_NPU=1` 后通过 pytest 运行 `test_npu_metadata_and_overhead`，该入口使用默认 V2 配置。普通 pytest 默认跳过实机测试。
 
-此用例固定 BF16、随机路由、expand=0、无 bias，不清理 L2。依次覆盖 fresh dispatch、cached dispatch、无 weight 和带 weight 的 combine。weight 是 combine 的 topk_weights 输入，未增加 bias。精度用独立 CPU reference 检查，发生在计时之前。
+此用例固定 BF16、随机路由、expand=0、无 bias，不清理 L2。依次覆盖 fresh dispatch、cached dispatch、无 weight 和带 weight 的 combine。V1 fresh 将 `get_dispatch_layout()` 计入 API 耗时，V1 combine 使用同一个 `--aiv` 配置。weight 是 combine 的 topk_weights 输入，未增加 bias。精度用独立 CPU reference 检查，发生在计时之前。
 
 普通 `--npu` 验收不带 `--diagnostic`。每个 on 试次设置 `DEEPEP_TRACE_RECORDER_ENABLE=1`，通过 `DEEPEP_TRACE_DIR` 指向本次的 `trace/` 子目录，使用真实 C++ 写入器。正式采集固定使用 128 槽，`--trace-slots` 只控制开发诊断。
 
