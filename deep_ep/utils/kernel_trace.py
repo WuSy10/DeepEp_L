@@ -196,9 +196,7 @@ class KernelTrace:
             if recorder is not None:
                 groups = entry["groups"]
                 if comm_id is None:
-                    if len(groups) != 1:
-                        raise ValueError("comm_id is required when releasing one of multiple trace groups")
-                    comm_id = next(iter(groups))
+                    raise ValueError("comm_id is required when releasing a production trace group")
                 group_references = groups.get(comm_id, 0)
                 if not group_references:
                     return
@@ -577,5 +575,4 @@ def attach_trace_session(native, group, rank, ep_size, all_gather, *, comm=None)
 
 def detach_trace_session(identity, session, *, synchronized=False):
     if identity is not None:
-        comm_id = session.fields["comm_id"] if session is not None else None
-        KernelTrace.detach(identity, comm_id, synchronized=synchronized)
+        KernelTrace.detach(identity, session.fields["comm_id"], synchronized=synchronized)

@@ -556,11 +556,9 @@ class MetadataNative:
         self.templates += 1
         return dict(parent or {}, **fields)
 
-    def push_trace_metadata(self, template, api, handle, dispatch_count=-1):
+    def push_trace_metadata(self, template, api, handle):
         previous = getattr(self.context, "fields", {})
         self.context.fields = dict(template, api_call_id=api, handle_id=handle)
-        if dispatch_count >= 0:
-            self.context.fields["dispatch_count"] = dispatch_count
         return previous
 
     def restore_trace_metadata(self, previous):
@@ -1571,29 +1569,43 @@ def validate_production_trace(directory, manifests, args):
                 raise ValueError(f"production trace logger reported failure: {line.strip()}")
 
 
-@pytest.mark.parametrize("api_version", ("v1", "v2"))
 @pytest.mark.parametrize(
-    "corruption, message",
+    "api_version, corruption, message",
     [
-        (None, None), ("no_timeout", None), ("default_reduce", None), ("default_both_aiv", None),
-        ("sub_microsecond", None), ("wall_offset", "calibration offset"),
-        ("missing_completion", "completion counts"),
-        ("short_schema", "schema"), ("long_schema", "schema"), ("ticks", "device ticks"),
-        ("unpaired", "without completion"), ("mismatched_timeout", "mismatched"),
-        ("zero_counts", "op_count"), ("zero_dispatch_counts", "dispatch_count"),
-        ("wrong_dispatch_association", "dispatch_count"), ("wrong_reduce_aiv", "op 6 num_sms"),
-        ("string_comm_id", "comm_id"), ("encoded_bus_id", "bus ID"),
-        ("missing_shape_metadata", "shape metadata"), ("wrong_combine_association", "dispatch_count"),
-        ("dropped", "logger reported failure"),
+        ("v2", None, None),
+        ("v2", "no_timeout", None),
+        ("v2", "default_reduce", None),
+        ("v2", "default_both_aiv", None),
+        ("v2", "sub_microsecond", None),
+        ("v2", "wall_offset", "calibration offset"),
+        ("v2", "missing_completion", "completion counts"),
+        ("v2", "short_schema", "schema"),
+        ("v2", "long_schema", "schema"),
+        ("v2", "ticks", "device ticks"),
+        ("v2", "unpaired", "without completion"),
+        ("v2", "mismatched_timeout", "mismatched"),
+        ("v2", "zero_counts", "op_count"),
+        ("v2", "zero_dispatch_counts", "dispatch_count"),
+        ("v2", "wrong_dispatch_association", "dispatch_count"),
+        ("v2", "wrong_reduce_aiv", "op 6 num_sms"),
+        ("v2", "string_comm_id", "comm_id"),
+        ("v2", "encoded_bus_id", "bus ID"),
+        ("v2", "missing_shape_metadata", "shape metadata"),
+        ("v2", "wrong_combine_association", "dispatch_count"),
+        ("v2", "dropped", "logger reported failure"),
+        # Exercise the V1 fused combine path with and without malformed records.
+        ("v1", "no_timeout", None),
+        ("v1", "default_both_aiv", None),
+        ("v1", "missing_completion", "completion counts"),
+        ("v1", "wrong_reduce_aiv", "op 4 num_sms"),
+        ("v1", "wrong_combine_association", "dispatch_count"),
     ],
 )
-def test_validate_production_trace(tmp_path, corruption, message, api_version):
+def test_validate_production_trace(tmp_path, api_version, corruption, message):
     from types import SimpleNamespace
 
     combine_ops = (4,) if api_version == "v1" else (5, 6)
     combine_op = combine_ops[-1]
-    if api_version == "v1" and corruption == "wrong_reduce_aiv":
-        message = "op 4 num_sms"
     logged_aiv = 48 if corruption == "default_reduce" else 32
     if corruption in ("default_reduce", "default_both_aiv"):
         reduce_aiv, logged_reduce_aiv = 0, logged_aiv

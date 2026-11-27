@@ -38,6 +38,7 @@ constexpr unsigned kWriteRetries = 3;
 constexpr std::chrono::milliseconds kWriteRetryDelay{3};
 constexpr size_t kUuidChars = 32;
 static_assert(kFileCount <= 10);
+static_assert(kFileLimit > 0 && kFileLimit <= static_cast<uint64_t>(std::numeric_limits<off_t>::max()));
 
 class FileDescriptor {
 public:
@@ -350,10 +351,10 @@ struct LogRing {
         }
     }
 
-    void Append(int directory, const std::string& line, uint64_t file_limit)
+    void Append(int directory, const std::string& line)
     {
-        if (line.size() > file_limit) throw std::runtime_error("single trace record exceeds file limit");
-        if (line.size() > file_limit - size) {
+        if (line.size() > kFileLimit) throw std::runtime_error("single trace record exceeds file limit");
+        if (line.size() > kFileLimit - size) {
             const auto next = (index + 1) % kFileCount;
             FileDescriptor file(openat(directory, names[next].c_str(),
                                        O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
@@ -390,14 +391,13 @@ struct TraceRecorder::Impl {
     FileDescriptor directory, lock;
     uint32_t bus_id;
     std::string owner_prefix;
-    uint64_t file_limit;
     pid_t owner;
     std::mutex mutex;
     std::map<std::string, LogRing> groups;
 
-    Impl(FileDescriptor dir, FileDescriptor device_lock, uint32_t bus, std::string prefix, uint64_t limit)
+    Impl(FileDescriptor dir, FileDescriptor device_lock, uint32_t bus, std::string prefix)
         : directory(std::move(dir)), lock(std::move(device_lock)), bus_id(bus), owner_prefix(std::move(prefix)),
-          file_limit(limit), owner(getpid()) {}
+          owner(getpid()) {}
 };
 
 TraceRecorder::TraceRecorder(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -409,20 +409,17 @@ TraceRecorder::~TraceRecorder()
     }
 }
 
-std::shared_ptr<TraceRecorder> TraceRecorder::OpenAt(const std::string& directory, uint32_t bus_id,
-                                                    const std::string& device_uuid, uint64_t file_limit,
-                                                    uint32_t physical_device_id)
+std::shared_ptr<TraceRecorder> TraceRecorder::OpenAt(const std::string& directory, uint32_t physical_device_id,
+                                                    const std::string& device_uuid)
 {
-    if (!file_limit || file_limit > static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
-        throw std::invalid_argument("invalid trace file size limit");
     if (!ValidUuid(device_uuid)) throw std::invalid_argument("invalid trace device UUID");
     auto dir = OpenDirectory(directory);
     const auto device_key = device_uuid + "-" + std::to_string(physical_device_id);
     auto lock = LockDevice(dir.Get(), device_key);
-    auto prefix = ".trmt-deepep-trace-owner-v2-" + device_key + "-" + std::to_string(bus_id) + "-";
-    CleanHistory(dir.Get(), bus_id, prefix);
-    return std::shared_ptr<TraceRecorder>(
-        new TraceRecorder(std::make_unique<Impl>(std::move(dir), std::move(lock), bus_id, std::move(prefix), file_limit)));
+    auto prefix = ".trmt-deepep-trace-owner-v2-" + device_key + "-" + std::to_string(physical_device_id) + "-";
+    CleanHistory(dir.Get(), physical_device_id, prefix);
+    return std::shared_ptr<TraceRecorder>(new TraceRecorder(
+        std::make_unique<Impl>(std::move(dir), std::move(lock), physical_device_id, std::move(prefix))));
 }
 
 std::shared_ptr<TraceRecorder> TraceRecorder::Open(int device, const std::string& comm_id)
@@ -442,8 +439,7 @@ std::shared_ptr<TraceRecorder> TraceRecorder::Open(int device, const std::string
     auto recorder = cached.lock();
     if (!recorder) {
         const char* directory = std::getenv("DEEPEP_TRACE_DIR");
-        recorder = OpenAt(directory && *directory ? directory : kDefaultDirectory, physical_device_id, device_uuid,
-                          kFileLimit, physical_device_id);
+        recorder = OpenAt(directory && *directory ? directory : kDefaultDirectory, physical_device_id, device_uuid);
         cached = recorder;
     }
     if (recorder->impl_->owner != getpid()) throw std::runtime_error("cannot use inherited trace recorder");
@@ -490,8 +486,7 @@ void TraceRecorder::Write(const std::vector<TraceRecord>& records)
         const auto group = impl_->groups.find(comm_id->second);
         if (group == impl_->groups.end() || group->second.failed) continue;
         try {
-            group->second.Append(impl_->directory.Get(), FormatRecord(record, comm_id->second, impl_->bus_id),
-                                 impl_->file_limit);
+            group->second.Append(impl_->directory.Get(), FormatRecord(record, comm_id->second, impl_->bus_id));
         } catch (...) {
             group->second.failed = true;
             if (!failure) failure = std::current_exception();
