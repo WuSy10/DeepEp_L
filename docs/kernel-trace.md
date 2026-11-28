@@ -108,9 +108,9 @@ $$
 
 ## 上报和资源
 
-Python KernelTrace 在每个进程内共享一个后台线程，管理各活跃 ACL context 的原生采集器。Python 每轮按轮询配置等待后调用原生侧回收；生产路径在释放 GIL 的情况下合并记录、编码 JSONL 并按通信组写入轮转文件。
+Python KernelTrace 在每个进程内共享一个后台线程，管理各活跃 ACL context 的原生采集器。每轮等待后，线程调用 `KernelTrace::DrainProductionBatches()`，在释放 GIL 的情况下读取并回收槽位、格式化时间并按通信组编码 JSONL。Python 接收每个通信组的一批字节，批量写入文件。当前文件放不下整批时，按完整行切分，再轮转写入剩余日志。
 
-每条生产日志写入失败后最多重试 3 次，每次重新写入前等待 3 ms。若已经写入部分字节，则从剩余位置继续。重试耗尽后，采集器尝试截掉未写完的半行并停止写入该通信组，其他通信组继续写入。
+生产日志写入失败后最多重试 3 次，每次重新写入前等待 3 ms。短写时从剩余位置继续，写完一行后下一行恢复重试额度。重试耗尽后，采集器保留已写完的行，尝试截掉未写完的半行并停止写入该通信组，其他通信组继续写入。
 
 正式采集器固定分配 128 槽的 Host 映射内存，每槽预留 64 个 AIV，每个 AIV 占用 256 字节，总计约 2 MiB。核内起始 tick 保存在局部变量。结束时 dispatch/notify 复用已释放的 UB，combine/cached notify 在工作结束后使用 32 字节 UB，将 start_tick、end_tick 写入偏移 0，等待 MTE3_S 后，在偏移 128 发布 done_seq。第二次写出也用 MTE3_S 保护 UB 生命周期。combine/cached notify 在读取结束 tick 前用本核 V_S、MTE3_S 将流水完成推进到标量侧；不增加全卡或全核同步。每个 AIV 独占自己的区域。
 
@@ -123,7 +123,7 @@ notify、dispatch、combine 的每次启动分别预留 ticket，独立发布 do
 
 ## 开发诊断与验收
 
-普通 `--npu` 开关对照使用上文的正式 C++ 写入器，验收 `type=1/2` 格式的 `.txt` 轮转文件。带 `--diagnostic` 时，worker 使用单次试验的独立目录输出开发产物，保留 `kernel-*.jsonl` 的 `calibration`、`launch`、`end` 和 `summary` 等事件，供 `scripts/check_kernel_trace.py` 校验。
+普通 `--npu` 开关对照使用上文的生产写入器，验收 `type=1/2` 格式的 `.txt` 轮转文件。带 `--diagnostic` 时，worker 使用单次试验的独立目录输出开发产物，保留 `kernel-*.jsonl` 的 `calibration`、`launch`、`end` 和 `summary` 等事件，供 `scripts/check_kernel_trace.py` 校验。
 
 ### Host 元数据与调用关联
 
@@ -193,7 +193,7 @@ python -u tests/runtime/test_kernel_trace.py --npu --api-version v1 \
 
 此用例固定 BF16、随机路由、expand=0、无 bias，不清理 L2。依次覆盖 fresh dispatch、cached dispatch、无 weight 和带 weight 的 combine。V1 fresh 将 `get_dispatch_layout()` 计入 API 耗时，V1 combine 使用同一个 `--aiv` 配置。weight 是 combine 的 topk_weights 输入，未增加 bias。精度用独立 CPU reference 检查，发生在计时之前。
 
-普通 `--npu` 验收不带 `--diagnostic`。每个 on 试次设置 `DEEPEP_TRACE_RECORDER_ENABLE=1`，通过 `DEEPEP_TRACE_DIR` 指向本次的 `trace/` 子目录，使用真实 C++ 写入器。正式采集固定使用 128 槽，`--trace-slots` 只控制开发诊断。
+普通 `--npu` 验收不带 `--diagnostic`。每个 on 试次设置 `DEEPEP_TRACE_RECORDER_ENABLE=1`，通过 `DEEPEP_TRACE_DIR` 指向本次的 `trace/` 子目录，使用生产写入器。正式采集固定使用 128 槽，`--trace-slots` 只控制开发诊断。
 
 验收检查所有 rank 的生产日志，按 `op` 校验长短格式、字段及类型，再核对 `type=2` 完成记录数是否与精度检查、预热和正式执行预期一致。同一 rank 的完成记录需要可由同一个时钟校准偏移换算，允许墙钟时间截断至微秒带来的误差。出现 `type=1` 时仍按超时规则检查设备时间字段，它不计入完成数。off 试次不应产生 trace。槽位代际旧值拒收由 CPU 原生协议测试另行验证。
 
@@ -215,7 +215,7 @@ $$
 
 - `acceptance.json`：总结果、四种操作的开销、区间及 PASS/FAIL/INCONCLUSIVE；异常时保存失败原因。
 - `config.json`、`runs.json`：配置（含轮询和超时的环境变量值）、各对 A/B 的汇总原始值。
-- `pairXX_on/trace/trmt-deepep-trace-*.txt`：正式 C++ 写入器生成的生产日志；off 目录不应有 trace。
+- `pairXX_on/trace/trmt-deepep-trace-*.txt`：生产写入器生成的日志；off 目录不应有 trace。
 - `pairXX_on/` 和 `pairXX_off/` 下的 `rankN.json`：每 rank 每窗口耗时、初始化/退出排空耗时、wheel 路径和精度结果；`run.log` 保存 torchrun 输出。
 
 单次 torchrun 默认超时 1800 秒，可用 `--timeout` 调整。超时或中断时终止该次创建的进程组，不影响其他任务。未实际执行 NPU 验收前，CPU 测试通过不能视为开销已满足 1%。
@@ -264,7 +264,7 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic \
 
 `diagnosis.json` 汇总五种模式相对 off 的开销，`diagnostic_valid=true` 只表示诊断证据通过完整性检查，`performance_acceptance` 始终为 false。完整性失败返回非零并保留原因；性能变慢本身不使诊断任务失败。native/json/full 的计数校验针对本用例当前 eager 非展开的 notify+dispatch、communication+reduce 路径（每次 API 两个 kernel）；改变执行策略后若 kernel 数不同，应先核对实际路径，不放宽丢样检查。
 
-诊断环境变量由测试控制器管理并在初始化时读取：`DEEPEP_TRACE_DIAGNOSTIC_MODE=record_only|metadata|native|json_discard|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`。EP 内配置必须一致，普通 `--npu` 验收会清除这两个诊断变量。`--diagnostic` 的 `production` 模式使用原有开发 JSONL 基线，以保持各诊断分层之间的比较口径。正式 C++ 写入路径的开关对照使用不带 `--diagnostic` 的 `--npu`。
+诊断环境变量由测试控制器管理并在初始化时读取：`DEEPEP_TRACE_DIAGNOSTIC_MODE=record_only|metadata|native|json_discard|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`。EP 内配置必须一致，普通 `--npu` 验收会清除这两个诊断变量。`--diagnostic` 的 `production` 模式使用原有开发 JSONL 基线，以保持各诊断分层之间的比较口径。生产写入路径的开关对照使用不带 `--diagnostic` 的 `--npu`。
 
 相邻模式的差值包含工作重叠、线程调度变化及小额诊断统计成本，不能当作各模块的精确独占时间。优先用未加细分计时的五组结果定位增量，再结合计时轮次解释。json 与 native 的差值现在主要对应原生编码和批量文本传递，不能沿用旧版的逐事件 Python 转换/编码归因。最终优化必须回到原始完整采集开关 A/B 验收。
 
@@ -516,9 +516,11 @@ CPU 回归实际调用 fresh/cached 包装，检查采集开关、模板复用�
 
 缓存只保留标量和原生快照，不保留用户 tensor 或 handle 对象。shape、dtype、容量或模式变化会使用新模板；超过 64 种时清空模板缓存。正在执行或延迟执行的 kernel 持有 shared_ptr 父快照引用，不受缓存清空影响。上下文仍是线程局部的，嵌套调用及异常退出使用原生句柄恢复。
 
-每次调用仍读取 Host tensor 属性、更新 ID、预留槽位和记录 launch 时间，并非零开销。kernel 的 tick、done_seq 和满槽跳过机制保持不变。Python 管理后台线程和退出排空。开发 JSONL 路径由 Python 写文件，正式路径由 C++ 编码并写入轮转文件。JSON 保留各自格式的字段和整数精度，转义控制字符、引号与反斜杠，UTF-8 可直接输出；字段顺序、空格和非 ASCII 转义形式可能变化，按 JSON 解析后的值兼容。
+每次调用仍读取 Host tensor 属性、更新 ID、预留槽位和记录 launch 时间，并非零开销。kernel 的 tick、done_seq 和满槽跳过机制保持不变。Python 管理后台线程和退出排空。开发和生产路径各自在 C++ 编码对应的 JSONL 格式。Python 写入编码后的内容，并管理生产日志的文件轮转。
 
-重新构建安装 Host 扩展后，先运行本文 CPU 回归，再运行不带 `--diagnostic` 的 `--npu` 正式采集开关 A/B。检查精度、生产日志字段、完成记录数和实际开销。诊断的 json/full 已采用新编码实现，分项不能直接套用旧版本含义。本次优化尚未完成 NPU 实测，不能承诺开销低于 1%。
+重新构建安装 Host 扩展后，先运行本文 CPU 回归，再运行不带 `--diagnostic` 的 `--npu` 正式采集开关 A/B。检查精度、生产日志字段、完成记录数和实际开销。诊断的 json/full 已采用新编码实现，分项不能直接套用旧版本含义。
+
+本次 EP4 实测中，V1 和 V2 各完成六对开关试次，精度均通过。V1 日志完整，Fresh dispatch 配对中位开销为 +11.01%，未通过 1% 验收。V2 Fresh dispatch 配对中位开销为 +10.73%，判定为 `INCONCLUSIVE`。V2 有两个开启试次共丢弃 19 条 Combine 记录，日志完整性未通过。
 
 ### 调用上下文的轻量化
 

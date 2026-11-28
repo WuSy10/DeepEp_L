@@ -6,11 +6,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <unistd.h>
@@ -96,6 +98,101 @@ void JsonString(std::string& out, const std::string& value)
         else out += ch; // Preserve UTF-8; the Python file is opened with encoding="utf-8".
     }
     out += '"';
+}
+
+std::optional<uint64_t> ParseUnsigned(std::string_view text)
+{
+    if (text.empty()) return std::nullopt;
+    uint64_t value{};
+    const auto end = text.data() + text.size();
+    const auto parsed = std::from_chars(text.data(), end, value);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) return std::nullopt;
+    return value;
+}
+
+bool IsCanonicalCommId(std::string_view comm_id)
+{
+    return !comm_id.empty() && (comm_id.size() == 1 || comm_id.front() != '0') &&
+           ParseUnsigned(comm_id).has_value();
+}
+
+std::string ProductionWallTime(int64_t ns)
+{
+    constexpr int64_t kNsPerSecond = 1'000'000'000;
+    constexpr int64_t kUtcOffsetSeconds = 8 * 3600;
+    auto seconds = ns / kNsPerSecond;
+    auto fraction = ns % kNsPerSecond;
+    if (fraction < 0) {
+        --seconds;
+        fraction += kNsPerSecond;
+    }
+    const auto timestamp = static_cast<std::time_t>(seconds + kUtcOffsetSeconds);
+    std::tm calendar{};
+    char result[32]{};
+    if (!gmtime_r(&timestamp, &calendar)) throw std::runtime_error("cannot convert trace wall time");
+    const auto size = std::strftime(result, sizeof(result), "%Y-%m-%d %H:%M:%S", &calendar);
+    if (!size) throw std::runtime_error("cannot format trace wall time");
+    std::snprintf(result + size, sizeof(result) - size, ".%06d", static_cast<int>(fraction / 1000));
+    return std::string("\"") + result + '"';
+}
+
+void AppendProductionRecord(std::string& jsonl, const TraceRecord& record, std::string_view comm_id, uint32_t bus_id)
+{
+    const auto value = [&](const char* name) -> std::optional<int64_t> {
+        const auto it = record.values.find(name);
+        if (it == record.values.end()) return std::nullopt;
+        return it->second;
+    };
+    const bool completed = record.event == "end";
+    jsonl += "{\"type\":";
+    jsonl += completed ? '2' : '1';
+    const auto field = [&](const char* name, std::string_view json) {
+        jsonl += ",\"";
+        jsonl += name;
+        jsonl += "\":";
+        jsonl += json;
+    };
+    const auto number = [&](const char* name, std::optional<int64_t> n) {
+        if (n) field(name, std::to_string(*n));
+        else field(name, "null");
+    };
+    const auto time = [&](const char* name, std::optional<int64_t> ns) {
+        if (ns) field(name, ProductionWallTime(*ns));
+        else field(name, "null");
+    };
+
+    const auto op = value("op");
+    const bool short_format = op == 0 || op == 1 || op == 3 || op == 6;
+    number("gid", value("gid"));
+    number("op", op);
+    number("op_count", value("op_count"));
+    number("dispatch_count", value("dispatch_count"));
+    if (!short_format) number("ep_size", value("ep_size"));
+    number("bus_id", bus_id);
+    const auto rank = value("rank");
+    number("rank", rank);
+    number("nvl_rank", rank ? std::optional<int64_t>{*rank % 16} : std::nullopt);
+    if (!short_format) {
+        number("hidden_size", value("hidden_size"));
+        number("num_experts", value("num_experts"));
+    }
+    number("num_sms", value("aiv"));
+    if (!short_format) {
+        number("num_tokens", value("num_tokens"));
+        number("topk", value("topk"));
+    }
+    number("pid", value("pid"));
+    const auto stream = record.labels.find("stream");
+    const auto handle = stream == record.labels.end() ? std::nullopt : ParseUnsigned(stream->second);
+    field("stream", handle ? std::to_string(*handle) : "null");
+    field("comm_id", comm_id);
+    time("launch_time", value("launch_ns"));
+    time("start_time", completed ? value("start_ns") : std::nullopt);
+    time("end_time", completed ? value("end_ns") : std::nullopt);
+    number("elapsed_ns", completed ? value("elapsed_ns") : std::nullopt);
+    number("start_tick", completed ? value("start_tick") : std::nullopt);
+    number("end_tick", completed ? value("end_tick") : std::nullopt);
+    jsonl += "}\n";
 }
 }
 std::string EncodeTraceRecords(const std::vector<TraceRecord>& records)
@@ -506,6 +603,18 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing, bool recorder)
         }
     }
     return records;
+}
+
+std::map<std::string, std::string> KernelTrace::DrainProductionBatches(uint32_t bus_id, bool closing)
+{
+    std::map<std::string, std::string> batches;
+    for (const auto& record : Drain(closing, true)) {
+        if (record.event != "end" && record.event != "timeout") continue;
+        const auto comm_id = record.labels.find("comm_id");
+        if (comm_id == record.labels.end() || !IsCanonicalCommId(comm_id->second)) continue;
+        AppendProductionRecord(batches[comm_id->second], record, comm_id->second, bus_id);
+    }
+    return batches;
 }
 
 KernelTrace::~KernelTrace()

@@ -9,13 +9,45 @@
 
 #include <torch/extension.h>
 #include <chrono>
+#include <dlfcn.h>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
 #include "common/types.h"
 #include "runtime/kernel_trace.h"
 #include "runtime/shmem_instance.h"
-#include "runtime/trace_recorder.h"
 
 namespace {
+uint32_t TracePhysicalDeviceId(int device)
+{
+    using Query = aclError (*)(int32_t, int32_t*);
+    auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByUserDevId"));
+    if (!query) query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByLogicDevId"));
+    int32_t physical_device_id = -1;
+    if (!query || query(device, &physical_device_id) != ACL_SUCCESS || physical_device_id < 0)
+        throw std::runtime_error("physical device ID unavailable for ACL device " + std::to_string(device));
+    return static_cast<uint32_t>(physical_device_id);
+}
+
+std::string TraceDeviceUuid(int device)
+{
+    using Query = aclError (*)(int32_t, aclrtUuid*);
+    const auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtDeviceGetUuid"));
+    aclrtUuid uuid{};
+    if (!query || query(device, &uuid) != ACL_SUCCESS)
+        throw std::runtime_error("device UUID unavailable for ACL device " + std::to_string(device));
+    constexpr char digits[] = "0123456789abcdef";
+    std::string hex;
+    for (const unsigned char byte : uuid.bytes) {
+        hex += digits[byte >> 4];
+        hex += digits[byte & 0xf];
+    }
+    if (hex.find_first_not_of('0') == std::string::npos)
+        throw std::runtime_error("empty device UUID for ACL device " + std::to_string(device));
+    return hex;
+}
+
 int ProbePythonGil()
 {
 #ifdef Py_GIL_DISABLED
@@ -92,7 +124,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     });
     using ascend_deepep::trace::KernelTrace;
     using ascend_deepep::trace::TraceRecord;
-    using ascend_deepep::trace::TraceRecorder;
     struct Snapshot { ascend_deepep::trace::TraceMetadataSnapshot value; };
     pybind11::class_<Snapshot>(m, "TraceMetadataSnapshot");
     m.def("make_trace_metadata", [](pybind11::dict fields, const Snapshot& parent, bool recorder) {
@@ -129,6 +160,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         })
         .def_property_readonly("poll_interval_ms", &KernelTrace::PollIntervalMs)
         .def("calibration", [to_dict](const KernelTrace& trace) { return to_dict(trace.Calibration()); })
+        .def(
+            "device_identity",
+            [](const KernelTrace& trace) {
+                const int device = trace.Device();
+                return std::pair{TracePhysicalDeviceId(device), TraceDeviceUuid(device)};
+            },
+            pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def(
+            "drain_production_batches",
+            [](KernelTrace& trace, uint32_t bus_id, bool closing) {
+                std::map<std::string, std::string> batches;
+                {
+                    pybind11::gil_scoped_release release;
+                    batches = trace.DrainProductionBatches(bus_id, closing);
+                }
+                pybind11::list result;
+                for (const auto& [comm_id, jsonl] : batches)
+                    result.append(pybind11::make_tuple(pybind11::str(comm_id), pybind11::bytes(jsonl)));
+                return result;
+            },
+            pybind11::arg("bus_id"), pybind11::arg("closing") = false)
         .def("drain_trace_json", [](KernelTrace& trace, bool closing) {
             std::string text;
             {
@@ -203,16 +255,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             return result;
         }, pybind11::arg("include_records"), pybind11::arg("timing") = false, pybind11::arg("closing") = false,
            pybind11::arg("return_text") = true);
-    pybind11::class_<TraceRecorder, std::shared_ptr<TraceRecorder>>(m, "TraceRecorder")
-        .def("attach", &TraceRecorder::Attach, pybind11::call_guard<pybind11::gil_scoped_release>())
-        .def("detach", &TraceRecorder::Detach, pybind11::call_guard<pybind11::gil_scoped_release>())
-        .def("drain", [](TraceRecorder& recorder, KernelTrace& source, bool closing) {
-            recorder.Write(source.Drain(closing, true));
-        }, pybind11::arg("source"), pybind11::arg("closing") = false,
-           pybind11::call_guard<pybind11::gil_scoped_release>());
-    m.def("open_trace_recorder", [](const KernelTrace& source, const std::string& comm_id) {
-        return TraceRecorder::Open(source.Device(), comm_id);
-    }, pybind11::arg("source"), pybind11::arg("comm_id"), pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("get_kernel_trace", &KernelTrace::Open);
     m.def("get_shmem_unique_id" , &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);

@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import atexit
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from collections.abc import Mapping
+import errno
 import itertools
 import json
 import os
 from pathlib import Path
 import secrets
 import socket
+import stat
 import threading
 import time
 import warnings
+import weakref
 import uuid
 
 
@@ -81,7 +84,9 @@ class KernelTrace:
                 poll_interval_ms = source.poll_interval_ms if production else 2
                 diagnostic_path = None
                 if production:
-                    recorder = native_module.open_trace_recorder(source, comm_id)
+                    if not callable(getattr(source, "drain_production_batches", None)):
+                        raise RuntimeError("KernelTrace requires the matching rebuilt native extension")
+                    recorder = _TraceRecorder.open(source, calibration["device"], comm_id)
                     recorder.attach(comm_id)
                     recorder_attached = True
                 else:
@@ -134,8 +139,10 @@ class KernelTrace:
                 return
             entry["deferred_drains"] += 1
         try:
-            if entry["recorder"] is not None:
-                entry["recorder"].drain(entry["source"], closing)
+            recorder = entry["recorder"]
+            if recorder is not None:
+                batches = entry["source"].drain_production_batches(recorder.bus_id, closing)
+                recorder.write(batches)
                 return
             if entry["mode"] not in ("", "record_only"):
                 KernelTrace._diagnostic_drain(entry, closing)
@@ -576,3 +583,331 @@ def attach_trace_session(native, group, rank, ep_size, all_gather, *, comm=None)
 def detach_trace_session(identity, session, *, synchronized=False):
     if identity is not None:
         KernelTrace.detach(identity, session.fields["comm_id"], synchronized=synchronized)
+
+
+_TRACE_DEFAULT_DIRECTORY = "/dockerdata/.trmt/deepep/"
+_TRACE_FILE_COUNT = 8
+_TRACE_FILE_LIMIT = 1_000_000_000
+_TRACE_WRITE_RETRIES = 3
+_TRACE_WRITE_RETRY_DELAY_S = 0.003
+
+
+def _valid_trace_comm_id(comm_id):
+    return (
+        isinstance(comm_id, str)
+        and len(comm_id) <= 20
+        and comm_id.isascii()
+        and comm_id.isdecimal()
+        and (len(comm_id) == 1 or comm_id[0] != "0")
+        and int(comm_id) < 1 << 64
+    )
+
+
+def _check_trace_comm_id(comm_id):
+    if not _valid_trace_comm_id(comm_id):
+        raise ValueError("expected a canonical decimal uint64 trace communication ID")
+
+
+def _valid_trace_uuid(value):
+    return isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdef" for c in value)
+
+
+def _trace_file_stem(comm_id, bus_id):
+    return f"trmt-deepep-trace-{comm_id}-{bus_id}-"
+
+
+def _close_trace_fd(fd):
+    if fd is not None:
+        with suppress(OSError):
+            os.close(fd)
+
+
+def _open_trace_directory(directory):
+    # Resolve the requested path, then open each component relative to its
+    # verified parent so a concurrent symlink replacement cannot redirect us.
+    path = Path(directory).resolve()
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            try:
+                child = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(part, mode=0o755, dir_fd=current)
+                child = os.open(part, flags, dir_fd=current)
+            _close_trace_fd(current)
+            current = child
+        return os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current)
+    finally:
+        _close_trace_fd(current)
+
+
+def _check_private_trace_file(fd, name):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RuntimeError(f"expected a regular trace file with one link: {name}")
+
+
+def _flock_trace_file(flock, fd, operation):
+    while True:
+        try:
+            flock(fd, operation)
+            return
+        except InterruptedError:
+            pass
+
+
+def _clean_trace_history(directory, bus_id, owner_prefix):
+    for marker in os.listdir(directory):
+        if not marker.startswith(owner_prefix):
+            continue
+        comm_id = marker[len(owner_prefix) :]
+        # Older owner-v2 markers used a hexadecimal communication ID.
+        if not (_valid_trace_comm_id(comm_id) or _valid_trace_uuid(comm_id)):
+            continue
+        try:
+            info = os.stat(marker, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            continue
+        stem = _trace_file_stem(comm_id, bus_id)
+        for index in range(_TRACE_FILE_COUNT):
+            name = f"{stem}{index}.txt"
+            with suppress(FileNotFoundError):
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode):
+                    os.unlink(name, dir_fd=directory)
+        with suppress(FileNotFoundError):
+            os.unlink(marker, dir_fd=directory)
+
+
+def _truncate_trace_file(fd, size):
+    while True:
+        try:
+            os.ftruncate(fd, size)
+            return
+        except InterruptedError:
+            pass
+
+
+class _LogRing:
+    def __init__(self, directory, comm_id, bus_id, owner_marker):
+        stem = _trace_file_stem(comm_id, bus_id)
+        self.names = [f"{stem}{index}.txt" for index in range(_TRACE_FILE_COUNT)]
+        self.active = None
+        self.index = 0
+        self.size = 0
+        self.references = 1
+        self.failed = False
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        created = []
+        try:
+            for name in self.names:
+                fd = os.open(name, flags | os.O_APPEND, 0o644, dir_fd=directory)
+                created.append(name)
+                if self.active is None:
+                    self.active = fd
+                else:
+                    _close_trace_fd(fd)
+            _close_trace_fd(os.open(owner_marker, flags, 0o644, dir_fd=directory))
+        except BaseException:
+            self.close()
+            for name in reversed(created):
+                with suppress(OSError):
+                    os.unlink(name, dir_fd=directory)
+            raise
+
+    def close(self):
+        _close_trace_fd(self.active)
+        self.active = None
+
+    def _rotate(self, directory):
+        index = (self.index + 1) % _TRACE_FILE_COUNT
+        name = self.names[index]
+        flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        fd = os.open(name, flags, dir_fd=directory)
+        try:
+            _check_private_trace_file(fd, name)
+            _truncate_trace_file(fd, 0)
+        except BaseException:
+            _close_trace_fd(fd)
+            raise
+        self.close()
+        self.active, self.index, self.size = fd, index, 0
+
+    def append(self, directory, payload):
+        if not payload:
+            return
+        if not payload.endswith(b"\n"):
+            raise ValueError("trace batch must end at a complete JSONL line")
+        data = memoryview(payload)
+        start = 0
+        while start < len(payload):
+            available = _TRACE_FILE_LIMIT - self.size
+            end = len(payload)
+            if end - start > available:
+                # Fit as many complete lines as possible before rotating.
+                end = payload.rfind(b"\n", start, start + available) + 1
+                if end <= start:
+                    next_end = payload.index(b"\n", start) + 1
+                    if next_end - start > _TRACE_FILE_LIMIT:
+                        raise RuntimeError("single trace record exceeds file limit")
+                    self._rotate(directory)
+                    continue
+            self._write_chunk(payload, data, start, end)
+            start = end
+
+    def _write_chunk(self, payload, data, start, end):
+        written = start
+        retries = 0
+        while written < end:
+            try:
+                count = os.write(self.active, data[written:end])
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                error = exc
+            else:
+                if count > 0:
+                    next_written = written + count
+                    # The retry budget restarts after a complete line.
+                    if retries and payload.find(b"\n", written, next_written) != -1:
+                        retries = 0
+                    written = next_written
+                    continue
+                error = OSError(errno.EIO, os.strerror(errno.EIO))
+            if retries == _TRACE_WRITE_RETRIES:
+                # Keep the complete records committed by a partial write.
+                complete = max(start, payload.rfind(b"\n", start, written) + 1)
+                if complete != written:
+                    _truncate_trace_file(self.active, self.size + complete - start)
+                self.size += complete - start
+                detail = error.strerror or str(error)
+                raise OSError(error.errno, f"write trace file {self.names[self.index]}: {detail}") from error
+            retries += 1
+            time.sleep(_TRACE_WRITE_RETRY_DELAY_S)
+        self.size += written - start
+
+
+class _TraceRecorder:
+    """Manage a physical device's production logs under the monitor's lock."""
+
+    _devices = weakref.WeakValueDictionary()
+    _writers = weakref.WeakValueDictionary()
+
+    def __init__(self, bus_id, device_uuid, directory):
+        self.bus_id = bus_id
+        self.owner = os.getpid()
+        self.groups = {}
+        self.directory = self.device_lock = None
+
+        # Keep non-Linux and diagnostic imports independent of the writer.
+        import fcntl
+
+        self._flock = fcntl.flock
+        self._unlock = fcntl.LOCK_UN
+        device_key = f"{device_uuid}-{bus_id}"
+        self.owner_prefix = f".trmt-deepep-trace-owner-v2-{device_key}-{bus_id}-"
+        with ExitStack() as resources:
+            directory_fd = _open_trace_directory(directory)
+            resources.callback(_close_trace_fd, directory_fd)
+            name = f".trmt-deepep-trace-device-{device_key}.lock"
+            flags = os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+            device_lock = os.open(name, flags, 0o644, dir_fd=directory_fd)
+            resources.callback(_close_trace_fd, device_lock)
+            _check_private_trace_file(device_lock, name)
+            _flock_trace_file(self._flock, device_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _clean_trace_history(directory_fd, bus_id, self.owner_prefix)
+            resources.pop_all()  # The recorder now owns both descriptors.
+            self.directory, self.device_lock = directory_fd, device_lock
+
+    @classmethod
+    def open(cls, source, device, comm_id):
+        _check_trace_comm_id(comm_id)
+        recorder = cls._devices.get(device)
+        if recorder is None or recorder.directory is None:
+            bus_id, device_uuid = source.device_identity()
+            if not isinstance(bus_id, int) or not 0 <= bus_id < 1 << 32:
+                raise ValueError("invalid trace physical device ID")
+            if not _valid_trace_uuid(device_uuid) or device_uuid == "0" * 32:
+                raise ValueError("invalid trace device UUID")
+            key = (bus_id, device_uuid)
+            recorder = cls._writers.get(key)
+            if recorder is None or recorder.directory is None:
+                directory = os.environ.get("DEEPEP_TRACE_DIR") or _TRACE_DEFAULT_DIRECTORY
+                recorder = cls(bus_id, device_uuid, directory)
+                cls._writers[key] = recorder
+            recorder._check_owner()
+            cls._devices[device] = recorder
+        else:
+            recorder._check_owner()
+        return recorder
+
+    def _check_owner(self):
+        if self.owner != os.getpid():
+            raise RuntimeError("cannot use inherited trace recorder")
+        if self.directory is None:
+            raise RuntimeError("trace recorder is closed")
+
+    def close(self):
+        if self.directory is None:
+            return
+        for group in self.groups.values():
+            group.close()
+        self.groups.clear()
+        if self.device_lock is not None and self.owner == os.getpid():
+            with suppress(OSError):
+                _flock_trace_file(self._flock, self.device_lock, self._unlock)
+        _close_trace_fd(self.device_lock)
+        _close_trace_fd(self.directory)
+        self.directory = self.device_lock = None
+
+    def __del__(self):
+        self.close()
+
+    def attach(self, comm_id):
+        self._check_owner()
+        try:
+            _check_trace_comm_id(comm_id)
+            group = self.groups.get(comm_id)
+            if group is None:
+                self.groups[comm_id] = _LogRing(self.directory, comm_id, self.bus_id, self.owner_prefix + comm_id)
+            else:
+                group.references += 1
+        except BaseException:
+            if not self.groups:
+                self.close()
+            raise
+
+    def detach(self, comm_id):
+        self._check_owner()
+        group = self.groups.get(comm_id)
+        if group is not None:
+            group.references -= 1
+            if not group.references:
+                del self.groups[comm_id]
+                group.close()
+                if not self.groups:
+                    self.close()
+
+    def write(self, batches):
+        self._check_owner()
+        failure = None
+        for comm_id, payload in batches:
+            group = self.groups.get(comm_id)
+            if group is None or group.failed:
+                continue
+            try:
+                group.append(self.directory, payload)
+            except Exception as error:
+                group.failed = True
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            try:
+                raise failure
+            finally:
+                failure = None  # Keep the exception traceback from retaining the writer.

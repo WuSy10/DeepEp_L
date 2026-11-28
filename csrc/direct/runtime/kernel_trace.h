@@ -107,6 +107,8 @@ public:
                    int64_t input_rows = -1, int64_t output_rows = -1);
     void Submit(Ticket ticket, int64_t launch_ns, int status);
     std::vector<TraceRecord> Drain(bool closing = false, bool recorder = false);
+    // Each communication group receives its ordered batch of production JSONL records.
+    std::map<std::string, std::string> DrainProductionBatches(uint32_t bus_id, bool closing = false);
     int Device() const { return device_; }
     int PollIntervalMs() const { return poll_interval_ms_; }
     TraceRecord Calibration() const;
